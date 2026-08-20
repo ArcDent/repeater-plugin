@@ -1,0 +1,6 @@
+{
+  "include": ["config.py", "plugin.py", "reactions.py"],
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "standard",
+  "reportMissingImports": "none"
+}

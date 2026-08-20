@@ -1,0 +1,53 @@
+# 表情跟风插件配置
+# 字段含义与取值范围见 config.py，术语见 CONTEXT.md。
+
+[plugin]
+enabled = true
+config_version = "1.0.0"
+
+# 协议端 HTTP 上报的接收端点。协议端需要新增一个 HTTP 上报目标指向这里
+# （好友申请插件已占 18080，本插件默认 18081）。
+[webhook]
+host = "0.0.0.0"
+port = 18081
+path = "/maibot/emoji_reaction"
+secret = ""
+
+# 贴表情动作直调协议端 OneBot HTTP。base_url 不填则插件不做任何动作。
+[protocol]
+base_url = ""
+access_token = ""
+# 留空则启动时用 get_login_info 自动获取
+self_qq = ""
+
+# 跟风概率。两套概率分别对应「他人的消息」和「麦麦自己的消息」。
+[bandwagon]
+probability = 0.25
+self_message_probability = 0.12
+
+# 反义回应。命中反义映射的表情只走这条分支，掷不中就什么都不做，不回落到跟风。
+[opposite]
+enabled = true
+probability = 0.35
+include_defaults = true
+# 追加或覆盖反义对，写法 "A=B"，可用 emoji 字符或协议端表情编号
+extra_pairs = []
+# 这些表情所在的反义对整对移除，使它们回落到跟风分支
+disabled_emojis = []
+
+[behavior]
+# 同一个群两次贴表情的最小间隔，0 = 不限
+cooldown_seconds = 60
+# 决定贴表情后的随机等待区间，避免瞬间贴上显得机械
+delay_min_seconds = 1.0
+delay_max_seconds = 6.0
+# 「这条消息已贴过」的记忆时长与条数上界
+slot_ttl_seconds = 3600
+max_slots = 2000
+
+[scope]
+# 留空 = 除黑名单外所有群生效
+group_whitelist = []
+group_blacklist = []
+# 忽略这些 QQ 贴出的表情回应，通常填其他机器人
+ignore_reactors = []

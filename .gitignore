@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+
+# 本地运维笔记（含服务器路径等本机信息），不进公开仓库
+.local/
