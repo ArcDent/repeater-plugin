@@ -226,10 +226,9 @@ class SendingEmojisPlugin(MaiBotPlugin):
         if self._state.is_cooling_down(event.group_id, self.config.behavior.cooldown_seconds, now):
             return None
 
-        # 命中反义映射的表情走反义分支，不需要知道原作者是谁。
-        is_self_message = False
-        if event.emoji_id not in self._opposite_map:
-            is_self_message = await self._is_self_message(event.message_id, now)
+        # 回应骰需要知道原作者是谁（self 消息用独立概率），反义表情也不例外：
+        # 反义分支只是回应后的第二次掷骰，不能绕过回应骰。
+        is_self_message = await self._is_self_message(event.message_id, now)
 
         bandwagon = self.config.bandwagon
         decision = decide_reaction(

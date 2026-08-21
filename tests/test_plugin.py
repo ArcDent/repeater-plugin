@@ -163,7 +163,8 @@ def test_cooldown_blocks_second_reaction_in_group():
 
 # ---- 分流 ----
 
-def test_opposite_branch_does_not_query_message_author():
+def test_opposite_branch_queries_message_author():
+    """两级决策下反义表情也要过回应骰，回应骰需要知道原作者是谁。"""
     plugin = make_plugin()
     plugin._self_qq = BOT_QQ
     plugin.config.opposite.probability = 1.0
@@ -172,7 +173,7 @@ def test_opposite_branch_does_not_query_message_author():
     assert decision is not None
     assert decision.kind == OPPOSITE
     assert decision.emoji_id == THUMBS_DOWN
-    assert "get_msg" not in actions_of(plugin)
+    assert "get_msg" in actions_of(plugin)
 
 
 def test_bandwagon_on_other_message_uses_main_probability():

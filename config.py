@@ -114,8 +114,11 @@ class BandwagonSection(PluginConfigBase):
     probability: float = Field(
         default=0.25, ge=0.0, le=1.0,
         json_schema_extra={
-            "hint": "有人给他人消息贴表情时，麦麦跟着贴同款表情的概率。0 = 从不跟风。",
-            "label": "跟风概率（他人消息）",
+            "hint": (
+                "有人给他人消息贴表情时，麦麦决定回应的概率（回应骰）。"
+                "回应后若表情命中反义映射，再掷反义概率决定贴反义还是同款。0 = 从不回应。"
+            ),
+            "label": "回应概率（他人消息）",
             "order": 0,
             "step": 0.05,
         },
@@ -124,10 +127,10 @@ class BandwagonSection(PluginConfigBase):
         default=0.12, ge=0.0, le=1.0,
         json_schema_extra={
             "hint": (
-                "有人给麦麦自己发的消息贴表情时，麦麦跟着贴同款的概率。"
+                "有人给麦麦自己发的消息贴表情时，麦麦决定回应的概率。"
                 "建议低于他人消息的概率，自己给自己的消息点赞观感较差。"
             ),
-            "label": "跟风概率（麦麦自己的消息）",
+            "label": "回应概率（麦麦自己的消息）",
             "order": 1,
             "step": 0.05,
         },
@@ -150,8 +153,9 @@ class OppositeSection(PluginConfigBase):
         default=0.35, ge=0.0, le=1.0,
         json_schema_extra={
             "hint": (
-                "触发表情命中反义映射时，麦麦贴出相反表情的概率。"
-                "命中反义映射的表情不会再跟风，掷不中就什么都不做。"
+                "回应骰掷中后，命中反义映射的表情贴出相反表情（而非同款）的概率。"
+                "先按跟风概率决定是否回应，回应后才掷本概率决定反义还是同款，"
+                "掷不中贴同款；填 0 则命中反义映射的表情也只会贴同款。"
             ),
             "label": "反义回应概率",
             "order": 1,
@@ -161,7 +165,11 @@ class OppositeSection(PluginConfigBase):
     include_defaults: bool = Field(
         default=True,
         json_schema_extra={
-            "hint": "是否加载内置反义映射（👍↔👎、❤↔💔、😂↔😭、😄↔😡、✅↔❌、🔥↔❄、⬆↔⬇、😍↔🤢）。",
+            "hint": (
+                "是否加载内置反义映射（👍↔👎、❤↔💔、😂↔😭、😄↔😡、✅↔❌、"
+                "🔥↔❄、⬆↔⬇、😍↔🤢、😈↔😇、🤮↔😋、🥶↔🥵、☀↔🌧、🚀↔🐢、"
+                "😊↔😠、🎉↔😢、➕↔➖）。"
+            ),
             "label": "使用内置反义映射",
             "order": 2,
         },

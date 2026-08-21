@@ -6,9 +6,11 @@ MaiBot 插件。群里有人给某条消息贴**表情回应**（消息气泡下
 
 ## 行为规则
 
-- 有人给**他人**的消息贴表情 → 以 `bandwagon.probability`（默认 0.25）跟风贴同款
-- 有人给**麦麦自己**的消息贴表情 → 以 `bandwagon.self_message_probability`（默认 0.12）跟风贴同款
-- 触发表情命中**反义映射** → 以 `opposite.probability`（默认 0.35）贴相反表情，**掷不中就什么都不做**，不回落到跟风（严格互斥，见 [ADR 0002](docs/adr/0002-exclusive-branches-and-in-memory-slots.md)）
+两级决策，最多掷两次骰：
+
+1. **回应骰**：有人给**他人**的消息贴表情 → 以 `bandwagon.probability`（默认 0.25）决定回应；给**麦麦自己**的消息贴 → 以 `bandwagon.self_message_probability`（默认 0.12）决定回应。掷不中就不贴任何表情。
+2. **反义骰**：回应后，触发表情若命中**反义映射**，再以 `opposite.probability`（默认 0.35）决定贴相反表情还是贴同款；掷不中**回落跟风**贴同款（见 [ADR 0002](docs/adr/0002-exclusive-branches-and-in-memory-slots.md)）。
+
 - 一条消息麦麦最多贴一次；同一个群两次贴表情间隔不小于 `behavior.cooldown_seconds`（默认 60 秒）
 - 贴之前随机等 1~6 秒，避免上报一到就瞬间贴上
 
@@ -17,6 +19,7 @@ MaiBot 插件。群里有人给某条消息贴**表情回应**（消息气泡下
 | | | | | | | | |
 |---|---|---|---|---|---|---|---|
 | 👍↔👎 | ❤↔💔 | 😂↔😭 | 😄↔😡 | ✅↔❌ | 🔥↔❄ | ⬆↔⬇ | 😍↔🤢 |
+| 😈↔😇 | 🤮↔😋 | 🥶↔🥵 | ☀↔🌧 | 🚀↔🐢 | 😊↔😠 | 🎉↔😢 | ➕↔➖ |
 
 映射双向生效。要加自己的对，在 `opposite.extra_pairs` 里按 `"A=B"` 写，可用 emoji 字符或协议端表情编号：
 

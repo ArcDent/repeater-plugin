@@ -23,6 +23,8 @@ REACTION_NOTICE_TYPES = frozenset({
 
 # 内置反义映射，只用 Unicode emoji（QQ 私有小黄脸编号的语义无公开权威表，
 # 不内置猜测值；需要私有编号请在 config.toml 的 extra_pairs 里按实测填）。
+# 选取原则：语义公认、无歧义、与已有对不重复（😄/😡、🔥/❄、😍/🤢、😭、👎、
+# ❌、💔 已被占用时改选相邻语义的字符，如 😠、🥵、😋、😢）。
 DEFAULT_OPPOSITE_PAIRS: tuple[tuple[str, str], ...] = (
     ("👍", "👎"),
     ("❤", "💔"),
@@ -32,6 +34,14 @@ DEFAULT_OPPOSITE_PAIRS: tuple[tuple[str, str], ...] = (
     ("🔥", "❄"),
     ("⬆", "⬇"),
     ("😍", "🤢"),
+    ("😈", "😇"),
+    ("🤮", "😋"),
+    ("🥶", "🥵"),
+    ("☀", "🌧"),
+    ("🚀", "🐢"),
+    ("😊", "😠"),
+    ("🎉", "😢"),
+    ("➕", "➖"),
 )
 
 BANDWAGON = "bandwagon"
@@ -245,38 +255,44 @@ def decide_reaction(
     opposite_probability: float,
     roll: Callable[[], float],
 ) -> Decision | None:
-    """决定麦麦对这次表情回应做什么。
+    """决定麦麦对这次表情回应做什么。两级决策，最多掷两次骰：
 
-    命中反义映射的表情只走反义回应分支，掷不中即什么都不做，不回落到跟风
-    （严格互斥，见 docs/adr/0002）。概率为 0 时不掷骰，为 1 时必中。
+    1. 回应骰：按跟风概率（self 消息用独立概率）决定是否贴表情，掷不中就什么都不做；
+    2. 反义骰：回应骰掷中后，若表情命中反义映射，再按反义概率决定贴相反表情
+       还是贴同款——反义骰掷不中**回落跟风**（见 docs/adr/0002）。
+
+    未命中反义映射的表情只有回应骰，掷中即贴同款。概率为 0 时不掷骰，为 1 时必中。
     """
     if event.removed:
+        return None
+
+    respond_probability = _clamp(
+        self_message_probability if is_self_message else bandwagon_probability
+    )
+    if respond_probability <= 0.0:
+        return None
+    if roll() >= respond_probability:
         return None
 
     opposite_id = opposite_map.get(event.emoji_id, "")
     if opposite_id:
         probability = _clamp(opposite_probability)
-        if probability <= 0.0:
-            return None
-        if roll() < probability:
+        if probability > 0.0 and roll() < probability:
             return Decision(
                 kind=OPPOSITE,
                 emoji_id=opposite_id,
-                reason=f"{event.emoji_id} 命中反义映射 → {opposite_id}（p={probability}）",
+                reason=(
+                    f"{event.emoji_id} 命中反义映射 → {opposite_id}"
+                    f"（回应 p={respond_probability}，反义 p={probability}）"
+                ),
             )
-        return None
 
-    probability = _clamp(self_message_probability if is_self_message else bandwagon_probability)
-    if probability <= 0.0:
-        return None
-    if roll() < probability:
-        target = "麦麦自己的消息" if is_self_message else "他人消息"
-        return Decision(
-            kind=BANDWAGON,
-            emoji_id=event.emoji_id,
-            reason=f"跟风 {event.emoji_id}（{target}，p={probability}）",
-        )
-    return None
+    target = "麦麦自己的消息" if is_self_message else "他人消息"
+    return Decision(
+        kind=BANDWAGON,
+        emoji_id=event.emoji_id,
+        reason=f"跟风 {event.emoji_id}（{target}，p={respond_probability}）",
+    )
 
 
 def coerce_message_id(message_id: Any) -> Any:

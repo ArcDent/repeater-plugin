@@ -250,8 +250,8 @@ def test_opposite_branch_hits():
     assert decision.emoji_id == THUMBS_DOWN
 
 
-def test_opposite_miss_does_not_fall_back_to_bandwagon():
-    """严格互斥（ADR 0002）：命中反义映射的表情掷不中就什么都不做。"""
+def test_opposite_miss_falls_back_to_bandwagon():
+    """两级决策（ADR 0002）：回应骰掷中后反义骰不中，回落贴同款。"""
     decision = decide_reaction(
         _event(),
         is_self_message=False,
@@ -260,6 +260,101 @@ def test_opposite_miss_does_not_fall_back_to_bandwagon():
         self_message_probability=1.0,
         opposite_probability=0.5,
         roll=lambda: 0.9,
+    )
+    assert decision is not None
+    assert decision.kind == BANDWAGON
+    assert decision.emoji_id == THUMBS_UP
+
+
+def test_opposite_emoji_respond_roll_miss_does_nothing():
+    """两级决策：回应骰不中时，即使反义概率拉满也不回应、不掷反义骰。"""
+    decision = decide_reaction(
+        _event(),
+        is_self_message=False,
+        opposite_map=build_opposite_map(),
+        bandwagon_probability=0.5,
+        self_message_probability=1.0,
+        opposite_probability=1.0,
+        roll=lambda: 0.9,
+    )
+    assert decision is None
+
+
+def test_opposite_emoji_uses_self_message_probability_for_respond():
+    """反义表情的回应骰同样区分 self/other 概率。"""
+    decision = decide_reaction(
+        _event(),
+        is_self_message=True,
+        opposite_map=build_opposite_map(),
+        bandwagon_probability=1.0,
+        self_message_probability=0.1,
+        opposite_probability=1.0,
+        roll=lambda: 0.5,
+    )
+    assert decision is None
+
+
+def test_opposite_emoji_gated_by_respond_roll_first():
+    """两级决策：命中反义映射的表情先过回应骰，回应骰不中即使反义概率拉满也不回应。"""
+    decision = decide_reaction(
+        _event(),
+        is_self_message=False,
+        opposite_map=build_opposite_map(),
+        bandwagon_probability=0.5,
+        self_message_probability=0.5,
+        opposite_probability=1.0,
+        roll=lambda: 0.9,
+    )
+    assert decision is None
+
+
+def test_opposite_emoji_rolls_respond_then_contrarian():
+    """命中反义映射的表情掷两次骰：回应骰中后再掷反义骰，反义骰不中回落跟风。
+
+    self_message_probability=0.0 同时验证非 self 消息的回应骰用的是跟风概率
+    （若误用 self 概率，回应骰概率为 0 直接不回应，用例会失败）。
+    """
+    # 回应中 + 反义中 → 反义回应
+    rolls = iter([0.1, 0.1])
+    decision = decide_reaction(
+        _event(),
+        is_self_message=False,
+        opposite_map=build_opposite_map(),
+        bandwagon_probability=0.5,
+        self_message_probability=0.0,
+        opposite_probability=0.5,
+        roll=lambda: next(rolls),
+    )
+    assert decision is not None
+    assert decision.kind == OPPOSITE
+    assert decision.emoji_id == THUMBS_DOWN
+
+    # 回应中 + 反义不中 → 回落跟风贴同款
+    rolls = iter([0.1, 0.9])
+    decision = decide_reaction(
+        _event(),
+        is_self_message=False,
+        opposite_map=build_opposite_map(),
+        bandwagon_probability=0.5,
+        self_message_probability=1.0,
+        opposite_probability=0.5,
+        roll=lambda: next(rolls),
+    )
+    assert decision is not None
+    assert decision.kind == BANDWAGON
+    assert decision.emoji_id == THUMBS_UP
+
+
+def test_opposite_emoji_on_self_message_uses_self_probability():
+    """反义表情的回应骰同样区分 self/other 概率：self 消息概率不中则不回应。"""
+    decision = decide_reaction(
+        _event(),
+        is_self_message=True,
+        opposite_map=build_opposite_map(),
+        bandwagon_probability=1.0,
+        self_message_probability=0.1,
+        opposite_probability=1.0,
+        roll=lambda: 0.5,
     )
     assert decision is None
 
@@ -305,16 +400,21 @@ def test_zero_probability_skips_roll():
     ) is None
 
 
-def test_zero_opposite_probability_skips_roll_and_does_not_bandwagon():
-    assert decide_reaction(
+def test_zero_opposite_probability_skips_second_roll_and_bandwagons():
+    """反义概率为 0 = 从不唱反调：命中反义映射的表情只掷回应骰，掷中即贴同款。"""
+    rolls = iter([0.1])
+    decision = decide_reaction(
         _event(),
         is_self_message=False,
         opposite_map=build_opposite_map(),
         bandwagon_probability=1.0,
         self_message_probability=1.0,
         opposite_probability=0.0,
-        roll=_roll_never_called,
-    ) is None
+        roll=lambda: next(rolls),
+    )
+    assert decision is not None
+    assert decision.kind == BANDWAGON
+    assert decision.emoji_id == THUMBS_UP
 
 
 def test_probability_above_one_always_hits():
