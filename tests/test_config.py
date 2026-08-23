@@ -55,6 +55,27 @@ def test_all_sections_present():
         assert getattr(config, section) is not None
 
 
+def test_context_section_defaults():
+    cfg = SendingEmojisConfig()
+    assert cfg.context.enabled is False
+    assert cfg.context.dedup_ttl_seconds == 3600
+    assert cfg.context.merge_window_seconds == 30
+    assert cfg.context.max_reactions_per_message == 10
+    assert cfg.context.self_display_name == ""
+
+
+def test_context_section_accepts_overrides():
+    cfg = SendingEmojisConfig(context={"enabled": True, "dedup_ttl_seconds": 120,
+                                       "merge_window_seconds": 5,
+                                       "max_reactions_per_message": 3,
+                                       "self_display_name": "麦麦"})
+    assert cfg.context.enabled is True
+    assert cfg.context.dedup_ttl_seconds == 120
+    assert cfg.context.merge_window_seconds == 5
+    assert cfg.context.max_reactions_per_message == 3
+    assert cfg.context.self_display_name == "麦麦"
+
+
 @pytest.mark.skipif(tomllib is None, reason="需要 Python 3.11+ 的 tomllib")
 def test_config_toml_matches_model_defaults():
     assert tomllib is not None

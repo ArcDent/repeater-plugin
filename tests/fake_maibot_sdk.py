@@ -9,17 +9,22 @@ CONFIG_RELOAD_SCOPE_SELF = "self"
 
 
 class PluginConfigBase:
-    """按注解逐字段取默认值；默认值深拷贝，保证每个实例的嵌套 section 互相独立。"""
+    """按注解逐字段取默认值；默认值深拷贝，保证每个实例的嵌套 section 互相独立。
+
+    kwargs 里的 dict 覆盖值自动转为对应嵌套 section（对齐真实 maibot_sdk 的
+    pydantic 语义，如 ``SendingEmojisConfig(context={"enabled": True})``）。
+    """
 
     def __init__(self, **kwargs: Any) -> None:
         annotations: dict[str, Any] = getattr(self.__class__, "__annotations__", {})
-        for key in annotations:
-            if key in kwargs:
-                setattr(self, key, kwargs[key])
-            else:
-                setattr(self, key, copy.deepcopy(getattr(type(self), key, None)))
         for key, value in kwargs.items():
+            default = getattr(type(self), key, None)
+            if isinstance(default, PluginConfigBase) and isinstance(value, dict):
+                value = type(default)(**value)
             setattr(self, key, value)
+        for key in annotations:
+            if key not in kwargs:
+                setattr(self, key, copy.deepcopy(getattr(type(self), key, None)))
 
 
 def Field(

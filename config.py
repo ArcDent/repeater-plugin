@@ -249,9 +249,68 @@ class BehaviorSection(PluginConfigBase):
     )
 
 
+class ContextSection(PluginConfigBase):
+    __ui_label__: ClassVar[str] = "上下文注入"
+    __ui_order__: ClassVar[int] = 6
+
+    enabled: bool = Field(
+        default=False,
+        json_schema_extra={
+            "hint": (
+                "实验性功能总开关：开启后表情回应（含麦麦自己的）去重、聚合后"
+                "注入聊天历史，同时拦截主程序消息链上的表情回应通知消息。默认关闭。"
+            ),
+            "label": "启用上下文注入",
+            "order": 0,
+        },
+    )
+    dedup_ttl_seconds: int = Field(
+        default=3600, ge=0, le=604800,
+        json_schema_extra={
+            "hint": "同一（回应者、被回应消息、表情）组合在窗口内只注入一次。",
+            "label": "去重窗口（秒）",
+            "order": 1,
+            "step": 60,
+        },
+    )
+    merge_window_seconds: int = Field(
+        default=30, ge=0, le=3600,
+        json_schema_extra={
+            "hint": (
+                "同一被回应消息同一表情的多条回应在此窗口内汇入同一条注入消息，"
+                "窗口到期后写入聊天历史。"
+            ),
+            "label": "聚合窗口（秒）",
+            "order": 2,
+            "step": 5,
+        },
+    )
+    max_reactions_per_message: int = Field(
+        default=10, ge=1, le=100,
+        json_schema_extra={
+            "hint": "单条被回应消息最多产生的注入消息条数，防表情回应风暴撑爆上下文。",
+            "label": "注入上限（每条消息）",
+            "order": 3,
+            "step": 1,
+        },
+    )
+    self_display_name: str = Field(
+        default="",
+        json_schema_extra={
+            "hint": (
+                "注入消息里麦麦自己的显示名。留空则自动取主程序配置 bot.nickname；"
+                "两者都取不到时注入文本不写名字。"
+            ),
+            "label": "麦麦显示名（兜底）",
+            "order": 4,
+            "placeholder": "留空自动获取",
+        },
+    )
+
+
 class ScopeSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "生效范围"
-    __ui_order__: ClassVar[int] = 6
+    __ui_order__: ClassVar[int] = 7
 
     group_whitelist: list[str] = Field(
         default_factory=list,
@@ -289,4 +348,5 @@ class SendingEmojisConfig(PluginConfigBase):
     bandwagon: BandwagonSection = Field(default_factory=BandwagonSection)
     opposite: OppositeSection = Field(default_factory=OppositeSection)
     behavior: BehaviorSection = Field(default_factory=BehaviorSection)
+    context: ContextSection = Field(default_factory=ContextSection)
     scope: ScopeSection = Field(default_factory=ScopeSection)
