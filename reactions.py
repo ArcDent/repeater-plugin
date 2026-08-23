@@ -466,7 +466,8 @@ class InjectionState:
         self.max_slots = max(int(max_slots), 1)
         self._dedup: dict[tuple[str, str, str], float] = {}
         self._aggregates: dict[tuple[str, str], InjectionAggregate] = {}
-        self._injected_count: dict[str, int] = {}
+        # 注入计数带时间戳，随 prune 一起做 TTL 与上界裁剪，防止无界增长。
+        self._injected_count: dict[str, tuple[int, float]] = {}
 
     def record(self, event: ReactionEvent, display_reactor: str, now: float) -> str:
         """记录一次表情回应，返回 'new' / 'merged' / 'skip'。
@@ -484,7 +485,8 @@ class InjectionState:
         aggregate = self._aggregates.get(agg_key)
         if aggregate is None:
             active = sum(1 for mid, _ in self._aggregates if mid == event.message_id)
-            if active + self._injected_count.get(event.message_id, 0) >= self.max_reactions_per_message:
+            injected, _ = self._injected_count.get(event.message_id, (0, now))
+            if active + injected >= self.max_reactions_per_message:
                 return "skip"
             self._aggregates[agg_key] = InjectionAggregate(
                 group_id=event.group_id,
@@ -509,10 +511,11 @@ class InjectionState:
             self._aggregates.pop((agg.message_id, agg.emoji_id), None)
         return due
 
-    def mark_injected(self, message_id: str) -> None:
+    def mark_injected(self, message_id: str, now: float) -> None:
         key = str(message_id or "")
         if key:
-            self._injected_count[key] = self._injected_count.get(key, 0) + 1
+            count, _ = self._injected_count.get(key, (0, now))
+            self._injected_count[key] = (count + 1, now)
 
     def prune(self, now: float) -> None:
         """按 TTL 清理去重表与注入计数中的过期条目，并裁剪总量上界。"""
@@ -520,10 +523,21 @@ class InjectionState:
             expired = [k for k, ts in self._dedup.items() if now - ts > self.dedup_ttl_seconds]
             for key in expired:
                 self._dedup.pop(key, None)
+            stale = [
+                k for k, (_, ts) in self._injected_count.items() if now - ts > self.dedup_ttl_seconds
+            ]
+            for key in stale:
+                self._injected_count.pop(key, None)
         overflow = len(self._dedup) - self.max_slots
         if overflow > 0:
             for key, _ in sorted(self._dedup.items(), key=lambda kv: kv[1])[:overflow]:
                 self._dedup.pop(key, None)
+        count_overflow = len(self._injected_count) - self.max_slots
+        if count_overflow > 0:
+            for key, _ in sorted(self._injected_count.items(), key=lambda kv: kv[1][1])[
+                :count_overflow
+            ]:
+                self._injected_count.pop(key, None)
 
 
 def build_reactor_display(reactor_qq: str, self_qq: str, bot_display_name: str) -> str:

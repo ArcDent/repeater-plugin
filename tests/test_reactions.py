@@ -621,6 +621,32 @@ class TestInjectionState:
         st.due(now + 31)  # 聚合 30s 到期后由 due 取出，避免 merged
         assert st.record(make_event(), "20002", now + 11) == "new"
 
+    def test_mark_injected_count_cleared_by_prune_ttl(self):
+        st = InjectionState(
+            dedup_ttl_seconds=10, merge_window_seconds=30, max_reactions_per_message=1
+        )
+        now = time.time()
+        st.mark_injected("1001", now)
+        # TTL 未过时注入计数仍在：同消息不能再开新聚合
+        assert st.record(make_event(), "20002", now + 1) == "skip"
+        st.prune(now + 12)
+        # TTL 过期计数清空：同消息可再次开新聚合
+        assert st.record(make_event(), "20002", now + 12) == "new"
+
+    def test_mark_injected_prune_trims_overflow_oldest(self):
+        st = InjectionState(
+            dedup_ttl_seconds=0, merge_window_seconds=30,
+            max_slots=2, max_reactions_per_message=1,
+        )
+        now = time.time()
+        st.mark_injected("1001", now)
+        st.mark_injected("1002", now + 1)
+        st.mark_injected("1003", now + 2)
+        st.prune(now + 3)
+        # 超上界时按时间戳最旧丢弃：1001 的计数被清，1003 的仍生效
+        assert st.record(make_event(message_id="1001"), "20002", now + 4) == "new"
+        assert st.record(make_event(message_id="1003"), "20002", now + 5) == "skip"
+
 
 class TestVisibleText:
     def test_single_reactor(self):

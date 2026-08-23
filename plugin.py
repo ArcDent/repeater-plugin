@@ -123,7 +123,7 @@ class SendingEmojisPlugin(MaiBotPlugin):
                 merge_window_seconds=float(context.merge_window_seconds),
                 max_reactions_per_message=int(context.max_reactions_per_message),
             )
-            if context.enabled
+            if context.enabled and self.config.plugin.enabled
             else None
         )
 
@@ -330,7 +330,7 @@ class SendingEmojisPlugin(MaiBotPlugin):
         if not (isinstance(response, dict) and response.get("success")):
             self.ctx.logger.warning(f"注入表情回应上下文失败: {response}")
             return
-        state.mark_injected(aggregate.message_id)
+        state.mark_injected(aggregate.message_id, time.time())
         self.ctx.logger.info(
             f"已注入表情回应上下文 group={group_id} msg={aggregate.message_id} "
             f"emoji={aggregate.emoji_id} 回应者={aggregate.responders}"

@@ -691,6 +691,18 @@ def test_hook_passes_through_when_disabled():
     assert result["action"] == "continue"
 
 
+def test_plugin_disabled_plus_context_enabled_no_intercept_no_inject():
+    """plugin.enabled=false 时即使 context.enabled=true 也不建注入态：
+    Hook 一律放行，也不产生任何注入（开关语义，见 ADR 0003）。"""
+    plugin = make_plugin()
+    plugin.config.plugin.enabled = False
+    enable_injection(plugin)
+    result = asyncio.run(plugin.guard_reaction_notify(message=_notify_message()))
+    assert result["action"] == "continue"
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))
+    assert plugin.ctx.maisaka.context.calls == []
+
+
 def test_hook_passes_plain_message():
     plugin = make_plugin()
     enable_injection(plugin)
