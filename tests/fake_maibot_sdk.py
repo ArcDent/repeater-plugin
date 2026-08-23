@@ -44,3 +44,19 @@ class MaiBotPlugin:
     def __init__(self) -> None:
         self.ctx: Any = None
         self.config: Any = None
+
+
+class _FakeHookInfo:
+    def __init__(self, hook: str, **kwargs: Any) -> None:
+        self.hook = hook
+        self.kwargs = kwargs
+
+
+def HookHandler(hook: str, **kwargs: Any) -> Any:
+    """假装饰器：附着元数据并原样返回函数，测试只直接调用被装饰方法。"""
+
+    def decorator(func: Any) -> Any:
+        func._hook_info = _FakeHookInfo(hook, **kwargs)  # type: ignore[attr-defined]
+        return func
+
+    return decorator

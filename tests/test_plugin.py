@@ -40,9 +40,43 @@ class FakeLogger:
         return [message for lvl, message in self.records if lvl == level]
 
 
+class FakeConfig:
+    def __init__(self) -> None:
+        self.values: dict[str, Any] = {}
+
+    async def get(self, key: str, default: Any = None) -> Any:
+        return self.values.get(key, default)
+
+
+class FakeChat:
+    def __init__(self) -> None:
+        self.streams: dict[str, dict[str, Any] | None] = {}
+
+    async def get_stream_by_group_id(self, group_id: str, platform: str = "qq") -> Any:
+        return self.streams.get(str(group_id))
+
+
+class FakeMaisakaContext:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.fail_next = False
+
+    async def append(self, stream_id: str, segments: list[dict[str, Any]], **kwargs: Any) -> Any:
+        self.calls.append({"stream_id": stream_id, "segments": segments, **kwargs})
+        return {"success": not self.fail_next, "index": len(self.calls) - 1}
+
+
+class FakeMaisaka:
+    def __init__(self) -> None:
+        self.context = FakeMaisakaContext()
+
+
 class FakeCtx:
     def __init__(self) -> None:
         self.logger = FakeLogger()
+        self.config = FakeConfig()
+        self.chat = FakeChat()
+        self.maisaka = FakeMaisaka()
 
 
 class FakeRequest:
@@ -71,12 +105,20 @@ def make_plugin(protocol_responses: dict[str, Any] | None = None) -> SendingEmoj
     plugin.config.opposite.probability = 1.0
     plugin.config.bandwagon.probability = 1.0
     plugin.config.bandwagon.self_message_probability = 1.0
+    # 聚合窗口拉平：注入测试不控制时钟，聚合必须随事件即时 flush 才可断言。
+    plugin.config.context.merge_window_seconds = 0
 
     plugin._runner = None
     plugin._site = None
     plugin._tasks = set()
     plugin._self_qq = ""
     plugin._emoji_action_supported = True
+    # 主程序配置与聊天流替身：与 event() 默认 group_id="10001" 对齐。
+    plugin.ctx.config.values["bot.nickname"] = "麦麦"
+    plugin.ctx.chat.streams["10001"] = {
+        "stream_id": "stream-10001", "session_id": "stream-10001",
+        "group_id": "10001", "is_group_session": True,
+    }
     plugin._rebuild_runtime()
 
     responses = dict(protocol_responses or {})
@@ -451,3 +493,134 @@ def test_on_unload_cancels_pending_tasks():
         return task.cancelled()
 
     assert asyncio.run(scenario()) is True
+
+
+# ---- 上下文注入（实验性）----
+
+def enable_injection(plugin: SendingEmojisPlugin) -> None:
+    plugin.config.context.enabled = True
+    plugin._rebuild_runtime()
+
+
+def test_injection_disabled_by_default_no_append():
+    plugin = make_plugin()
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))
+    assert plugin.ctx.maisaka.context.calls == []
+
+
+def test_injection_enabled_appends_visible_text():
+    plugin = make_plugin()
+    enable_injection(plugin)
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))
+    assert len(plugin.ctx.maisaka.context.calls) == 1
+    call = plugin.ctx.maisaka.context.calls[0]
+    assert call["stream_id"] == "stream-10001"
+    assert call["segments"] == [{"type": "text", "data": call["visible_text"]}]
+    assert call["source_kind"] == "reaction"
+    assert call["message_id"] == "1001"
+    assert "20002" in call["visible_text"]
+    assert "👍" in call["visible_text"]
+
+
+def test_injection_dedupes_same_key():
+    plugin = make_plugin()
+    enable_injection(plugin)
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))
+    assert len(plugin.ctx.maisaka.context.calls) == 1
+
+
+def test_injection_merges_same_emoji_same_message(monkeypatch):
+    """聚合窗口内同消息同表情的多人回应合并为一条注入。
+
+    make_plugin 默认窗口为 0（即时 flush），本用例显式拉到 30s 并外拨时钟
+    越过窗口，让两条回应汇入同一聚合后一次性写入。
+    """
+    plugin = make_plugin()
+    plugin.config.context.merge_window_seconds = 30
+    enable_injection(plugin)
+
+    class FakeClock:
+        def __init__(self) -> None:
+            self.now = 1000.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = FakeClock()
+    monkeypatch.setattr("time.time", clock)
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))
+    clock.now = 1031.0  # 越过 30s 聚合窗口
+    asyncio.run(plugin._on_reaction(event(message_id="1001", reactor_qq="20003")))
+    assert len(plugin.ctx.maisaka.context.calls) == 1
+    text = plugin.ctx.maisaka.context.calls[0]["visible_text"]
+    assert "20002" in text and "20003" in text
+
+
+def test_injection_self_reaction_uses_bot_display_name():
+    plugin = make_plugin()
+    enable_injection(plugin)
+    asyncio.run(plugin._on_reaction(event(message_id="1001", reactor_qq=BOT_QQ)))
+    assert len(plugin.ctx.maisaka.context.calls) == 1
+    text = plugin.ctx.maisaka.context.calls[0]["visible_text"]
+    assert "麦麦" in text
+
+
+def test_injection_display_name_falls_back_to_config():
+    plugin = make_plugin()
+    plugin.ctx.config.values["bot.nickname"] = ""
+    plugin.config.context.self_display_name = "麦麦酱"
+    enable_injection(plugin)
+    asyncio.run(plugin._on_reaction(event(message_id="1001", reactor_qq=BOT_QQ)))
+    assert "麦麦酱" in plugin.ctx.maisaka.context.calls[0]["visible_text"]
+
+
+def test_injection_no_display_name_omits_name():
+    plugin = make_plugin()
+    plugin.ctx.config.values["bot.nickname"] = ""
+    plugin._bot_display_name = ""
+    enable_injection(plugin)
+    asyncio.run(plugin._on_reaction(event(message_id="1001", reactor_qq=BOT_QQ)))
+    text = plugin.ctx.maisaka.context.calls[0]["visible_text"]
+    assert text.startswith("[表情回应] 给某条消息")
+
+
+def test_injection_blacklisted_group_skipped():
+    plugin = make_plugin()
+    plugin.config.scope.group_blacklist = ["10001"]
+    enable_injection(plugin)
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))
+    assert plugin.ctx.maisaka.context.calls == []
+
+
+def test_injection_ignored_reactor_skipped_but_self_injected():
+    plugin = make_plugin()
+    plugin.config.scope.ignore_reactors = ["20002"]
+    enable_injection(plugin)
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))
+    assert plugin.ctx.maisaka.context.calls == []
+    asyncio.run(plugin._on_reaction(event(message_id="1002", reactor_qq=BOT_QQ)))
+    assert len(plugin.ctx.maisaka.context.calls) == 1
+
+
+def test_injection_unknown_stream_skipped():
+    plugin = make_plugin()
+    plugin.ctx.chat.streams["10001"] = None
+    enable_injection(plugin)
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))
+    assert plugin.ctx.maisaka.context.calls == []
+
+
+def test_injection_append_failure_logs_warning():
+    plugin = make_plugin()
+    enable_injection(plugin)
+    plugin.ctx.maisaka.context.fail_next = True
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))
+    assert any("注入" in t for t in plugin.ctx.logger.texts("warning"))
+
+
+def test_injection_removed_reaction_not_injected():
+    plugin = make_plugin()
+    enable_injection(plugin)
+    asyncio.run(plugin._on_reaction(event(message_id="1001", removed=True)))
+    assert plugin.ctx.maisaka.context.calls == []
