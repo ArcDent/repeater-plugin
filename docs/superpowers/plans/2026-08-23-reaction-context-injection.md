@@ -201,13 +201,23 @@ class TestInjectionState:
         st = InjectionState(dedup_ttl_seconds=3600, merge_window_seconds=30)
         now = time.time()
         st.record(make_event(), "20002", now)
+        st.due(now + 3601)  # 真实调用序列里旧聚合早已到期 flush，这里手动清掉
         assert st.record(make_event(), "20002", now + 3601) == "new"
+
+    def test_same_key_after_expiry_merges_if_aggregate_alive(self):
+        st = InjectionState(dedup_ttl_seconds=10, merge_window_seconds=30)
+        now = time.time()
+        st.record(make_event(), "20002", now)
+        # dedup 过期但聚合未到期（真实序列里 dedup_ttl > merge_window 时会命中）
+        assert st.record(make_event(), "20002", now + 11) == "merged"
+        (agg,) = st.due(now + 31)
+        assert agg.responders == ["20002"]
 
     def test_same_message_same_emoji_different_reactors_merge(self):
         st = InjectionState(merge_window_seconds=30)
         now = time.time()
         assert st.record(make_event(), "20002", now) == "new"
-        assert st.record(make_event(), "20003", now + 1) == "merged"
+        assert st.record(make_event(reactor="20003"), "20003", now + 1) == "merged"
         (agg,) = st.due(now + 31)
         assert agg.responders == ["20002", "20003"]
 
@@ -238,10 +248,12 @@ class TestInjectionState:
         st = InjectionState(merge_window_seconds=30)
         now = time.time()
         st.record(make_event(), "20002", now)
-        st.record(make_event(emoji="129303"), "20003", now + 5)
+        st.record(make_event(emoji="129303", reactor="20003"), "20003", now + 5)
         due = st.due(now + 31)
         assert len(due) == 1
         assert due[0].emoji_id == "128077"
+        # 第二个聚合 first_ts=now+5，now+35 到期，now+40 应返回且取出即移除
+        assert len(st.due(now + 40)) == 1
         assert st.due(now + 40) == []
 
     def test_prune_clears_stale_dedup_keys(self):
@@ -249,6 +261,7 @@ class TestInjectionState:
         now = time.time()
         st.record(make_event(), "20002", now)
         st.prune(now + 11)
+        st.due(now + 31)  # 清掉到期聚合（merge_window=30），避免 merged
         assert st.record(make_event(), "20002", now + 11) == "new"
 
 
@@ -352,7 +365,12 @@ class InjectionState:
         self._injected_count: dict[str, int] = {}
 
     def record(self, event: ReactionEvent, display_reactor: str, now: float) -> str:
-        """记录一次表情回应，返回 'new' / 'merged' / 'skip'。"""
+        """记录一次表情回应，返回 'new' / 'merged' / 'skip'。
+
+        去重键按 reactor_qq（回应者 = QQ 用户，见 CONTEXT.md）；display_reactor
+        只是显示名。dedup 过期后的同键回应：聚合仍存在则并入（responders 已去重，
+        不会重复列名），否则开启新聚合。
+        """
         key = (event.reactor_qq, event.message_id, event.emoji_id)
         last = self._dedup.get(key)
         if last is not None and not (self.dedup_ttl_seconds and now - last > self.dedup_ttl_seconds):
@@ -362,7 +380,8 @@ class InjectionState:
         agg_key = (event.message_id, event.emoji_id)
         aggregate = self._aggregates.get(agg_key)
         if aggregate is None:
-            if self._injected_count.get(event.message_id, 0) >= self.max_reactions_per_message:
+            active = sum(1 for mid, _ in self._aggregates if mid == event.message_id)
+            if active + self._injected_count.get(event.message_id, 0) >= self.max_reactions_per_message:
                 return "skip"
             self._aggregates[agg_key] = InjectionAggregate(
                 message_id=event.message_id,
@@ -934,8 +953,8 @@ from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, HookHandler, MaiBotPlugin
     @HookHandler(
         "chat.receive.before_process",
         name="emoji_reaction_notify_guard",
-        mode="BLOCKING",
-        order="EARLY",
+        mode="blocking",
+        order="early",
         description="防御式拦截表情回应通知消息，避免其进入主程序上下文（ADR 0003）。",
     )
     async def guard_reaction_notify(self, **kwargs: Any) -> dict[str, Any]:
@@ -955,7 +974,7 @@ from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, HookHandler, MaiBotPlugin
         return {"action": "continue", "modified_kwargs": kwargs}
 ```
 
-注意：`mode`/`order` 传字符串——fake 里 `HookHandler` 假装饰器接受任意 kwargs；真实 SDK 的 `HookMode.BLOCKING`/`HookOrder.EARLY` 是字符串枚举（`"BLOCKING"`/`"EARLY"`），为让 fake 与真实 SDK 都能跑，直接传字符串值即可（真实 SDK `HookHandler` 的 `mode` 参数类型是 `HookMode`，枚举值为字符串，运行时比较用值，字符串传参成立——若 pyright 报类型错误，改回从 `maibot_sdk.components` 导入枚举并在 import 处处理）。
+注意：`mode`/`order` 传**小写**字符串——真实 SDK 的 `HookMode.BLOCKING = "blocking"`、`HookOrder.EARLY = "early"`（`REFERENCE/maibot-plugin-sdk/maibot_sdk/types.py`，str Enum，值为小写）。`HookHandler` 装饰时构造 pydantic 模型，传大写 `"BLOCKING"` 会抛 ValidationError 导致插件加载失败。直接传小写字符串值最稳（pydantic 接受值转枚举成员，fake 假装饰器接受任意 kwargs 亦兼容）；pyright 若报类型错误再改从 `maibot_sdk.types` 导入枚举。
 
 - [ ] **Step 4: 运行确认通过**
 
@@ -1020,7 +1039,8 @@ Unicode 码点），归一正好抹平「上报给字符、发送要码点」的
 ## QQ 小黄脸编号边界
 
 编号语义没有公开权威静态表，以下边界来自 SnowLuma（`REFERENCE/snowluma`）
-`packages/core/src/sys-face-catalog.ts` 的 `faceWireFor`：
+`packages/protocol/src/sys-face-store.ts` 的 `faceWireFor`（core 下同名文件只是
+storage 绑定模块）：
 
 - `face_id < 260`：classic 小黄脸
 - `260 <= face_id`：small（新式表情）
