@@ -28,6 +28,34 @@ extra_pairs = ["🎉=😢", "76=78"]
 disabled_emojis = ["👍"]   # 把 👍 从反义映射里摘掉，让它回落到跟风
 ```
 
+## 上下文注入（实验性，默认关闭）
+
+`context.enabled` 默认 `false`，整块功能试验性地开、试验性地关。开启后：
+
+- **注入**：表情回应（含麦麦自己贴的）去重、聚合后作为**独立上下文消息**写入聊天历史（`source_kind="reaction"`，`message_id` 指向被回应消息），麦麦回复时会感知到群里发生过表情回应
+- **拦截**：插件挂 `chat.receive.before_process` Hook，把主程序消息链上的表情回应通知消息 abort 掉，避免适配器转发 notice 时历史里出现两份记录（见 [ADR 0003](docs/adr/0003-reaction-context-injection-with-defensive-intercept.md)）
+
+注入限流里有三个窗口概念，不要混：
+
+- **去重**（`dedup_ttl_seconds`，默认 3600）：同一「回应者 + 被回应消息 + 表情」组合在窗口内只注入一次
+- **聚合**（`merge_window_seconds`，默认 30）：同一被回应消息同一表情的多条回应在此窗口内汇入同一条注入消息，窗口到期写入——「A、B、C 给消息 X 贴了 👍」是一条注入消息而不是三条
+- **上限**（`max_reactions_per_message`，默认 10）：单条被回应消息最多产生的注入消息条数，防表情回应风暴撑爆上下文
+
+注入的门禁复用 `[scope]` 的白黑名单；麦麦自己贴的表情回应不受 `ignore_reactors` 影响。注入文本里麦麦自己的显示名来源链：`context.self_display_name` → 主程序配置 `bot.nickname` → 都取不到就不写名字。
+
+```toml
+[context]
+enabled = false
+# 同一（回应者、被回应消息、表情）组合在此窗口内只注入一次
+dedup_ttl_seconds = 3600
+# 同一被回应消息同一表情的多条回应在此窗口内汇入同一条注入消息
+merge_window_seconds = 30
+# 单条被回应消息最多产生的注入消息条数
+max_reactions_per_message = 10
+# 麦麦自己的显示名；留空自动取主程序 bot.nickname，再取不到则不写名字
+self_display_name = ""
+```
+
 ## 安装
 
 1. 目录整个放进 MaiBot 的 `plugins/`，无需打包

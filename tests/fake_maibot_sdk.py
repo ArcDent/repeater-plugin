@@ -9,17 +9,22 @@ CONFIG_RELOAD_SCOPE_SELF = "self"
 
 
 class PluginConfigBase:
-    """按注解逐字段取默认值；默认值深拷贝，保证每个实例的嵌套 section 互相独立。"""
+    """按注解逐字段取默认值；默认值深拷贝，保证每个实例的嵌套 section 互相独立。
+
+    kwargs 里的 dict 覆盖值自动转为对应嵌套 section（对齐真实 maibot_sdk 的
+    pydantic 语义，如 ``SendingEmojisConfig(context={"enabled": True})``）。
+    """
 
     def __init__(self, **kwargs: Any) -> None:
         annotations: dict[str, Any] = getattr(self.__class__, "__annotations__", {})
-        for key in annotations:
-            if key in kwargs:
-                setattr(self, key, kwargs[key])
-            else:
-                setattr(self, key, copy.deepcopy(getattr(type(self), key, None)))
         for key, value in kwargs.items():
+            default = getattr(type(self), key, None)
+            if isinstance(default, PluginConfigBase) and isinstance(value, dict):
+                value = type(default)(**value)
             setattr(self, key, value)
+        for key in annotations:
+            if key not in kwargs:
+                setattr(self, key, copy.deepcopy(getattr(type(self), key, None)))
 
 
 def Field(
@@ -39,3 +44,35 @@ class MaiBotPlugin:
     def __init__(self) -> None:
         self.ctx: Any = None
         self.config: Any = None
+
+
+class _FakeHookInfo:
+    def __init__(self, hook: str, **kwargs: Any) -> None:
+        self.hook = hook
+        self.kwargs = kwargs
+
+
+_HOOK_MODES = {"blocking", "observe"}
+_HOOK_ORDERS = {"early", "normal", "late"}
+
+
+def HookHandler(hook: str, **kwargs: Any) -> Any:
+    """假装饰器：附着元数据并原样返回函数，测试只直接调用被装饰方法。
+
+    对 mode/order 做值校验（对齐真实 SDK 的 pydantic 枚举校验，
+    maibot_sdk/types.py 的 HookMode/HookOrder），传大写等非法值直接抛
+    ValueError，防止 fake 过宽放行生产代码里的错误枚举值。
+    """
+
+    mode = kwargs.get("mode")
+    if mode is not None and mode not in _HOOK_MODES:
+        raise ValueError(f"invalid hook mode: {mode!r} (allowed: {sorted(_HOOK_MODES)})")
+    order = kwargs.get("order")
+    if order is not None and order not in _HOOK_ORDERS:
+        raise ValueError(f"invalid hook order: {order!r} (allowed: {sorted(_HOOK_ORDERS)})")
+
+    def decorator(func: Any) -> Any:
+        func._hook_info = _FakeHookInfo(hook, **kwargs)  # type: ignore[attr-defined]
+        return func
+
+    return decorator

@@ -2,20 +2,27 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from reactions import (
     BANDWAGON,
     DEFAULT_OPPOSITE_PAIRS,
     OPPOSITE,
+    InjectionState,
     ReactionEvent,
     ReactionState,
     build_opposite_map,
+    build_reaction_visible_text,
+    build_reactor_display,
     coerce_message_id,
     decide_reaction,
+    emoji_id_to_display,
     group_allowed,
     is_missing_action,
     is_reaction_notice,
+    is_reaction_notice_message,
     normalize_emoji_id,
     parse_message_author,
     parse_pair,
@@ -531,3 +538,167 @@ def test_is_missing_action():
     assert is_missing_action({"retcode": 1404}) is True
     assert is_missing_action({"retcode": 0}) is False
     assert is_missing_action(None) is False
+
+
+# ---- 注入聚合（Task 2：去重/聚合/可见文本/形态判定）----
+
+def make_event(message_id="1001", reactor="20002", emoji="128077", group="30003"):
+    return ReactionEvent(group_id=group, message_id=message_id,
+                         reactor_qq=reactor, emoji_id=emoji)
+
+
+class TestInjectionState:
+    def test_same_key_deduped_within_window(self):
+        st = InjectionState(dedup_ttl_seconds=3600, merge_window_seconds=30)
+        now = time.time()
+        assert st.record(make_event(), "20002", now) == "new"
+        assert st.record(make_event(), "20002", now + 1) == "skip"
+
+    def test_same_key_allowed_after_window_expiry(self):
+        st = InjectionState(dedup_ttl_seconds=3600, merge_window_seconds=30)
+        now = time.time()
+        st.record(make_event(), "20002", now)
+        st.due(now + 3601)  # 真实调用序列里旧聚合早已到期 flush，这里手动清掉
+        assert st.record(make_event(), "20002", now + 3601) == "new"
+
+    def test_same_key_after_expiry_merges_if_aggregate_alive(self):
+        st = InjectionState(dedup_ttl_seconds=10, merge_window_seconds=30)
+        now = time.time()
+        st.record(make_event(), "20002", now)
+        # dedup 过期但聚合未到期（真实序列里 dedup_ttl > merge_window 时会命中）
+        assert st.record(make_event(), "20002", now + 11) == "merged"
+        (agg,) = st.due(now + 31)
+        assert agg.responders == ["20002"]
+
+    def test_same_message_same_emoji_different_reactors_merge(self):
+        st = InjectionState(merge_window_seconds=30)
+        now = time.time()
+        assert st.record(make_event(), "20002", now) == "new"
+        assert st.record(make_event(reactor="20003"), "20003", now + 1) == "merged"
+        (agg,) = st.due(now + 31)
+        assert agg.responders == ["20002", "20003"]
+
+    def test_same_reactor_not_duplicated_in_aggregate(self):
+        st = InjectionState(merge_window_seconds=30)
+        now = time.time()
+        st.record(make_event(), "20002", now)
+        # 同键应被 dedup 拦，换一个键但同 reactor（不同 emoji）验证不重复列名
+        ev = make_event(emoji="129303")
+        assert st.record(ev, "20002", now + 1) == "new"
+
+    def test_different_emojis_get_separate_aggregates(self):
+        st = InjectionState(merge_window_seconds=30)
+        now = time.time()
+        assert st.record(make_event(), "20002", now) == "new"
+        assert st.record(make_event(emoji="129303"), "20002", now + 1) == "new"
+        due = st.due(now + 31)
+        assert len(due) == 2
+
+    def test_injection_cap_drops_extra_aggregates(self):
+        st = InjectionState(merge_window_seconds=30, max_reactions_per_message=2)
+        now = time.time()
+        assert st.record(make_event(emoji="128077"), "20002", now) == "new"
+        assert st.record(make_event(emoji="129303"), "20002", now + 1) == "new"
+        assert st.record(make_event(emoji="128512"), "20002", now + 2) == "skip"
+
+    def test_due_only_returns_expired_aggregates(self):
+        st = InjectionState(merge_window_seconds=30)
+        now = time.time()
+        st.record(make_event(), "20002", now)
+        st.record(make_event(emoji="129303", reactor="20003"), "20003", now + 5)
+        due = st.due(now + 31)
+        assert len(due) == 1
+        assert due[0].emoji_id == "128077"
+        # 第二个聚合 first_ts=now+5，now+35 到期，now+40 应返回且取出即移除
+        assert len(st.due(now + 40)) == 1
+        assert st.due(now + 40) == []
+
+    def test_prune_clears_stale_dedup_keys(self):
+        st = InjectionState(dedup_ttl_seconds=10, merge_window_seconds=30)
+        now = time.time()
+        st.record(make_event(), "20002", now)
+        st.prune(now + 11)
+        st.due(now + 31)  # 聚合 30s 到期后由 due 取出，避免 merged
+        assert st.record(make_event(), "20002", now + 11) == "new"
+
+    def test_mark_injected_count_cleared_by_prune_ttl(self):
+        st = InjectionState(
+            dedup_ttl_seconds=10, merge_window_seconds=30, max_reactions_per_message=1
+        )
+        now = time.time()
+        st.mark_injected("1001", now)
+        # TTL 未过时注入计数仍在：同消息不能再开新聚合
+        assert st.record(make_event(), "20002", now + 1) == "skip"
+        st.prune(now + 12)
+        # TTL 过期计数清空：同消息可再次开新聚合
+        assert st.record(make_event(), "20002", now + 12) == "new"
+
+    def test_mark_injected_prune_trims_overflow_oldest(self):
+        st = InjectionState(
+            dedup_ttl_seconds=0, merge_window_seconds=30,
+            max_slots=2, max_reactions_per_message=1,
+        )
+        now = time.time()
+        st.mark_injected("1001", now)
+        st.mark_injected("1002", now + 1)
+        st.mark_injected("1003", now + 2)
+        st.prune(now + 3)
+        # 超上界时按时间戳最旧丢弃：1001 的计数被清，1003 的仍生效
+        assert st.record(make_event(message_id="1001"), "20002", now + 4) == "new"
+        assert st.record(make_event(message_id="1003"), "20002", now + 5) == "skip"
+
+
+class TestVisibleText:
+    def test_single_reactor(self):
+        text = build_reaction_visible_text("1001", "128077", ["20002"])
+        assert text == "[表情回应] 20002 给某条消息(id=1001)贴了 👍"
+
+    def test_multiple_reactors_with_count(self):
+        text = build_reaction_visible_text("1001", "128077", ["20002", "20003"])
+        assert text == "[表情回应] 20002、20003 给某条消息(id=1001)贴了 👍（2人）"
+
+    def test_no_name_when_responders_empty(self):
+        text = build_reaction_visible_text("1001", "76", [])
+        assert text == "[表情回应] 给某条消息(id=1001)贴了 76"
+
+    def test_long_message_id_truncated(self):
+        text = build_reaction_visible_text("12345678901234567890", "128077", ["20002"])
+        assert text == "[表情回应] 20002 给某条消息(id=12345678…)贴了 👍"
+
+
+class TestEmojiDisplay:
+    def test_qq_face_id_passthrough(self):
+        assert emoji_id_to_display("76") == "76"
+
+    def test_unicode_codepoint_to_char(self):
+        assert emoji_id_to_display("128077") == "👍"
+
+    def test_emoji_char_passthrough(self):
+        assert emoji_id_to_display("👍") == "👍"
+
+
+class TestReactorDisplay:
+    def test_self_uses_bot_display_name(self):
+        assert build_reactor_display("40004", "40004", "麦麦") == "麦麦"
+
+    def test_self_without_display_name_empty(self):
+        assert build_reactor_display("40004", "40004", "") == ""
+
+    def test_other_uses_qq(self):
+        assert build_reactor_display("20002", "40004", "麦麦") == "20002"
+
+
+class TestReactionNoticeMessage:
+    def test_emoji_like_notify_matched(self):
+        msg = {"is_notify": True,
+               "message_info": {"additional_config": {"napcat_notice_type": "group_msg_emoji_like"}}}
+        assert is_reaction_notice_message(msg) is True
+
+    def test_plain_message_not_matched(self):
+        msg = {"is_notify": False, "message_info": {"additional_config": {}}}
+        assert is_reaction_notice_message(msg) is False
+
+    def test_unrelated_notify_not_matched(self):
+        msg = {"is_notify": True,
+               "message_info": {"additional_config": {"napcat_notice_type": "group_recall"}}}
+        assert is_reaction_notice_message(msg) is False

@@ -6,10 +6,11 @@ MaiBot 插件：群里有人贴表情回应后，麦麦按概率跟风贴同款�
 
 - `plugin.py` — 插件主类：上报监听、门禁与掷骰编排、协议端直调、启动自检
 - `reactions.py` — 纯逻辑层（上报解析、表情 ID 归一、反义映射、决策、表情槽与冷却），不依赖 SDK，可单测
-- `config.py` — 配置模型（plugin/webhook/protocol/bandwagon/opposite/behavior/scope）
+- `config.py` — 配置模型（plugin/webhook/protocol/bandwagon/opposite/behavior/context/scope）
 - `config.toml` — 默认配置，值必须与 `config.py` 的 default 一致
 - `tests/` — pytest（fake maibot_sdk 注入，`uv run --with pytest --with aiohttp pytest tests/ -q`）
-- `docs/adr/` — 0001 走 webhook 不走 SDK 事件链；0002 分支严格互斥 + 内存态
+- `docs/emoji-id-reference.md` — 表情 ID 两套编号体系（QQ 小黄脸编号 / Unicode 码点）查表与边界
+- `docs/adr/` — 0001 走 webhook 不走 SDK 事件链；0002 分支严格互斥 + 内存态；0003 防御式拦截通知 + 插件自建注入
 - `CONTEXT.md` — 领域术语表
 
 ## 关键规则
@@ -23,6 +24,9 @@ MaiBot 插件：群里有人贴表情回应后，麦麦按概率跟风贴同款�
 - 表情 ID 归一一律走 `normalize_emoji_id`（纯数字原样，emoji 字符取首码点）。**这不是美化，删不得**：协议端上报 Unicode 表情给的是字符本身（`'⭐'`），而发送时按 `code.length > 3` 判类型（≤3 位当 QQ 小黄脸、更长当 Unicode 码点），归一正好抹平这个不对称。依据见 `REFERENCE/snowluma` 的 `msg-push/decoders/event-0x2dc.ts` 与 `oidb-services/reaction/set-reaction.ts`
 - 内置反义映射只用 Unicode emoji，不臆造 QQ 私有编号的语义
 - 协议端行为有疑问先读源码：SnowLuma 已 clone 在 `/Users/arcdent/github/REFERENCE/snowluma`，表情回应相关在 `packages/onebot/src/event-converter/to-notice.ts`（上报）、`packages/onebot/src/actions/extended.ts`（`set_msg_emoji_like`）、`packages/onebot/src/actions/message.ts`（`get_msg`）
+- 上下文注入默认关闭（`context.enabled`），整块试、整块关；注入路径复用 `scope` 白黑名单，但麦麦自己贴的回应不受 `ignore_reactors` 影响
+- 注入限流里**去重 ≠ 聚合**：去重（`dedup_ttl_seconds`）管「同一回应者+被回应消息+表情只注入一次」，聚合（`merge_window_seconds`）管「同一被回应消息同一表情的多条回应汇入一条注入消息」，`max_reactions_per_message` 兜住单条消息的注入条数
+- 注入文本显示名来源链：`context.self_display_name` → 主程序 `bot.nickname` → 空（不写名字）
 - 新增纯逻辑先写进 `reactions.py` 并加单测；不往 `plugin.py` 里塞可测逻辑
 
 ## 验证

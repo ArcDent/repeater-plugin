@@ -16,20 +16,24 @@ from typing import Any
 
 import aiohttp
 from aiohttp import web
-from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, MaiBotPlugin
+from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, HookHandler, MaiBotPlugin
 
 from .config import SendingEmojisConfig
 from .reactions import (
     OPPOSITE,
     Decision,
+    InjectionState,
     ReactionEvent,
     ReactionState,
     build_opposite_map,
+    build_reaction_visible_text,
+    build_reactor_display,
     coerce_message_id,
     decide_reaction,
     group_allowed,
     is_missing_action,
     is_reaction_notice,
+    is_reaction_notice_message,
     parse_message_author,
     parse_reaction_report,
     parse_self_qq,
@@ -49,6 +53,9 @@ class SendingEmojisPlugin(MaiBotPlugin):
     _self_qq: str
     _tasks: set[asyncio.Task]
     _emoji_action_supported: bool
+    _injection_state: InjectionState | None
+    _bot_display_name: str
+    _stream_ids: dict[str, str]
 
     async def on_load(self) -> None:
         self._runner = None
@@ -57,6 +64,12 @@ class SendingEmojisPlugin(MaiBotPlugin):
         self._self_qq = ""
         self._emoji_action_supported = True
         self._rebuild_runtime()
+
+        if self._injection_state is not None:
+            self._bot_display_name = await self._fetch_bot_display_name()
+            self.ctx.logger.info(
+                f"上下文注入已启用，麦麦显示名: {self._bot_display_name or '（无，注入时不写名字）'}"
+            )
 
         if self.config.plugin.enabled:
             await self._start_webhook()
@@ -101,6 +114,18 @@ class SendingEmojisPlugin(MaiBotPlugin):
         configured_self_qq = str(self.config.protocol.self_qq or "").strip()
         if configured_self_qq:
             self._self_qq = configured_self_qq
+        context = self.config.context
+        self._stream_ids = {}
+        self._bot_display_name = ""
+        self._injection_state = (
+            InjectionState(
+                dedup_ttl_seconds=float(context.dedup_ttl_seconds),
+                merge_window_seconds=float(context.merge_window_seconds),
+                max_reactions_per_message=int(context.max_reactions_per_message),
+            )
+            if context.enabled and self.config.plugin.enabled
+            else None
+        )
 
     # ---- Webhook 服务 ----
 
@@ -189,6 +214,12 @@ class SendingEmojisPlugin(MaiBotPlugin):
 
     async def _on_reaction(self, event: ReactionEvent) -> None:
         try:
+            try:
+                if self._injection_state is not None:
+                    await self._inject_reaction(event)
+            except Exception as exc:
+                # 注入失败不得拖垮行为路径：记日志后照常走跟风/反义决策。
+                self.ctx.logger.warning(f"注入表情回应上下文异常: {exc}")
             decision = await self._evaluate(event)
             if decision is None:
                 return
@@ -246,6 +277,117 @@ class SendingEmojisPlugin(MaiBotPlugin):
                 f"reactor={event.reactor_qq or '未知'} {decision.reason}"
             )
         return decision
+
+    # ---- 上下文注入（实验性）----
+
+    async def _inject_reaction(self, event: ReactionEvent) -> None:
+        """去重、聚合后把表情回应注入聊天历史。失败只记日志，不阻塞行为路径。"""
+        if self._injection_state is None or event.removed:
+            return
+        scope = self.config.scope
+        if not group_allowed(event.group_id, scope.group_whitelist, scope.group_blacklist):
+            return
+        ignored = {str(qq).strip() for qq in (scope.ignore_reactors or []) if str(qq).strip()}
+        if event.reactor_qq and event.reactor_qq in ignored and event.reactor_qq != self._self_qq:
+            return
+
+        now = time.time()
+        if not self._bot_display_name:
+            # on_load 已取过一次；此处兜底（测试直调、配置热更新等场景），
+            # 并保证显示名随 _rebuild_runtime 重置后仍能重新解析。
+            self._bot_display_name = await self._fetch_bot_display_name()
+        display = build_reactor_display(event.reactor_qq, self._self_qq, self._bot_display_name)
+        result = self._injection_state.record(event, display, now)
+        if result == "skip":
+            return
+        for aggregate in self._injection_state.due(now):
+            # 聚合归属自己的群：不得用当前事件的群，多群并发时会串群。
+            await self._flush_aggregate(aggregate.group_id, aggregate)
+        self._injection_state.prune(now)
+
+    async def _flush_aggregate(
+        self, group_id: str, aggregate: Any
+    ) -> None:
+        state = self._injection_state
+        if state is None:
+            return
+        stream_id = await self._get_stream_id(group_id)
+        if not stream_id:
+            self.ctx.logger.debug(f"取不到群 {group_id} 的 stream，跳过注入")
+            return
+        text = build_reaction_visible_text(aggregate.message_id, aggregate.emoji_id, aggregate.responders)
+        try:
+            response = await self.ctx.maisaka.context.append(
+                stream_id=stream_id,
+                segments=[{"type": "text", "data": text}],
+                visible_text=text,
+                source_kind="reaction",
+                message_id=aggregate.message_id,
+            )
+        except Exception as exc:
+            self.ctx.logger.warning(f"注入表情回应上下文调用失败: {exc}")
+            return
+        if not (isinstance(response, dict) and response.get("success")):
+            self.ctx.logger.warning(f"注入表情回应上下文失败: {response}")
+            return
+        state.mark_injected(aggregate.message_id, time.time())
+        self.ctx.logger.info(
+            f"已注入表情回应上下文 group={group_id} msg={aggregate.message_id} "
+            f"emoji={aggregate.emoji_id} 回应者={aggregate.responders}"
+        )
+
+    async def _get_stream_id(self, group_id: str) -> str:
+        """群号 → 聊天流 ID，带缓存；查不到返回空串。"""
+        cached = self._stream_ids.get(group_id)
+        if cached is not None:
+            return cached
+        stream_id = ""
+        try:
+            stream = await self.ctx.chat.get_stream_by_group_id(group_id)
+        except Exception as exc:
+            self.ctx.logger.debug(f"查群 {group_id} 的 stream 失败: {exc}")
+            stream = None
+        if isinstance(stream, dict):
+            stream_id = str(stream.get("stream_id") or stream.get("session_id") or "").strip()
+        self._stream_ids[group_id] = stream_id
+        return stream_id
+
+    async def _fetch_bot_display_name(self) -> str:
+        """机器人显示名来源链：配置兜底 → 主程序 bot.nickname → 空。"""
+        configured = str(self.config.context.self_display_name or "").strip()
+        if configured:
+            return configured
+        try:
+            result = await self.ctx.config.get("bot.nickname", "")
+        except Exception as exc:
+            self.ctx.logger.debug(f"取主程序 bot.nickname 失败: {exc}")
+            return ""
+        return str(result or "").strip()
+
+    # ---- 防御式拦截（chat.receive.before_process Hook）----
+
+    @HookHandler(
+        "chat.receive.before_process",
+        name="emoji_reaction_notify_guard",
+        mode="blocking",
+        order="early",
+        description="防御式拦截表情回应通知消息，避免其进入主程序上下文（ADR 0003）。",
+    )
+    async def guard_reaction_notify(self, **kwargs: Any) -> dict[str, Any]:
+        """表情回应通知消息在主链上 abort；其余放行。
+
+        命中时打 info 日志——这条日志就是「适配器是否把表情回应当通知转发」的
+        线上答案（ADR 0001/0003）。上下文注入关闭时不拦截。
+        """
+        if self._injection_state is None:
+            return {"action": "continue", "modified_kwargs": kwargs}
+        message = kwargs.get("message")
+        if is_reaction_notice_message(message):
+            self.ctx.logger.info(
+                f"拦截表情回应通知消息进入主程序: {str(message)[:200]}"
+            )
+            return {"action": "abort", "modified_kwargs": kwargs}
+        return {"action": "continue", "modified_kwargs": kwargs}
 
     async def _is_self_message(self, message_id: str, now: float) -> bool:
         """被回应消息的原作者是否是麦麦自己。查不到时按他人消息处理。"""

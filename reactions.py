@@ -428,3 +428,168 @@ class ReactionState:
         if author_overflow > 0:
             for key, _ in sorted(self._authors.items(), key=lambda kv: kv[1][0])[:author_overflow]:
                 self._authors.pop(key, None)
+
+
+@dataclass
+class InjectionAggregate:
+    """聚合窗口内同消息同表情的多条回应的合并体。
+
+    group_id 记录聚合归属的群：到期 flush 时注入该群的 stream，
+    不得借用触发 flush 的那个事件的群（多群并发时会串群）。
+    """
+
+    group_id: str
+    message_id: str
+    emoji_id: str
+    responders: list[str]
+    first_ts: float
+
+
+class InjectionState:
+    """表情回应的去重与聚合，纯内存 + TTL 裁剪。见 docs/adr/0003。
+
+    - 去重键 (responder, message_id, emoji_id)：窗口内同键只注入一次
+    - 聚合键 (message_id, emoji_id)：窗口内多人同表情合并为一条注入消息
+    - 注入上限：单条消息最多开启 max_reactions_per_message 个聚合
+    """
+
+    def __init__(
+        self,
+        dedup_ttl_seconds: float = 3600.0,
+        merge_window_seconds: float = 30.0,
+        max_reactions_per_message: int = 10,
+        max_slots: int = 2000,
+    ) -> None:
+        self.dedup_ttl_seconds = max(float(dedup_ttl_seconds), 0.0)
+        self.merge_window_seconds = max(float(merge_window_seconds), 0.0)
+        self.max_reactions_per_message = max(int(max_reactions_per_message), 1)
+        self.max_slots = max(int(max_slots), 1)
+        self._dedup: dict[tuple[str, str, str], float] = {}
+        self._aggregates: dict[tuple[str, str], InjectionAggregate] = {}
+        # 注入计数带时间戳，随 prune 一起做 TTL 与上界裁剪，防止无界增长。
+        self._injected_count: dict[str, tuple[int, float]] = {}
+
+    def record(self, event: ReactionEvent, display_reactor: str, now: float) -> str:
+        """记录一次表情回应，返回 'new' / 'merged' / 'skip'。
+
+        去重对象是回应者（reactor_qq，CONTEXT.md 术语），display_reactor 只是
+        显示名：同人在 dedup TTL 内的重复回应只注入一次。
+        """
+        key = (event.reactor_qq, event.message_id, event.emoji_id)
+        last = self._dedup.get(key)
+        if last is not None and not (self.dedup_ttl_seconds and now - last > self.dedup_ttl_seconds):
+            return "skip"
+        self._dedup[key] = now
+
+        agg_key = (event.message_id, event.emoji_id)
+        aggregate = self._aggregates.get(agg_key)
+        if aggregate is None:
+            active = sum(1 for mid, _ in self._aggregates if mid == event.message_id)
+            injected, _ = self._injected_count.get(event.message_id, (0, now))
+            if active + injected >= self.max_reactions_per_message:
+                return "skip"
+            self._aggregates[agg_key] = InjectionAggregate(
+                group_id=event.group_id,
+                message_id=event.message_id,
+                emoji_id=event.emoji_id,
+                responders=[display_reactor] if display_reactor else [],
+                first_ts=now,
+            )
+            return "new"
+        if display_reactor and display_reactor not in aggregate.responders:
+            aggregate.responders.append(display_reactor)
+        return "merged"
+
+    def due(self, now: float) -> list[InjectionAggregate]:
+        """取出并移除全部到期聚合。"""
+        due = [
+            agg
+            for agg in self._aggregates.values()
+            if now - agg.first_ts >= self.merge_window_seconds
+        ]
+        for agg in due:
+            self._aggregates.pop((agg.message_id, agg.emoji_id), None)
+        return due
+
+    def mark_injected(self, message_id: str, now: float) -> None:
+        key = str(message_id or "")
+        if key:
+            count, _ = self._injected_count.get(key, (0, now))
+            self._injected_count[key] = (count + 1, now)
+
+    def prune(self, now: float) -> None:
+        """按 TTL 清理去重表与注入计数中的过期条目，并裁剪总量上界。"""
+        if self.dedup_ttl_seconds:
+            expired = [k for k, ts in self._dedup.items() if now - ts > self.dedup_ttl_seconds]
+            for key in expired:
+                self._dedup.pop(key, None)
+            stale = [
+                k for k, (_, ts) in self._injected_count.items() if now - ts > self.dedup_ttl_seconds
+            ]
+            for key in stale:
+                self._injected_count.pop(key, None)
+        overflow = len(self._dedup) - self.max_slots
+        if overflow > 0:
+            for key, _ in sorted(self._dedup.items(), key=lambda kv: kv[1])[:overflow]:
+                self._dedup.pop(key, None)
+        count_overflow = len(self._injected_count) - self.max_slots
+        if count_overflow > 0:
+            for key, _ in sorted(self._injected_count.items(), key=lambda kv: kv[1][1])[
+                :count_overflow
+            ]:
+                self._injected_count.pop(key, None)
+
+
+def build_reactor_display(reactor_qq: str, self_qq: str, bot_display_name: str) -> str:
+    """回应者在注入文本里的显示名：麦麦自己用机器人显示名，他人用 QQ 号。"""
+    if self_qq and reactor_qq == self_qq:
+        return str(bot_display_name or "").strip()
+    return str(reactor_qq or "").strip()
+
+
+def emoji_id_to_display(emoji_id: str) -> str:
+    """把归一后的表情 ID 还原为展示形式：长纯数字当 Unicode 码点转字符，其余原样。
+
+    与协议端 set-reaction 的 `code.length > 3` 判型保持一致（见 AGENTS.md）。
+    """
+    text = str(emoji_id or "").strip()
+    if text.isdigit() and len(text) > 3:
+        try:
+            return chr(int(text))
+        except ValueError:
+            return text
+    return text
+
+
+def build_reaction_visible_text(message_id: str, emoji_id: str, responders: list[str]) -> str:
+    """构建注入消息的可见文本。回应者可能为空（显示名取不到时）。"""
+    mid = str(message_id or "")
+    if len(mid) > 8:
+        mid = mid[:8] + "…"
+    names = "、".join(responders)
+    count = f"（{len(responders)}人）" if len(responders) > 1 else ""
+    prefix = f"{names} " if names else ""
+    return f"[表情回应] {prefix}给某条消息(id={mid})贴了 {emoji_id_to_display(emoji_id)}{count}"
+
+
+def is_reaction_notice_message(message: Any) -> bool:
+    """判定主程序消息链上的一条通知消息是否为表情回应形态（防御式拦截用）。
+
+    只认主程序适配器约定写入的 notice_type 字段（bot.py 注释：additional_config
+    含 napcat_notice_type / napcat_notice_sub_type / napcat_notice_payload），
+    认不出返回 False 放行——不臆测未知形态（ADR 0003）。
+    """
+    if not isinstance(message, dict):
+        return False
+    if not message.get("is_notify"):
+        return False
+    message_info = message.get("message_info")
+    if not isinstance(message_info, dict):
+        return False
+    additional = message_info.get("additional_config")
+    if not isinstance(additional, dict):
+        return False
+    notice_type = str(
+        additional.get("napcat_notice_type") or additional.get("notice_type") or ""
+    ).lower()
+    return "emoji_like" in notice_type or "reaction" in notice_type

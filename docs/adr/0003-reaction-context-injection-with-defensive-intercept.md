@@ -21,11 +21,11 @@ status: accepted
 - **去重窗口**：键（回应者，被回应消息，表情 ID）在 TTL 内只注入一次（防协议端重复上报与贴-取消-再贴），默认 3600s 可配。
 - **聚合窗口**：同一被回应消息同一表情的多条回应（不同回应者）在窗口内汇入一条注入消息（可见文本列出各回应者），窗口到期 flush；防表情风暴撑爆上下文，另配注入上限兜底。
 - **麦麦自己的回应完全同路注入**：不构成循环——注入不产生新上报，只有上报才触发行为。
-- **机器人显示名来源链**：优先主程序暴露的 `config.get("bot.nickname")`（官方配置 `bot.nickname`，默认「麦麦」）→ 插件配置项兜底 → 再取不到则不写入名字。不依赖协议端 `get_login_info` 的 QQ 昵称，因为 QQ 昵称与机器人名是两回事。
+- **机器人显示名来源链**：优先插件配置 `context.self_display_name` → 主程序暴露的 `config.get("bot.nickname")`（官方配置 `bot.nickname`，默认「麦麦」）→ 再取不到则不写入名字。不依赖协议端 `get_login_info` 的 QQ 昵称，因为 QQ 昵称与机器人名是两回事。
 
 ## Consequences
 
 - `chat.receive.before_process` 的拦截只对「插件认得的表情回应通知形态」生效，认不出仍放行并打日志——拦截逻辑必须与解析层共用同一份形态判定，避免漏拦或误拦普通消息。
-- Hook 是声明式的：`context.enabled` 关掉时插件不再订阅该 Hook，主链完全不受影响（Hook 注册在插件加载时按配置决定）。
+- Hook 通过类级装饰器声明，插件加载即随插件注册（`chat.receive.before_process`，`allow_abort=True`）；`context.enabled` 关闭时回调对全部消息直接返回 `continue`，主链行为完全不受影响（回调默认 `error_policy=SKIP`，异常不拖垮消息链）。
 - 注入消息的时间戳由主程序在调用时刻取 `datetime.now()`，故聚合窗口内的注入时间会比事件发生晚至多一个聚合窗口；这是可接受的已知行为。
 - 主程序启动恢复上下文时会跳过 `is_notify` 消息（`_restore_recent_context_from_db`），但**不会**跳过插件的注入消息（`source_kind=reaction` 的 `SessionBackedMessage`）——重启后注入消息可能从主程序消息库恢复，与插件内存去重表不同步，极端情况会出现少量重复注入。已知行为，实验功能可接受。
