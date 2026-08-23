@@ -558,13 +558,23 @@ class TestInjectionState:
         st = InjectionState(dedup_ttl_seconds=3600, merge_window_seconds=30)
         now = time.time()
         st.record(make_event(), "20002", now)
+        st.due(now + 3601)  # 真实调用序列里旧聚合早已到期 flush，这里手动清掉
         assert st.record(make_event(), "20002", now + 3601) == "new"
+
+    def test_same_key_after_expiry_merges_if_aggregate_alive(self):
+        st = InjectionState(dedup_ttl_seconds=10, merge_window_seconds=30)
+        now = time.time()
+        st.record(make_event(), "20002", now)
+        # dedup 过期但聚合未到期（真实序列里 dedup_ttl > merge_window 时会命中）
+        assert st.record(make_event(), "20002", now + 11) == "merged"
+        (agg,) = st.due(now + 31)
+        assert agg.responders == ["20002"]
 
     def test_same_message_same_emoji_different_reactors_merge(self):
         st = InjectionState(merge_window_seconds=30)
         now = time.time()
         assert st.record(make_event(), "20002", now) == "new"
-        assert st.record(make_event(), "20003", now + 1) == "merged"
+        assert st.record(make_event(reactor="20003"), "20003", now + 1) == "merged"
         (agg,) = st.due(now + 31)
         assert agg.responders == ["20002", "20003"]
 
@@ -595,21 +605,20 @@ class TestInjectionState:
         st = InjectionState(merge_window_seconds=30)
         now = time.time()
         st.record(make_event(), "20002", now)
-        st.record(make_event(emoji="129303"), "20003", now + 5)
+        st.record(make_event(emoji="129303", reactor="20003"), "20003", now + 5)
         due = st.due(now + 31)
         assert len(due) == 1
         assert due[0].emoji_id == "128077"
-        # 第二个聚合 first_ts=now+5，now+35 到期：取出后即移除，不会重复返回
-        due2 = st.due(now + 40)
-        assert len(due2) == 1
-        assert due2[0].emoji_id == "129303"
-        assert st.due(now + 50) == []
+        # 第二个聚合 first_ts=now+5，now+35 到期，now+40 应返回且取出即移除
+        assert len(st.due(now + 40)) == 1
+        assert st.due(now + 40) == []
 
     def test_prune_clears_stale_dedup_keys(self):
         st = InjectionState(dedup_ttl_seconds=10, merge_window_seconds=30)
         now = time.time()
         st.record(make_event(), "20002", now)
         st.prune(now + 11)
+        st.due(now + 31)  # 聚合 30s 到期后由 due 取出，避免 merged
         assert st.record(make_event(), "20002", now + 11) == "new"
 
 

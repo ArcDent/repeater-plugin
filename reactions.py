@@ -466,10 +466,10 @@ class InjectionState:
     def record(self, event: ReactionEvent, display_reactor: str, now: float) -> str:
         """记录一次表情回应，返回 'new' / 'merged' / 'skip'。
 
-        去重键按 display_reactor（回应者的展示维度：QQ 号或麦麦显示名）而非
-        reactor_qq——两个不同回应者贴同款应合并而非被去重拦下。
+        去重对象是回应者（reactor_qq，CONTEXT.md 术语），display_reactor 只是
+        显示名：同人在 dedup TTL 内的重复回应只注入一次。
         """
-        key = (display_reactor, event.message_id, event.emoji_id)
+        key = (event.reactor_qq, event.message_id, event.emoji_id)
         last = self._dedup.get(key)
         if last is not None and not (self.dedup_ttl_seconds and now - last > self.dedup_ttl_seconds):
             return "skip"
@@ -485,15 +485,6 @@ class InjectionState:
                 message_id=event.message_id,
                 emoji_id=event.emoji_id,
                 responders=[display_reactor] if display_reactor else [],
-                first_ts=now,
-            )
-            return "new"
-        if display_reactor and display_reactor in aggregate.responders:
-            # 同人同款重贴且去重记录已过期/被清理：旧聚合作废，重新开启新聚合
-            self._aggregates[agg_key] = InjectionAggregate(
-                message_id=event.message_id,
-                emoji_id=event.emoji_id,
-                responders=[display_reactor],
                 first_ts=now,
             )
             return "new"
