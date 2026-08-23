@@ -51,7 +51,7 @@ def test_list_fields_are_independent_per_instance():
 
 def test_all_sections_present():
     config = SendingEmojisConfig()
-    for section in ("plugin", "webhook", "protocol", "bandwagon", "opposite", "behavior", "scope"):
+    for section in ("plugin", "webhook", "protocol", "bandwagon", "opposite", "behavior", "context", "scope"):
         assert getattr(config, section) is not None
 
 
