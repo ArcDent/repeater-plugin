@@ -16,7 +16,7 @@ from typing import Any
 
 import aiohttp
 from aiohttp import web
-from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, MaiBotPlugin
+from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, HookHandler, MaiBotPlugin
 
 from .config import SendingEmojisConfig
 from .reactions import (
@@ -33,6 +33,7 @@ from .reactions import (
     group_allowed,
     is_missing_action,
     is_reaction_notice,
+    is_reaction_notice_message,
     parse_message_author,
     parse_reaction_report,
     parse_self_qq,
@@ -362,6 +363,31 @@ class SendingEmojisPlugin(MaiBotPlugin):
             self.ctx.logger.debug(f"取主程序 bot.nickname 失败: {exc}")
             return ""
         return str(result or "").strip()
+
+    # ---- 防御式拦截（chat.receive.before_process Hook）----
+
+    @HookHandler(
+        "chat.receive.before_process",
+        name="emoji_reaction_notify_guard",
+        mode="BLOCKING",
+        order="EARLY",
+        description="防御式拦截表情回应通知消息，避免其进入主程序上下文（ADR 0003）。",
+    )
+    async def guard_reaction_notify(self, **kwargs: Any) -> dict[str, Any]:
+        """表情回应通知消息在主链上 abort；其余放行。
+
+        命中时打 info 日志——这条日志就是「适配器是否把表情回应当通知转发」的
+        线上答案（ADR 0001/0003）。上下文注入关闭时不拦截。
+        """
+        if self._injection_state is None:
+            return {"action": "continue", "modified_kwargs": kwargs}
+        message = kwargs.get("message")
+        if is_reaction_notice_message(message):
+            self.ctx.logger.info(
+                f"拦截表情回应通知消息进入主程序: {str(message)[:200]}"
+            )
+            return {"action": "abort", "modified_kwargs": kwargs}
+        return {"action": "continue", "modified_kwargs": kwargs}
 
     async def _is_self_message(self, message_id: str, now: float) -> bool:
         """被回应消息的原作者是否是麦麦自己。查不到时按他人消息处理。"""

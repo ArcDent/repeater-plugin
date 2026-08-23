@@ -667,3 +667,41 @@ def test_injection_exception_does_not_block_behavior_path(monkeypatch):
     asyncio.run(plugin._on_reaction(event()))
     assert "set_msg_emoji_like" in actions_of(plugin)
     assert any("注入表情回应上下文异常" in t for t in plugin.ctx.logger.texts("warning"))
+
+
+# ---- 防御式拦截（chat.receive.before_process Hook）----
+
+def _notify_message(notice_type: str = "group_msg_emoji_like") -> dict[str, Any]:
+    return {
+        "is_notify": True,
+        "message_info": {"additional_config": {"napcat_notice_type": notice_type}},
+    }
+
+
+def test_hook_aborts_reaction_notify_when_enabled():
+    plugin = make_plugin()
+    enable_injection(plugin)
+    result = asyncio.run(plugin.guard_reaction_notify(message=_notify_message()))
+    assert result["action"] == "abort"
+
+
+def test_hook_passes_through_when_disabled():
+    plugin = make_plugin()
+    result = asyncio.run(plugin.guard_reaction_notify(message=_notify_message()))
+    assert result["action"] == "continue"
+
+
+def test_hook_passes_plain_message():
+    plugin = make_plugin()
+    enable_injection(plugin)
+    result = asyncio.run(
+        plugin.guard_reaction_notify(message={"is_notify": False, "message_info": {}})
+    )
+    assert result["action"] == "continue"
+
+
+def test_hook_passes_unrelated_notify():
+    plugin = make_plugin()
+    enable_injection(plugin)
+    result = asyncio.run(plugin.guard_reaction_notify(message=_notify_message("group_recall")))
+    assert result["action"] == "continue"
