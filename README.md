@@ -74,9 +74,10 @@ self_display_name = ""
 ```bash
 # 1. 推送插件文件（排除本地开发与内部文件）
 rsync -av --delete \
-  --exclude .git --exclude .local --exclude .serena \
+  --exclude .git --exclude .local --exclude .serena --exclude .superpowers \
   --exclude .pytest_cache --exclude .ruff_cache --exclude __pycache__ \
   --exclude tests --exclude docs/superpowers \
+  --exclude conftest.py --exclude pyrightconfig.json \
   ./ arclinux:/home/arc/maimai/MaiBot/data/MaiMBot/plugins/arcdent.sending-emojis-plugin/
 
 # 2. 在服务器上写部署配置（含协议端 token，勿入库）
