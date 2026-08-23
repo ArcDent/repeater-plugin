@@ -119,6 +119,10 @@ def make_plugin(protocol_responses: dict[str, Any] | None = None) -> SendingEmoj
         "stream_id": "stream-10001", "session_id": "stream-10001",
         "group_id": "10001", "is_group_session": True,
     }
+    plugin.ctx.chat.streams["20002"] = {
+        "stream_id": "stream-20002", "session_id": "stream-20002",
+        "group_id": "20002", "is_group_session": True,
+    }
     plugin._rebuild_runtime()
 
     responses = dict(protocol_responses or {})
@@ -624,3 +628,42 @@ def test_injection_removed_reaction_not_injected():
     enable_injection(plugin)
     asyncio.run(plugin._on_reaction(event(message_id="1001", removed=True)))
     assert plugin.ctx.maisaka.context.calls == []
+
+
+def test_injection_flushes_aggregate_to_its_own_group(monkeypatch):
+    """A 群聚合未到期时由 B 群事件触发 flush——聚合注入 A 群 stream，不串群。"""
+    plugin = make_plugin()
+    plugin.config.context.merge_window_seconds = 30
+    enable_injection(plugin)
+
+    class FakeClock:
+        def __init__(self) -> None:
+            self.now = 1000.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = FakeClock()
+    monkeypatch.setattr("time.time", clock)
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))  # A 群聚合开启，未到期
+    assert plugin.ctx.maisaka.context.calls == []
+    clock.now = 1031.0  # 越过窗口，B 群事件到来触发 flush
+    asyncio.run(plugin._on_reaction(event(group_id="20002", message_id="2001")))
+    assert len(plugin.ctx.maisaka.context.calls) == 1
+    call = plugin.ctx.maisaka.context.calls[0]
+    assert call["stream_id"] == "stream-10001"
+    assert "1001" in call["visible_text"]
+
+
+def test_injection_exception_does_not_block_behavior_path(monkeypatch):
+    """注入路径抛未预期异常时，记 warning 后行为路径照常执行。"""
+    plugin = make_plugin()
+    enable_injection(plugin)
+
+    async def boom(event):
+        raise RuntimeError("注入内部异常")
+
+    monkeypatch.setattr(plugin, "_inject_reaction", boom)
+    asyncio.run(plugin._on_reaction(event()))
+    assert "set_msg_emoji_like" in actions_of(plugin)
+    assert any("注入表情回应上下文异常" in t for t in plugin.ctx.logger.texts("warning"))

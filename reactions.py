@@ -432,8 +432,13 @@ class ReactionState:
 
 @dataclass
 class InjectionAggregate:
-    """聚合窗口内同消息同表情的多条回应的合并体。"""
+    """聚合窗口内同消息同表情的多条回应的合并体。
 
+    group_id 记录聚合归属的群：到期 flush 时注入该群的 stream，
+    不得借用触发 flush 的那个事件的群（多群并发时会串群）。
+    """
+
+    group_id: str
     message_id: str
     emoji_id: str
     responders: list[str]
@@ -482,6 +487,7 @@ class InjectionState:
             if active + self._injected_count.get(event.message_id, 0) >= self.max_reactions_per_message:
                 return "skip"
             self._aggregates[agg_key] = InjectionAggregate(
+                group_id=event.group_id,
                 message_id=event.message_id,
                 emoji_id=event.emoji_id,
                 responders=[display_reactor] if display_reactor else [],

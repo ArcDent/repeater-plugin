@@ -213,8 +213,12 @@ class SendingEmojisPlugin(MaiBotPlugin):
 
     async def _on_reaction(self, event: ReactionEvent) -> None:
         try:
-            if self._injection_state is not None:
-                await self._inject_reaction(event)
+            try:
+                if self._injection_state is not None:
+                    await self._inject_reaction(event)
+            except Exception as exc:
+                # 注入失败不得拖垮行为路径：记日志后照常走跟风/反义决策。
+                self.ctx.logger.warning(f"注入表情回应上下文异常: {exc}")
             decision = await self._evaluate(event)
             if decision is None:
                 return
@@ -296,7 +300,8 @@ class SendingEmojisPlugin(MaiBotPlugin):
         if result == "skip":
             return
         for aggregate in self._injection_state.due(now):
-            await self._flush_aggregate(event.group_id, aggregate)
+            # 聚合归属自己的群：不得用当前事件的群，多群并发时会串群。
+            await self._flush_aggregate(aggregate.group_id, aggregate)
         self._injection_state.prune(now)
 
     async def _flush_aggregate(
