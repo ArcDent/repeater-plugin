@@ -369,8 +369,8 @@ class SendingEmojisPlugin(MaiBotPlugin):
     @HookHandler(
         "chat.receive.before_process",
         name="emoji_reaction_notify_guard",
-        mode="BLOCKING",
-        order="EARLY",
+        mode="blocking",
+        order="early",
         description="防御式拦截表情回应通知消息，避免其进入主程序上下文（ADR 0003）。",
     )
     async def guard_reaction_notify(self, **kwargs: Any) -> dict[str, Any]:

@@ -52,8 +52,24 @@ class _FakeHookInfo:
         self.kwargs = kwargs
 
 
+_HOOK_MODES = {"blocking", "observe"}
+_HOOK_ORDERS = {"early", "normal", "late"}
+
+
 def HookHandler(hook: str, **kwargs: Any) -> Any:
-    """假装饰器：附着元数据并原样返回函数，测试只直接调用被装饰方法。"""
+    """假装饰器：附着元数据并原样返回函数，测试只直接调用被装饰方法。
+
+    对 mode/order 做值校验（对齐真实 SDK 的 pydantic 枚举校验，
+    maibot_sdk/types.py 的 HookMode/HookOrder），传大写等非法值直接抛
+    ValueError，防止 fake 过宽放行生产代码里的错误枚举值。
+    """
+
+    mode = kwargs.get("mode")
+    if mode is not None and mode not in _HOOK_MODES:
+        raise ValueError(f"invalid hook mode: {mode!r} (allowed: {sorted(_HOOK_MODES)})")
+    order = kwargs.get("order")
+    if order is not None and order not in _HOOK_ORDERS:
+        raise ValueError(f"invalid hook order: {order!r} (allowed: {sorted(_HOOK_ORDERS)})")
 
     def decorator(func: Any) -> Any:
         func._hook_info = _FakeHookInfo(hook, **kwargs)  # type: ignore[attr-defined]
