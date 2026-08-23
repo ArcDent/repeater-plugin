@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "arcdent.sending-emojis-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "name": "表情跟风",
   "description": "群里有人给消息贴表情回应后，麦麦按概率跟着贴同款；特定表情则按另一套概率贴语义相反的表情",
   "author": {

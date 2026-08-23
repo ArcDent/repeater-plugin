@@ -65,7 +65,42 @@ self_display_name = ""
 
 第 4 步是必需的。麦麦插件 SDK 的事件类型里没有 notice 通道，表情回应事件只能由协议端直接 POST 给插件，理由见 [ADR 0001](docs/adr/0001-webhook-instead-of-sdk-event.md)。如果同机的好友申请插件已经配过一个上报目标，这里要**再加一个**，两者端口不同（18080 / 18081）。
 
-配了 `webhook.secret` 时，协议端上报需带 `X-Signature: sha1=<hmac>` 头，与协议端的 secret 配置一致即可。
+配了 `webhook.secret` 时，协议端上报需带 `X-Signature: sha1=<hmac>` 头，与协议端的 secret 配置一致即可。注意 SnowLuma 的 HTTP 上报带的是 `Authorization: Bearer` 头而非 `X-Signature`，所以配 SnowLuma 时 `webhook.secret` 应留空，靠 Docker 网络隔离。
+
+## 部署（arclinux 服务器）
+
+服务器：`arclinux`（SSH 别名），MaiBot 容器化部署在 `/home/arc/maimai/MaiBot`，第三方插件目录（宿主机）为 `data/MaiMBot/plugins/<插件ID>/`（挂载进容器 `/MaiMBot/plugins/`）。协议端为 `maim-bot-snowluma` 容器（OneBot HTTP :3000），表情回应上报已配置指向 `http://maim-bot-core:18081/maibot/emoji_reaction`。
+
+```bash
+# 1. 推送插件文件（排除本地开发与内部文件）
+rsync -av --delete \
+  --exclude .git --exclude .local --exclude .serena \
+  --exclude .pytest_cache --exclude .ruff_cache --exclude __pycache__ \
+  --exclude tests --exclude docs/superpowers \
+  ./ arclinux:/home/arc/maimai/MaiBot/data/MaiMBot/plugins/arcdent.sending-emojis-plugin/
+
+# 2. 在服务器上写部署配置（含协议端 token，勿入库）
+ssh arclinux 'cat > /home/arc/maimai/MaiBot/data/MaiMBot/plugins/arcdent.sending-emojis-plugin/config.toml << "EOF"
+[webhook]
+secret = ""    # SnowLuma 上报带 Authorization 头，X-Signature 校验不适用，留空
+
+[protocol]
+base_url = "http://maim-bot-snowluma:3000"
+access_token = "<snowluma OneBot HTTP accessToken>"
+self_qq = ""   # 留空启动时自动获取
+
+[context]
+enabled = false   # 实验性功能，按需开启
+EOF'
+
+# 3. 重启主容器让 MaiBot 重新发现插件
+ssh arclinux 'docker restart maim-bot-core'
+
+# 4. 验证加载
+ssh arclinux 'docker logs --since 2m maim-bot-core | grep -i "表情\|sending"'
+```
+
+部署后验证链路：去群里给任意消息贴个表情，日志应出现 `表情回应上报已监听` → `表情回应触发` / `已跟风贴表情`；若出现 `表情回应上报形态不认识，已忽略` 则协议端形态变了，把日志里的原始 JSON 贴回来。
 
 ## 首次部署验证
 
