@@ -647,6 +647,99 @@ class TestInjectionState:
         assert st.record(make_event(message_id="1001"), "20002", now + 4) == "new"
         assert st.record(make_event(message_id="1003"), "20002", now + 5) == "skip"
 
+    # ---- Task 1.1: reactor_qqs tracking on the aggregate ----
+
+    def test_reactor_qqs_after_new(self):
+        st = InjectionState(merge_window_seconds=30)
+        now = time.time()
+        assert st.record(make_event(), "20002", now) == "new"
+        (agg,) = st.due(now + 31)
+        assert agg.reactor_qqs == ["20002"]
+
+    def test_reactor_qqs_merged_contains_both_reactors(self):
+        st = InjectionState(merge_window_seconds=30)
+        now = time.time()
+        assert st.record(make_event(reactor="20002"), "20002", now) == "new"
+        assert st.record(make_event(reactor="20003"), "20003", now + 1) == "merged"
+        (agg,) = st.due(now + 31)
+        assert agg.reactor_qqs == ["20002", "20003"]
+
+    def test_reactor_qqs_same_reactor_not_duplicated(self):
+        # Dedup disabled (ttl=0) so the same reactor re-enters the aggregate;
+        # the QQ must still not be appended twice.
+        st = InjectionState(dedup_ttl_seconds=0, merge_window_seconds=30)
+        now = time.time()
+        assert st.record(make_event(reactor="20002"), "20002", now) == "new"
+        assert st.record(make_event(reactor="20002"), "20002", now + 1) == "merged"
+        (agg,) = st.due(now + 31)
+        assert agg.reactor_qqs == ["20002"]
+
+    def test_reactor_qqs_tracks_qq_not_display_name(self):
+        # display name may be empty while the dedup identity is still tracked.
+        st = InjectionState(merge_window_seconds=30)
+        now = time.time()
+        assert st.record(make_event(reactor="20002"), "", now) == "new"
+        (agg,) = st.due(now + 31)
+        assert agg.responders == []
+        assert agg.reactor_qqs == ["20002"]
+
+    # ---- Task 1.2: rollback drops the aggregate's dedup keys ----
+
+    def test_rollback_lets_same_key_record_new_again(self):
+        st = InjectionState(dedup_ttl_seconds=3600, merge_window_seconds=30)
+        now = time.time()
+        assert st.record(make_event(), "20002", now) == "new"
+        (agg,) = st.due(now + 31)
+        st.rollback(agg)
+        # Same (reactor, message, emoji) must re-aggregate as new, not skip.
+        assert st.record(make_event(), "20002", now + 32) == "new"
+
+    def test_rollback_drops_all_reactor_keys_of_merged_aggregate(self):
+        st = InjectionState(dedup_ttl_seconds=3600, merge_window_seconds=30)
+        now = time.time()
+        st.record(make_event(reactor="20002"), "20002", now)
+        st.record(make_event(reactor="20003"), "20003", now + 1)
+        (agg,) = st.due(now + 31)
+        assert agg.reactor_qqs == ["20002", "20003"]
+        st.rollback(agg)
+        # Both reactors' keys were covered by the aggregate and got dropped.
+        assert st.record(make_event(reactor="20002"), "20002", now + 32) == "new"
+        assert st.record(make_event(reactor="20003"), "20003", now + 33) == "merged"
+
+    def test_rollback_does_not_touch_other_aggregates_keys(self):
+        st = InjectionState(dedup_ttl_seconds=3600, merge_window_seconds=30)
+        now = time.time()
+        st.record(make_event(emoji="128077"), "20002", now)
+        st.record(make_event(emoji="129303", reactor="20003"), "20003", now + 5)
+        (agg,) = st.due(now + 31)  # only the first aggregate is due
+        st.rollback(agg)
+        # The rolled-back key is gone, so the report re-aggregates...
+        assert st.record(make_event(emoji="128077"), "20002", now + 32) == "new"
+        # ...while the untouched key still dedups within its window.
+        assert st.record(make_event(emoji="129303", reactor="20003"), "20003", now + 33) == "skip"
+
+    # ---- Task 1.3: dedup_ttl_seconds=0 disables dedup entirely ----
+
+    def test_zero_dedup_ttl_disables_dedup(self):
+        st = InjectionState(dedup_ttl_seconds=0, merge_window_seconds=30)
+        now = time.time()
+        assert st.record(make_event(), "20002", now) == "new"
+        # Same (reactor, message, emoji) twice: neither may return "skip".
+        assert st.record(make_event(), "20002", now + 1) == "merged"
+        # After the aggregate is flushed out, a fresh report starts a new one.
+        st.due(now + 31)
+        assert st.record(make_event(), "20002", now + 32) == "new"
+
+    def test_positive_dedup_ttl_still_dedups_after_expiry(self):
+        # Regression guard for the rewritten skip condition: with a positive
+        # TTL the original behavior (skip inside the window, re-record after
+        # expiry) is unchanged.
+        st = InjectionState(dedup_ttl_seconds=10, merge_window_seconds=30)
+        now = time.time()
+        assert st.record(make_event(), "20002", now) == "new"
+        assert st.record(make_event(), "20002", now + 1) == "skip"
+        assert st.record(make_event(), "20002", now + 11) == "merged"
+
 
 class TestVisibleText:
     def test_single_reactor(self):

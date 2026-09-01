@@ -9,3 +9,5 @@ __pycache__/
 .local/
 # Serena 工具本地状态，不入库
 .serena/
+# Cursor 本地配置（openspec init 生成的 skills/commands 等），不入库
+.cursor/

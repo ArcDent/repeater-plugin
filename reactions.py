@@ -436,12 +436,18 @@ class InjectionAggregate:
 
     group_id 记录聚合归属的群：到期 flush 时注入该群的 stream，
     不得借用触发 flush 的那个事件的群（多群并发时会串群）。
+
+    reactor_qqs keeps the dedup identities (reactor QQs) that fed this
+    aggregate; InjectionState.rollback uses them to drop every dedup key
+    the aggregate covers when the injection write fails. responders only
+    carries display names and may diverge from reactor_qqs.
     """
 
     group_id: str
     message_id: str
     emoji_id: str
     responders: list[str]
+    reactor_qqs: list[str]
     first_ts: float
 
 
@@ -451,6 +457,8 @@ class InjectionState:
     - 去重键 (responder, message_id, emoji_id)：窗口内同键只注入一次
     - 聚合键 (message_id, emoji_id)：窗口内多人同表情合并为一条注入消息
     - 注入上限：单条消息最多开启 max_reactions_per_message 个聚合
+    - rollback: on a failed injection write, drop every dedup key the
+      aggregate covers so the same reports can re-aggregate and retry
     """
 
     def __init__(
@@ -476,10 +484,13 @@ class InjectionState:
         显示名：同人在 dedup TTL 内的重复回应只注入一次。
         """
         key = (event.reactor_qq, event.message_id, event.emoji_id)
-        last = self._dedup.get(key)
-        if last is not None and not (self.dedup_ttl_seconds and now - last > self.dedup_ttl_seconds):
-            return "skip"
-        self._dedup[key] = now
+        # Dedup applies only when a positive TTL is configured; 0 disables it
+        # entirely so repeated reports always re-enter aggregation.
+        if self.dedup_ttl_seconds > 0:
+            last = self._dedup.get(key)
+            if last is not None and now - last <= self.dedup_ttl_seconds:
+                return "skip"
+            self._dedup[key] = now
 
         agg_key = (event.message_id, event.emoji_id)
         aggregate = self._aggregates.get(agg_key)
@@ -493,11 +504,14 @@ class InjectionState:
                 message_id=event.message_id,
                 emoji_id=event.emoji_id,
                 responders=[display_reactor] if display_reactor else [],
+                reactor_qqs=[event.reactor_qq],
                 first_ts=now,
             )
             return "new"
         if display_reactor and display_reactor not in aggregate.responders:
             aggregate.responders.append(display_reactor)
+        if event.reactor_qq not in aggregate.reactor_qqs:
+            aggregate.reactor_qqs.append(event.reactor_qq)
         return "merged"
 
     def due(self, now: float) -> list[InjectionAggregate]:
@@ -510,6 +524,16 @@ class InjectionState:
         for agg in due:
             self._aggregates.pop((agg.message_id, agg.emoji_id), None)
         return due
+
+    def rollback(self, aggregate: InjectionAggregate) -> None:
+        """Drop every dedup key covered by the aggregate.
+
+        Called when writing the injected message failed: removing the keys
+        lets the same (reactor, message_id, emoji_id) reports re-aggregate
+        and be retried within the dedup window instead of being skipped.
+        """
+        for reactor_qq in aggregate.reactor_qqs:
+            self._dedup.pop((reactor_qq, aggregate.message_id, aggregate.emoji_id), None)
 
     def mark_injected(self, message_id: str, now: float) -> None:
         key = str(message_id or "")

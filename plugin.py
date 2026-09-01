@@ -22,6 +22,7 @@ from .config import SendingEmojisConfig
 from .reactions import (
     OPPOSITE,
     Decision,
+    InjectionAggregate,
     InjectionState,
     ReactionEvent,
     ReactionState,
@@ -41,6 +42,9 @@ from .reactions import (
 )
 
 _PROTOCOL_TIMEOUT_SECONDS = 10
+# Resident flush-loop tick (design.md D2): hardcoded on purpose — far below
+# the default 30s merge window, so worst-case injection lag is window + tick.
+_INJECTION_FLUSH_TICK_SECONDS = 5
 
 
 class SendingEmojisPlugin(MaiBotPlugin):
@@ -55,18 +59,22 @@ class SendingEmojisPlugin(MaiBotPlugin):
     _emoji_action_supported: bool
     _injection_state: InjectionState | None
     _bot_display_name: str
+    _bot_display_name_resolved: bool
     _stream_ids: dict[str, str]
+    _flush_loop_task: asyncio.Task | None
 
     async def on_load(self) -> None:
         self._runner = None
         self._site = None
         self._tasks = set()
+        self._flush_loop_task = None
         self._self_qq = ""
         self._emoji_action_supported = True
         self._rebuild_runtime()
 
         if self._injection_state is not None:
             self._bot_display_name = await self._fetch_bot_display_name()
+            self._ensure_flush_loop()
             self.ctx.logger.info(
                 f"上下文注入已启用，麦麦显示名: {self._bot_display_name or '（无，注入时不写名字）'}"
             )
@@ -90,6 +98,7 @@ class SendingEmojisPlugin(MaiBotPlugin):
             return
         del config_data, version
         self._rebuild_runtime()
+        self._ensure_flush_loop()
         await self._stop_webhook()
         if self.config.plugin.enabled:
             await self._start_webhook()
@@ -117,6 +126,9 @@ class SendingEmojisPlugin(MaiBotPlugin):
         context = self.config.context
         self._stream_ids = {}
         self._bot_display_name = ""
+        # One-shot resolution flag (design.md D6): display-name lookups stop
+        # once resolved; only a rebuild (config reload) resets it.
+        self._bot_display_name_resolved = False
         self._injection_state = (
             InjectionState(
                 dedup_ttl_seconds=float(context.dedup_ttl_seconds),
@@ -204,11 +216,12 @@ class SendingEmojisPlugin(MaiBotPlugin):
         expected = "sha1=" + hmac.new(secret.encode("utf-8"), raw, sha1).hexdigest()
         return hmac.compare_digest(signature, expected)
 
-    def _spawn(self, coro: Any) -> None:
+    def _spawn(self, coro: Any) -> asyncio.Task:
         """后台执行并持有引用，避免任务被 GC；卸载时统一取消。"""
         task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        return task
 
     # ---- 决策与执行 ----
 
@@ -292,27 +305,82 @@ class SendingEmojisPlugin(MaiBotPlugin):
             return
 
         now = time.time()
-        if not self._bot_display_name:
-            # on_load 已取过一次；此处兜底（测试直调、配置热更新等场景），
-            # 并保证显示名随 _rebuild_runtime 重置后仍能重新解析。
+        if not self._bot_display_name_resolved:
+            # Resolved once per runtime rebuild (design.md D6): bot.nickname
+            # rarely changes, so injections must not re-query it; the flag
+            # is reset only by _rebuild_runtime (config reload path).
             self._bot_display_name = await self._fetch_bot_display_name()
         display = build_reactor_display(event.reactor_qq, self._self_qq, self._bot_display_name)
-        result = self._injection_state.record(event, display, now)
-        if result == "skip":
+        if self._injection_state.record(event, display, now) == "skip":
             return
-        for aggregate in self._injection_state.due(now):
-            # 聚合归属自己的群：不得用当前事件的群，多群并发时会串群。
+        await self._flush_due_aggregates()
+
+    async def _flush_due_aggregates(self) -> None:
+        """Flush every aggregate whose merge window has elapsed.
+
+        Shared by the event-driven path in _inject_reaction and the resident
+        flush loop. due() removes aggregates synchronously (no await point),
+        which is what keeps the two trigger paths from double-delivering
+        (design.md D3).
+        """
+        state = self._injection_state
+        if state is None:
+            return
+        now = time.time()
+        for aggregate in state.due(now):
+            # The aggregate belongs to its own group: flush must not borrow the
+            # triggering event's group (crosses groups under concurrency).
             await self._flush_aggregate(aggregate.group_id, aggregate)
-        self._injection_state.prune(now)
+        state.prune(now)
+
+    def _ensure_flush_loop(self) -> None:
+        """Ensure the resident flush loop is running while injection is on.
+
+        The loop re-reads self._injection_state every tick, so a config
+        reload that keeps injection enabled reuses the running loop instead
+        of stacking a duplicate; a reload that turns injection off lets the
+        loop exit on its own at the next tick.
+        """
+        if self._injection_state is None:
+            return
+        task = self._flush_loop_task
+        if task is not None and not task.done():
+            return
+        self._flush_loop_task = self._spawn(self._injection_flush_loop())
+
+    async def _injection_flush_loop(self) -> None:
+        """Resident fallback flush loop (design.md D2).
+
+        Event-driven flush depends on later reports arriving; this loop
+        guarantees an aggregate whose merge window elapsed during a silent
+        period is still injected within window + tick. The tick is hardcoded
+        (not a config item). Each iteration re-reads self._injection_state so
+        a config reload switches to the fresh state, and the loop exits by
+        itself once injection is turned off.
+        """
+        while True:
+            await asyncio.sleep(_INJECTION_FLUSH_TICK_SECONDS)
+            if self._injection_state is None:
+                return
+            try:
+                await self._flush_due_aggregates()
+            except Exception as exc:
+                # One failed tick must not kill the resident loop (BLE001-style
+                # broad catch is intentional here, same as other task bodies).
+                self.ctx.logger.warning(f"兜底 flush 表情回应聚合失败: {exc}")
 
     async def _flush_aggregate(
-        self, group_id: str, aggregate: Any
+        self, group_id: str, aggregate: InjectionAggregate
     ) -> None:
         state = self._injection_state
         if state is None:
             return
         stream_id = await self._get_stream_id(group_id)
         if not stream_id:
+            # The aggregate was already removed by due(); roll its dedup keys
+            # back so the same reports can re-aggregate and retry once the
+            # stream becomes available (design.md D4).
+            state.rollback(aggregate)
             self.ctx.logger.debug(f"取不到群 {group_id} 的 stream，跳过注入")
             return
         text = build_reaction_visible_text(aggregate.message_id, aggregate.emoji_id, aggregate.responders)
@@ -325,9 +393,11 @@ class SendingEmojisPlugin(MaiBotPlugin):
                 message_id=aggregate.message_id,
             )
         except Exception as exc:
+            state.rollback(aggregate)
             self.ctx.logger.warning(f"注入表情回应上下文调用失败: {exc}")
             return
         if not (isinstance(response, dict) and response.get("success")):
+            state.rollback(aggregate)
             self.ctx.logger.warning(f"注入表情回应上下文失败: {response}")
             return
         state.mark_injected(aggregate.message_id, time.time())
@@ -337,7 +407,13 @@ class SendingEmojisPlugin(MaiBotPlugin):
         )
 
     async def _get_stream_id(self, group_id: str) -> str:
-        """群号 → 聊天流 ID，带缓存；查不到返回空串。"""
+        """群号 → 聊天流 ID；成功缓存，失败返回空串且不缓存（design.md D6）。
+
+        The main program looks sessions up in memory and creates them lazily,
+        so a failed lookup is transient: caching the empty string would pin
+        the group as "no stream" forever. Success values are deterministic
+        (session_id is stable), so they are cached as before.
+        """
         cached = self._stream_ids.get(group_id)
         if cached is not None:
             return cached
@@ -349,19 +425,28 @@ class SendingEmojisPlugin(MaiBotPlugin):
             stream = None
         if isinstance(stream, dict):
             stream_id = str(stream.get("stream_id") or stream.get("session_id") or "").strip()
-        self._stream_ids[group_id] = stream_id
+        if stream_id:
+            self._stream_ids[group_id] = stream_id
         return stream_id
 
     async def _fetch_bot_display_name(self) -> str:
-        """机器人显示名来源链：配置兜底 → 主程序 bot.nickname → 空。"""
+        """机器人显示名来源链：配置兜底 → 主程序 bot.nickname → 空。
+
+        Resolved once (design.md D6): whatever the outcome (configured value,
+        nickname, or lookup failure), _bot_display_name_resolved is set so the
+        injection path stops re-querying; only _rebuild_runtime resets the
+        flag (config reload may change self_display_name).
+        """
         configured = str(self.config.context.self_display_name or "").strip()
         if configured:
+            self._bot_display_name_resolved = True
             return configured
         try:
             result = await self.ctx.config.get("bot.nickname", "")
         except Exception as exc:
             self.ctx.logger.debug(f"取主程序 bot.nickname 失败: {exc}")
-            return ""
+            result = ""
+        self._bot_display_name_resolved = True
         return str(result or "").strip()
 
     # ---- 防御式拦截（chat.receive.before_process Hook）----

@@ -29,3 +29,4 @@ status: accepted
 - Hook 通过类级装饰器声明，插件加载即随插件注册（`chat.receive.before_process`，`allow_abort=True`）；`context.enabled` 关闭时回调对全部消息直接返回 `continue`，主链行为完全不受影响（回调默认 `error_policy=SKIP`，异常不拖垮消息链）。
 - 注入消息的时间戳由主程序在调用时刻取 `datetime.now()`，故聚合窗口内的注入时间会比事件发生晚至多一个聚合窗口；这是可接受的已知行为。
 - 主程序启动恢复上下文时会跳过 `is_notify` 消息（`_restore_recent_context_from_db`），但**不会**跳过插件的注入消息（`source_kind=reaction` 的 `SessionBackedMessage`）——重启后注入消息可能从主程序消息库恢复，与插件内存去重表不同步，极端情况会出现少量重复注入。已知行为，实验功能可接受。
+- guard 拦截不受 `scope` 白黑名单约束：拦截范围与 scope 是两个维度。guard 的动机是防止表情回应通知消息污染主程序上下文——黑名单群里贴表情回应产生的通知消息同样不该进入主程序上下文，若 guard 做 scope 检查，黑名单群反而变成拦截盲区。`scope` 管「插件在该群做不做注入」，guard 管「这类消息要不要进主程序」，两者不应耦合。

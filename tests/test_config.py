@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,16 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 CONFIG_TOML = Path(__file__).resolve().parent.parent / "config.toml"
+MANIFEST_JSON = Path(__file__).resolve().parent.parent / "_manifest.json"
+
+# The three host capabilities consumed by the context-injection path.
+# The fake SDK cannot simulate the authorization layer, so we assert the
+# manifest content instead (see openspec change fix-context-injection, D1).
+REQUIRED_CAPABILITIES = {
+    "maisaka.context.append",
+    "chat.get_stream_by_group_id",
+    "config.get",
+}
 
 
 def test_default_probabilities():
@@ -92,3 +103,15 @@ def test_config_toml_matches_model_defaults():
             assert model_value == toml_value, (
                 f"{section_name}.{key} 默认值漂移: config.py={model_value!r} config.toml={toml_value!r}"
             )
+
+
+def test_manifest_declares_injection_capabilities():
+    """The manifest must declare every capability the injection path consumes."""
+    with MANIFEST_JSON.open("r", encoding="utf-8") as fp:
+        manifest = json.load(fp)
+    capabilities = manifest.get("capabilities")
+    assert isinstance(capabilities, list), "_manifest.json 缺少 capabilities 数组"
+    assert set(capabilities) == REQUIRED_CAPABILITIES, (
+        f"manifest capabilities 漂移: 缺 {REQUIRED_CAPABILITIES - set(capabilities)}，"
+        f"多 {set(capabilities) - REQUIRED_CAPABILITIES}"
+    )

@@ -10,7 +10,7 @@ MaiBot 插件：群里有人贴表情回应后，麦麦按概率跟风贴同款�
 - `config.toml` — 默认配置，值必须与 `config.py` 的 default 一致
 - `tests/` — pytest（fake maibot_sdk 注入，`uv run --with pytest --with aiohttp pytest tests/ -q`）
 - `docs/emoji-id-reference.md` — 表情 ID 两套编号体系（QQ 小黄脸编号 / Unicode 码点）查表与边界
-- `docs/adr/` — 0001 走 webhook 不走 SDK 事件链；0002 分支严格互斥 + 内存态；0003 防御式拦截通知 + 插件自建注入
+- `docs/adr/` — 0001 走 webhook 不走 SDK 事件链；0002 分支严格互斥 + 内存态；0003 防御式拦截通知 + 插件自建注入；0004 定时 flush 兜底 + 失败回滚
 - `CONTEXT.md` — 领域术语表
 
 ## 关键规则

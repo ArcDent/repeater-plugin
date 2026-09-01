@@ -267,7 +267,7 @@ class ContextSection(PluginConfigBase):
     dedup_ttl_seconds: int = Field(
         default=3600, ge=0, le=604800,
         json_schema_extra={
-            "hint": "同一（回应者、被回应消息、表情）组合在窗口内只注入一次。",
+            "hint": "同一（回应者、被回应消息、表情）组合在窗口内只注入一次。0 = 不启用去重，重复上报不再被跳过。",
             "label": "去重窗口（秒）",
             "order": 1,
             "step": 60,

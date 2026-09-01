@@ -43,8 +43,10 @@ class FakeLogger:
 class FakeConfig:
     def __init__(self) -> None:
         self.values: dict[str, Any] = {}
+        self.get_calls = 0
 
     async def get(self, key: str, default: Any = None) -> Any:
+        self.get_calls += 1
         return self.values.get(key, default)
 
 
@@ -111,6 +113,7 @@ def make_plugin(protocol_responses: dict[str, Any] | None = None) -> SendingEmoj
     plugin._runner = None
     plugin._site = None
     plugin._tasks = set()
+    plugin._flush_loop_task = None
     plugin._self_qq = ""
     plugin._emoji_action_supported = True
     # 主程序配置与聊天流替身：与 event() 默认 group_id="10001" 对齐。
@@ -669,6 +672,175 @@ def test_injection_exception_does_not_block_behavior_path(monkeypatch):
     assert any("注入表情回应上下文异常" in t for t in plugin.ctx.logger.texts("warning"))
 
 
+def test_injection_stream_failure_not_cached_and_recovers():
+    """A failed stream lookup must not cache the empty result (design D6).
+
+    The main program resolves group sessions lazily, so the lookup can fail
+    for a group that has one moments later: the next report has to retry
+    the query and inject, which also proves the failed flush rolled its
+    dedup keys back.
+    """
+    plugin = make_plugin()
+    plugin.ctx.chat.streams["10001"] = None
+    enable_injection(plugin)
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))
+    assert plugin.ctx.maisaka.context.calls == []
+    assert "10001" not in plugin._stream_ids
+
+    # The session shows up later; the same report combination re-aggregates.
+    plugin.ctx.chat.streams["10001"] = {
+        "stream_id": "stream-10001", "session_id": "stream-10001",
+        "group_id": "10001", "is_group_session": True,
+    }
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))
+    assert len(plugin.ctx.maisaka.context.calls) == 1
+    # Successful lookups keep being cached as before.
+    assert plugin._stream_ids == {"10001": "stream-10001"}
+
+
+def test_injection_display_name_resolved_once_until_rebuild():
+    """bot.nickname is resolved once per runtime rebuild (design D6).
+
+    An empty nickname must not trigger a config.get on every injection;
+    _rebuild_runtime (the config-reload path) resets the flag so the next
+    injection resolves the display name again.
+    """
+    plugin = make_plugin()
+    plugin.ctx.config.values["bot.nickname"] = ""
+    enable_injection(plugin)
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))
+    asyncio.run(plugin._on_reaction(event(message_id="1002")))
+    assert plugin.ctx.config.get_calls == 1
+
+    plugin._rebuild_runtime()  # config reload resets the one-shot flag
+    asyncio.run(plugin._on_reaction(event(message_id="1003")))
+    assert plugin.ctx.config.get_calls == 2
+
+
+def test_flush_loop_spawned_when_injection_enabled_and_cancelled_on_unload():
+    """The resident flush loop (design D2) is spawned while injection is on
+    and is cancelled together with every other task on unload."""
+    plugin = make_plugin()
+
+    async def scenario() -> bool:
+        async def no_webhook() -> None:
+            return None
+
+        plugin._start_webhook = no_webhook  # type: ignore[assignment]
+        plugin._stop_webhook = no_webhook  # type: ignore[assignment]
+        plugin.config.context.enabled = True
+        await plugin.on_config_update("self", {}, "1")
+        task = plugin._flush_loop_task
+        assert task is not None and not task.done()
+        assert task in plugin._tasks
+        await plugin.on_unload()
+        await asyncio.sleep(0)
+        return task.cancelled()
+
+    assert asyncio.run(scenario()) is True
+
+
+def test_flush_loop_exits_when_injection_turned_off(monkeypatch):
+    """Turning injection off lets the loop exit on its own at the next tick
+    (self._injection_state is None), without an explicit cancel."""
+    plugin = make_plugin()
+
+    async def scenario() -> bool:
+        async def no_webhook() -> None:
+            return None
+
+        plugin._start_webhook = no_webhook  # type: ignore[assignment]
+        plugin._stop_webhook = no_webhook  # type: ignore[assignment]
+        plugin.config.context.enabled = True
+        await plugin.on_config_update("self", {}, "1")
+        task = plugin._flush_loop_task
+        assert task is not None and not task.done()
+        plugin.config.context.enabled = False
+        await plugin.on_config_update("self", {}, "1")
+        await asyncio.sleep(0.05)
+        return task.done() and not task.cancelled()
+
+    monkeypatch.setattr("plugin._INJECTION_FLUSH_TICK_SECONDS", 0.01)
+    assert asyncio.run(scenario()) is True
+
+
+def test_flush_loop_not_duplicated_when_injection_stays_enabled():
+    """A config reload that keeps injection enabled reuses the running loop
+    (it re-reads self._injection_state each tick) instead of stacking a
+    second one."""
+    plugin = make_plugin()
+
+    async def scenario() -> int:
+        async def no_webhook() -> None:
+            return None
+
+        plugin._start_webhook = no_webhook  # type: ignore[assignment]
+        plugin._stop_webhook = no_webhook  # type: ignore[assignment]
+        plugin.config.context.enabled = True
+        await plugin.on_config_update("self", {}, "1")
+        first = plugin._flush_loop_task
+        await plugin.on_config_update("self", {}, "1")  # reload, injection still on
+        assert plugin._flush_loop_task is first
+        return len(plugin._tasks)
+
+    assert asyncio.run(scenario()) == 1
+
+
+def test_injection_failure_rolls_back_dedup_and_quota():
+    """A failed injection write rolls the aggregate's dedup keys back
+    (design D4): the same reactor+message+emoji combination re-aggregates on
+    the next report and retries, and the failure consumes no
+    max_reactions_per_message quota (mark_injected is success-only)."""
+    plugin = make_plugin()
+    plugin.config.context.max_reactions_per_message = 1
+    enable_injection(plugin)
+    plugin.ctx.maisaka.context.fail_next = True
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))
+    assert len(plugin.ctx.maisaka.context.calls) == 1  # attempted and failed
+
+    plugin.ctx.maisaka.context.fail_next = False
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))
+    assert len(plugin.ctx.maisaka.context.calls) == 2  # re-aggregated and injected
+
+
+def test_silent_period_fallback_flush_and_no_double_delivery(monkeypatch):
+    """Silent-period fallback (design D2/D3): an aggregate whose window
+    elapsed with no further reports is delivered by the flush loop's single
+    tick method, and due()'s remove-on-read keeps the event-driven and tick
+    paths from double-delivering."""
+    plugin = make_plugin()
+    plugin.config.context.merge_window_seconds = 30
+    enable_injection(plugin)
+
+    class FakeClock:
+        def __init__(self) -> None:
+            self.now = 1000.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = FakeClock()
+    monkeypatch.setattr("time.time", clock)
+
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))
+    assert plugin.ctx.maisaka.context.calls == []  # window not yet elapsed
+
+    clock.now = 1031.0  # window elapsed, no new report arrives
+    asyncio.run(plugin._flush_due_aggregates())
+    assert len(plugin.ctx.maisaka.context.calls) == 1
+
+    clock.now = 1062.0  # a second message starts aggregating
+    asyncio.run(plugin._on_reaction(event(message_id="1002", reactor_qq="20003")))
+    assert len(plugin.ctx.maisaka.context.calls) == 1
+
+    clock.now = 1093.0  # a later report drives the event-driven flush
+    asyncio.run(plugin._on_reaction(event(message_id="1002", reactor_qq="20004")))
+    assert len(plugin.ctx.maisaka.context.calls) == 2
+
+    asyncio.run(plugin._flush_due_aggregates())  # the tick must not re-deliver
+    assert len(plugin.ctx.maisaka.context.calls) == 2
+
+
 # ---- 防御式拦截（chat.receive.before_process Hook）----
 
 def _notify_message(notice_type: str = "group_msg_emoji_like") -> dict[str, Any]:
@@ -717,3 +889,17 @@ def test_hook_passes_unrelated_notify():
     enable_injection(plugin)
     result = asyncio.run(plugin.guard_reaction_notify(message=_notify_message("group_recall")))
     assert result["action"] == "continue"
+
+
+def test_guard_intercepts_notify_from_blacklisted_group():
+    """Guard interception is orthogonal to the scope filter (spec-fixed
+    behavior, ADR 0003): even a group blacklisted from bandwagon reactions
+    still has its reaction notify messages aborted, because the guard
+    protects the main context from notify spam, not the reaction scope."""
+    plugin = make_plugin()
+    plugin.config.scope.group_blacklist = ["10001"]
+    enable_injection(plugin)
+    message = _notify_message()
+    message["message_info"]["group_info"] = {"group_id": "10001"}
+    result = asyncio.run(plugin.guard_reaction_notify(message=message))
+    assert result["action"] == "abort"
