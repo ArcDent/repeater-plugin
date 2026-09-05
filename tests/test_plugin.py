@@ -9,6 +9,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+# repeats 只经合成包名导入（conftest 未给它建顶层别名，其相对导入决定
+# 顶层形态加载不了），与 tests/test_repeats.py 的导入方式一致。
+from sending_emojis_plugin.repeats import REPEAT
+
 from config import RepeaterConfig
 from plugin import RepeaterPlugin
 from reactions import BANDWAGON, OPPOSITE, ReactionEvent
@@ -229,7 +233,21 @@ class StepClock:
 
 
 def sent_texts(plugin: RepeaterPlugin) -> list[str]:
-    return [call["text"] for call in plugin.ctx.send.text_calls]
+    """直发通路断言辅助：按调用序取 send_group_msg 的文本段内容。"""
+    return [
+        params["message"][0]["data"]["text"]
+        for name, params in plugin.protocol_calls  # type: ignore[attr-defined]
+        if name == "send_group_msg"
+    ]
+
+
+def sent_group_calls(plugin: RepeaterPlugin) -> list[tuple[str, Any]]:
+    """直发参数形态断言辅助：(文本, group_id) 对，群号按协议端惯例为 int。"""
+    return [
+        (params["message"][0]["data"]["text"], params["group_id"])
+        for name, params in plugin.protocol_calls  # type: ignore[attr-defined]
+        if name == "send_group_msg"
+    ]
 
 
 def test_plugin_disabled_messages_do_not_join_chain():
@@ -239,13 +257,13 @@ def test_plugin_disabled_messages_do_not_join_chain():
 
     async def scenario() -> tuple[list[str], list[str]]:
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("草", sender))
+            await plugin.handle_repeat_message(message=group_message("草", sender))
         # 恢复开关后仅一个发送者发言：若禁用期消息进了链，此时计数已满应触发
         plugin.config.plugin.enabled = True
-        await plugin.observe_repeat(message=group_message("草", "20003"))
+        await plugin.handle_repeat_message(message=group_message("草", "20003"))
         mid = sent_texts(plugin)
-        await plugin.observe_repeat(message=group_message("草", "20005"))
-        await plugin.observe_repeat(message=group_message("草", "20006"))
+        await plugin.handle_repeat_message(message=group_message("草", "20005"))
+        await plugin.handle_repeat_message(message=group_message("草", "20006"))
         await drain_spawned(plugin)
         return mid, sent_texts(plugin)
 
@@ -261,12 +279,12 @@ def test_repeat_switch_off_messages_do_not_join_chain():
 
     async def scenario() -> tuple[list[str], list[str]]:
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("草", sender))
+            await plugin.handle_repeat_message(message=group_message("草", sender))
         plugin.config.repeat.enabled = True
-        await plugin.observe_repeat(message=group_message("草", "20003"))
+        await plugin.handle_repeat_message(message=group_message("草", "20003"))
         mid = sent_texts(plugin)
-        await plugin.observe_repeat(message=group_message("草", "20005"))
-        await plugin.observe_repeat(message=group_message("草", "20006"))
+        await plugin.handle_repeat_message(message=group_message("草", "20005"))
+        await plugin.handle_repeat_message(message=group_message("草", "20006"))
         await drain_spawned(plugin)
         return mid, sent_texts(plugin)
 
@@ -281,7 +299,7 @@ def test_blacklisted_group_does_not_trigger_repeat():
 
     async def scenario() -> list[str]:
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("草", sender))
+            await plugin.handle_repeat_message(message=group_message("草", sender))
         await drain_spawned(plugin)
         return sent_texts(plugin)
 
@@ -294,12 +312,12 @@ def test_ignored_sender_messages_do_not_join_chain():
     plugin.config.scope.ignore_senders = ["20002"]
 
     async def scenario() -> tuple[list[str], list[str]]:
-        await plugin.observe_repeat(message=group_message("草", "20002"))
-        await plugin.observe_repeat(message=group_message("草", "20003"))
-        await plugin.observe_repeat(message=group_message("草", "20004"))
+        await plugin.handle_repeat_message(message=group_message("草", "20002"))
+        await plugin.handle_repeat_message(message=group_message("草", "20003"))
+        await plugin.handle_repeat_message(message=group_message("草", "20004"))
         # 若忽略名单失效：{20002, 20003, 20004} 已达阈值，此处应已发送
         mid = sent_texts(plugin)
-        await plugin.observe_repeat(message=group_message("草", "20005"))
+        await plugin.handle_repeat_message(message=group_message("草", "20005"))
         await drain_spawned(plugin)
         return mid, sent_texts(plugin)
 
@@ -312,22 +330,21 @@ def test_third_sender_consumes_qualification_and_rolls():
     """三人接龙第三次调用消耗资格并掷骰；后续同文本发送者不再触发。"""
     plugin = make_plugin()
 
-    async def scenario() -> tuple[int, list[tuple[str, str]]]:
-        await plugin.observe_repeat(message=group_message("草", "20002"))
-        await plugin.observe_repeat(message=group_message("草", "20003"))
-        after_two = len(plugin.ctx.send.text_calls)
-        await plugin.observe_repeat(message=group_message(" 草 ", "20004"))
+    async def scenario() -> tuple[int, list[tuple[str, Any]]]:
+        await plugin.handle_repeat_message(message=group_message("草", "20002"))
+        await plugin.handle_repeat_message(message=group_message("草", "20003"))
+        after_two = len(sent_texts(plugin))
+        await plugin.handle_repeat_message(message=group_message(" 草 ", "20004"))
         await drain_spawned(plugin)
         # 资格已消耗（链终结）：D、E 只续记录
-        await plugin.observe_repeat(message=group_message("草", "20005"))
-        await plugin.observe_repeat(message=group_message("草", "20006"))
+        await plugin.handle_repeat_message(message=group_message("草", "20005"))
+        await plugin.handle_repeat_message(message=group_message("草", "20006"))
         await drain_spawned(plugin)
-        calls = [(c["text"], c["stream_id"]) for c in plugin.ctx.send.text_calls]
-        return after_two, calls
+        return after_two, sent_group_calls(plugin)
 
     after_two, calls = asyncio.run(scenario())
     assert after_two == 0
-    assert calls == [(" 草 ", "stream-10001")]
+    assert calls == [(" 草 ", 10001)]
 
 
 def test_cooldown_suppresses_and_restores_qualification(monkeypatch):
@@ -339,16 +356,16 @@ def test_cooldown_suppresses_and_restores_qualification(monkeypatch):
 
     async def scenario() -> list[str]:
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("草", sender))
+            await plugin.handle_repeat_message(message=group_message("草", sender))
         await drain_spawned(plugin)
         # 冷却期内（起点 +1s < 5s）：另一文本「哈哈」三人接龙达标 → 压制不发送
         clock.now += 1
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("哈哈", sender))
+            await plugin.handle_repeat_message(message=group_message("哈哈", sender))
         await drain_spawned(plugin)
         # 冷却结束（起点 +6s ≥ 5s）：新发送者加入「哈哈」链 → 直接取得资格掷骰
         clock.now += 5
-        await plugin.observe_repeat(message=group_message("哈哈", "20005"))
+        await plugin.handle_repeat_message(message=group_message("哈哈", "20005"))
         await drain_spawned(plugin)
         return sent_texts(plugin)
 
@@ -364,11 +381,11 @@ def test_silence_outlet_does_not_enter_cooldown():
 
     async def scenario() -> list[str]:
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("草", sender))
+            await plugin.handle_repeat_message(message=group_message("草", sender))
         # 若沉默也进冷却，「哈哈」链会被压制；概率翻回拉满验证它仍能触发
         plugin.config.repeat.probability = 1.0
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("哈哈", sender))
+            await plugin.handle_repeat_message(message=group_message("哈哈", sender))
         await drain_spawned(plugin)
         return sent_texts(plugin)
 
@@ -385,11 +402,11 @@ def test_interrupt_outlet_enters_cooldown():
 
     async def scenario() -> list[str]:
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("草", sender))
+            await plugin.handle_repeat_message(message=group_message("草", sender))
         await drain_spawned(plugin)
         # 冷却期内另一文本达标 → 压制，不发送
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("哈哈", sender))
+            await plugin.handle_repeat_message(message=group_message("哈哈", sender))
         await drain_spawned(plugin)
         return sent_texts(plugin)
 
@@ -397,23 +414,22 @@ def test_interrupt_outlet_enters_cooldown():
 
 
 def test_send_failure_keeps_cooldown():
-    """发送成败不影响已进入的冷却：发送抛异常后冷却照常压制下一链。"""
-    plugin = make_plugin()
+    """直发成败不影响已进入的冷却：直发失败后冷却照常压制下一链。"""
+    plugin = make_plugin({"send_group_msg": None})
     plugin.config.repeat.cooldown_seconds = 600
-    plugin.ctx.send.raise_on_text = RuntimeError("boom")
 
     async def scenario() -> list[str]:
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("草", sender))
+            await plugin.handle_repeat_message(message=group_message("草", sender))
         await drain_spawned(plugin)
-        # 发送已失败，但冷却已写入：另一文本达标应被压制，不再尝试发送
+        # 直发已失败，但冷却已写入：另一文本达标应被压制，不再尝试直发
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("哈哈", sender))
+            await plugin.handle_repeat_message(message=group_message("哈哈", sender))
         await drain_spawned(plugin)
         return sent_texts(plugin)
 
     assert asyncio.run(scenario()) == ["草"]  # 只有一次尝试，失败不重试
-    assert any("复读/打断发送失败" in t for t in plugin.ctx.logger.texts("warning"))
+    assert any("直发失败" in t for t in plugin.ctx.logger.texts("warning"))
 
 
 def test_malformed_message_logs_debug_not_warning():
@@ -421,16 +437,16 @@ def test_malformed_message_logs_debug_not_warning():
     plugin = make_plugin()
 
     async def scenario() -> None:
-        await plugin.observe_repeat(message="not a dict")
-        await plugin.observe_repeat(message={})
+        await plugin.handle_repeat_message(message="not a dict")
+        await plugin.handle_repeat_message(message={})
         # 通知消息是合法非候选：不打 debug 也不打 warning
-        await plugin.observe_repeat(
+        await plugin.handle_repeat_message(
             message={"is_notify": True, "message_info": {"additional_config": {}}}
         )
         # 私聊同样合法：group_info 为 None
         message = group_message("草", "20002")
         message["message_info"]["group_info"] = None
-        await plugin.observe_repeat(message=message)
+        await plugin.handle_repeat_message(message=message)
 
     asyncio.run(scenario())
     assert plugin.ctx.logger.texts("warning") == []
@@ -444,7 +460,7 @@ def test_private_chat_message_is_silent():
     async def scenario() -> list[str]:
         message = group_message("草", "20002")
         message["message_info"]["group_info"] = None
-        await plugin.observe_repeat(message=message)
+        await plugin.handle_repeat_message(message=message)
         await drain_spawned(plugin)
         return sent_texts(plugin)
 
@@ -453,13 +469,228 @@ def test_private_chat_message_is_silent():
 
 
 def test_observe_handler_never_raises():
-    """handler 全程不得抛异常：内部异常兜住记 warning，返回继续动作。"""
+    """handler 兜底未捕获异常：记 warning，返回 continue 且随附原 kwargs。
+
+    CancelledError 不在兜底之列（照常上抛），由专门用例验证。
+    """
     plugin = make_plugin()
     plugin.config.repeat.max_text_length = "garbage"  # 非法配置制造内部异常
+    message = group_message("草", "20002")
 
-    result = asyncio.run(plugin.observe_repeat(message=group_message("草", "20002")))
-    assert result["action"] == "continue"
+    result = asyncio.run(plugin.handle_repeat_message(message=message))
+    assert result == {"action": "continue", "modified_kwargs": {"message": message}}
     assert any("复读检测处理消息失败" in t for t in plugin.ctx.logger.texts("warning"))
+
+
+def test_handler_cancelled_error_propagates(monkeypatch):
+    """CancelledError 照常上抛：不吞、不记 warning（design D1 兜底的例外）。"""
+    plugin = make_plugin()
+
+    async def cancelled_processor(message: Any) -> bool:
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(plugin, "_process_repeat_message", cancelled_processor)
+
+    async def scenario() -> str:
+        try:
+            await plugin.handle_repeat_message(message=group_message("草", "20002"))
+        except asyncio.CancelledError:
+            return "propagated"
+        return "swallowed"
+
+    assert asyncio.run(scenario()) == "propagated"
+    assert plugin.ctx.logger.texts("warning") == []
+
+
+# ---- blocking 返回值与触发消息拦截（planner 拦截，ADR 0006）----
+
+def test_blocking_continues_while_chain_accumulates():
+    """链未达标的消息放行：continue 且随附原 kwargs（blocking 正常形态）。"""
+    plugin = make_plugin()
+    first_message = group_message("草", "20002")
+    second_message = group_message("草", "20003")
+
+    async def scenario() -> list[dict[str, Any]]:
+        return [
+            await plugin.handle_repeat_message(message=first_message),
+            await plugin.handle_repeat_message(message=second_message),
+        ]
+
+    first, second = asyncio.run(scenario())
+    assert first == {"action": "continue", "modified_kwargs": {"message": first_message}}
+    assert second == {"action": "continue", "modified_kwargs": {"message": second_message}}
+
+
+def test_blocking_continue_on_silence_outlet():
+    """沉默出口放行触发消息：continue（用沉默日志证明掷骰确实发生，非门禁失效）。"""
+    plugin = make_plugin()
+    plugin.config.repeat.probability = 0.0
+    plugin.config.repeat.interrupt_probability = 0.0
+    messages = [group_message("草", sender) for sender in ("20002", "20003", "20004")]
+
+    async def scenario() -> list[dict[str, Any]]:
+        results = []
+        for message in messages:
+            results.append(await plugin.handle_repeat_message(message=message))
+        await drain_spawned(plugin)
+        return results
+
+    results = asyncio.run(scenario())
+    assert [result["action"] for result in results] == ["continue"] * 3
+    assert results[2]["modified_kwargs"] == {"message": messages[2]}
+    assert sent_texts(plugin) == []
+    assert plugin.ctx.maisaka.context.calls == []  # 沉默出口零注入
+    assert any("保持沉默" in t for t in plugin.ctx.logger.texts("info"))
+
+
+def test_blocking_continue_on_non_candidate():
+    """非候选消息（通知/私聊/形态异常）一律 continue 放行。"""
+    plugin = make_plugin()
+    notify = {"is_notify": True, "message_info": {"additional_config": {}}}
+    private = group_message("草", "20002")
+    private["message_info"]["group_info"] = None
+
+    async def scenario() -> list[dict[str, Any]]:
+        return [
+            await plugin.handle_repeat_message(message=notify),
+            await plugin.handle_repeat_message(message=private),
+            await plugin.handle_repeat_message(message="not a dict"),
+        ]
+
+    notify_result, private_result, malformed_result = asyncio.run(scenario())
+    assert notify_result == {"action": "continue", "modified_kwargs": {"message": notify}}
+    assert private_result == {"action": "continue", "modified_kwargs": {"message": private}}
+    assert malformed_result == {"action": "continue", "modified_kwargs": {"message": "not a dict"}}
+
+
+def test_blocking_continue_when_repeat_disabled():
+    """repeat.enabled=false：本可触发复读出口的消息也放行、不拦截不注入。
+
+    context.enabled=true 不改变该结果（delta spec：复读侧开关语义不受
+    表情回应域 context.enabled 约束）。
+    """
+    plugin = make_plugin()
+    plugin.config.repeat.enabled = False
+    enable_injection(plugin)
+    messages = [group_message("草", sender) for sender in ("20002", "20003", "20004")]
+
+    async def scenario() -> list[dict[str, Any]]:
+        results = []
+        for message in messages:
+            results.append(await plugin.handle_repeat_message(message=message))
+        await drain_spawned(plugin)
+        return results
+
+    results = asyncio.run(scenario())
+    assert [result["action"] for result in results] == ["continue"] * 3
+    assert results[2]["modified_kwargs"] == {"message": messages[2]}
+    assert sent_texts(plugin) == []
+    assert plugin.ctx.maisaka.context.calls == []
+
+
+def test_blocking_abort_on_repeat_outlet():
+    """复读出口命中：spawn 后台发送后 abort 触发消息（planner 拦截）。"""
+    plugin = make_plugin()
+    messages = [group_message("草", sender) for sender in ("20002", "20003", "20004")]
+
+    async def scenario() -> tuple[list[dict[str, Any]], list[str]]:
+        results = []
+        for message in messages:
+            results.append(await plugin.handle_repeat_message(message=message))
+        await drain_spawned(plugin)
+        return results, sent_texts(plugin)
+
+    results, texts = asyncio.run(scenario())
+    assert [result["action"] for result in results] == ["continue", "continue", "abort"]
+    assert results[2]["modified_kwargs"] == {"message": messages[2]}
+    assert texts == ["草"]
+
+
+def test_blocking_abort_on_interrupt_outlet():
+    """打断出口同样拦截触发消息：abort，后台只发打断文本。"""
+    plugin = make_plugin()
+    plugin.config.repeat.probability = 0.0
+    plugin.config.repeat.interrupt_probability = 1.0
+    plugin.config.repeat.interrupt_texts = ["停！"]
+    messages = [group_message("草", sender) for sender in ("20002", "20003", "20004")]
+
+    async def scenario() -> tuple[list[dict[str, Any]], list[str]]:
+        results = []
+        for message in messages:
+            results.append(await plugin.handle_repeat_message(message=message))
+        await drain_spawned(plugin)
+        return results, sent_texts(plugin)
+
+    results, texts = asyncio.run(scenario())
+    assert [result["action"] for result in results] == ["continue", "continue", "abort"]
+    assert results[2]["modified_kwargs"] == {"message": messages[2]}
+    assert texts == ["停！"]
+
+
+def test_background_task_receives_trigger_context_and_decision():
+    """后台任务收到触发消息打包（群号/发送者/原始文本/message_id）+ 决策共五项。
+
+    原始文本取发送时的样子（含原始空白），不是链键控用的归一产物。
+    """
+    plugin = make_plugin()
+    captured: list[tuple[Any, Any]] = []
+
+    async def capture(candidate: Any, decision: Any) -> None:
+        captured.append((candidate, decision))
+
+    plugin._send_repeat_decision = capture  # type: ignore[assignment]
+
+    async def scenario() -> None:
+        await plugin.handle_repeat_message(message=group_message("草", "20002"))
+        await plugin.handle_repeat_message(message=group_message("草", "20003"))
+        trigger = group_message(" 草 ", "20004")
+        trigger["message_id"] = "msg-42"
+        await plugin.handle_repeat_message(message=trigger)
+        await drain_spawned(plugin)
+
+    asyncio.run(scenario())
+    assert len(captured) == 1
+    candidate, decision = captured[0]
+    assert candidate.group_id == "10001"
+    assert candidate.sender_qq == "20004"
+    assert candidate.text == " 草 "
+    assert candidate.message_id == "msg-42"
+    assert decision.kind == REPEAT
+    assert decision.text == " 草 "
+
+
+def test_concurrent_trigger_boundary_spawns_once():
+    """并发到达的两条边界消息只消费一次资格：一 abort 一 continue、单次打包。
+
+    并发双触发防护语义（AGENTS.md 复读域）：record 同步原子段写终结标记
+    先于掷骰，同一链上的资格绝无二次授出。
+    """
+    plugin = make_plugin()
+    captured: list[tuple[Any, Any]] = []
+
+    async def capture(candidate: Any, decision: Any) -> None:
+        captured.append((candidate, decision))
+
+    plugin._send_repeat_decision = capture  # type: ignore[assignment]
+
+    async def scenario() -> list[dict[str, Any]]:
+        await plugin.handle_repeat_message(message=group_message("草", "20002"))
+        await plugin.handle_repeat_message(message=group_message("草", "20003"))
+        results = await asyncio.gather(
+            plugin.handle_repeat_message(message=group_message("草", "20004")),
+            plugin.handle_repeat_message(message=group_message("草", "20005")),
+        )
+        await drain_spawned(plugin)
+        return results
+
+    results = asyncio.run(scenario())
+    assert sorted(result["action"] for result in results) == ["abort", "continue"]
+    assert len(captured) == 1
+    candidate, decision = captured[0]
+    assert candidate.group_id == "10001"
+    assert candidate.sender_qq in ("20004", "20005")
+    assert decision.kind == REPEAT
+    assert decision.text == "草"
 
 
 # ---- 复读/打断发送编排 ----
@@ -469,9 +700,9 @@ def test_repeat_outlet_sends_last_raw_text():
     plugin = make_plugin()
 
     async def scenario() -> list[str]:
-        await plugin.observe_repeat(message=group_message("草", "20002"))
-        await plugin.observe_repeat(message=group_message("草", "20003"))
-        await plugin.observe_repeat(message=group_message(" 草 ", "20004"))
+        await plugin.handle_repeat_message(message=group_message("草", "20002"))
+        await plugin.handle_repeat_message(message=group_message("草", "20003"))
+        await plugin.handle_repeat_message(message=group_message(" 草 ", "20004"))
         await drain_spawned(plugin)
         return sent_texts(plugin)
 
@@ -479,20 +710,52 @@ def test_repeat_outlet_sends_last_raw_text():
 
 
 def test_interrupt_outlet_sends_single_pool_text_without_repeat_text():
-    """打断出口只发池内一条文本，不附带复读文本。"""
+    """打断出口只直发池内一条文本，不附带复读文本。"""
     plugin = make_plugin()
     plugin.config.repeat.probability = 0.0
     plugin.config.repeat.interrupt_probability = 1.0
     # 单条池子让随机取值确定化
     plugin.config.repeat.interrupt_texts = ["停！"]
 
-    async def scenario() -> list[tuple[str, str]]:
+    async def scenario() -> list[tuple[str, Any]]:
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("草", sender))
+            await plugin.handle_repeat_message(message=group_message("草", sender))
         await drain_spawned(plugin)
-        return [(c["text"], c["stream_id"]) for c in plugin.ctx.send.text_calls]
+        return sent_group_calls(plugin)
 
-    assert asyncio.run(scenario()) == [("停！", "stream-10001")]
+    assert asyncio.run(scenario()) == [("停！", 10001)]
+
+
+def test_direct_send_carries_group_id_and_text_segment():
+    """send_group_msg 完整参数形态：group_id 数字化、message 为单条 text 段。
+
+    两出口共用同一形态：第 1 链走复读出口（默认概率已拉满），第 2 链概率
+    反向拉满走打断出口，整包比对（对齐贴表情侧 test_send_carries_* 惯例）。
+    """
+    plugin = make_plugin()
+    plugin.config.repeat.interrupt_texts = ["停！"]
+
+    async def scenario() -> list[dict[str, Any]]:
+        for sender in ("20002", "20003", "20004"):
+            await plugin.handle_repeat_message(message=group_message("草", sender))
+        await drain_spawned(plugin)
+        plugin.config.repeat.probability = 0.0
+        plugin.config.repeat.interrupt_probability = 1.0
+        for sender in ("20002", "20003", "20004"):
+            await plugin.handle_repeat_message(message=group_message("哈哈", sender))
+        await drain_spawned(plugin)
+        return [
+            params
+            for name, params in plugin.protocol_calls  # type: ignore[attr-defined]
+            if name == "send_group_msg"
+        ]
+
+    assert asyncio.run(scenario()) == [
+        {"group_id": 10001, "message": [{"type": "text", "data": {"text": "草"}}]},
+        {"group_id": 10001, "message": [{"type": "text", "data": {"text": "停！"}}]},
+    ]
+    # 直发彻底替代标准发送链：全程不出现 ctx.send.text
+    assert plugin.ctx.send.text_calls == []
 
 
 def test_silence_outlet_sends_nothing():
@@ -503,13 +766,13 @@ def test_silence_outlet_sends_nothing():
 
     async def scenario() -> list[str]:
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("草", sender))
+            await plugin.handle_repeat_message(message=group_message("草", sender))
         await drain_spawned(plugin)
         # 机制活性探针：概率翻满后另一文本的链必须能发出，证明前面的零调用
         # 来自沉默出口而非门禁失效
         plugin.config.repeat.probability = 1.0
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("哈哈", sender))
+            await plugin.handle_repeat_message(message=group_message("哈哈", sender))
         await drain_spawned(plugin)
         return sent_texts(plugin)
 
@@ -517,7 +780,7 @@ def test_silence_outlet_sends_nothing():
 
 
 def test_send_waits_behavior_delay_before_sending(monkeypatch):
-    """发送经 behavior.delay_min/max 随机延迟后执行，不出现决策即发。"""
+    """直发经 behavior.delay_min/max 随机延迟后执行，不出现决策即发。"""
     plugin = make_plugin()
     plugin.config.behavior.delay_min_seconds = 1.5
     plugin.config.behavior.delay_max_seconds = 1.5
@@ -530,7 +793,7 @@ def test_send_waits_behavior_delay_before_sending(monkeypatch):
 
     async def scenario() -> list[str]:
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("草", sender))
+            await plugin.handle_repeat_message(message=group_message("草", sender))
         # handler 自身不得延迟（observe 必须快进快出）：此刻延迟尚未发生
         assert sleeps == []
         await drain_spawned(plugin)
@@ -541,35 +804,46 @@ def test_send_waits_behavior_delay_before_sending(monkeypatch):
 
 
 def test_stream_id_resolved_once_per_group_across_sends():
-    """stream_id 复用 _get_stream_id 缓存：同群两次发送只查一次聊天流。"""
+    """stream_id 复用 _get_stream_id 缓存：同群两出口的注入只查一次聊天流。
+
+    直发只需群号、不依赖 stream（design D2）；触发消息与行为文本两路注入
+    （每出口各两次 append）都取 stream，成功缓存保证同群只解析一次。
+    """
     plugin = make_plugin()
 
-    async def scenario() -> tuple[list[tuple[str, str]], list[str]]:
+    async def scenario() -> tuple[list[tuple[str, Any]], list[str], list[str]]:
         for text in ("草", "哈哈"):
             for sender in ("20002", "20003", "20004"):
-                await plugin.observe_repeat(message=group_message(text, sender))
+                await plugin.handle_repeat_message(message=group_message(text, sender))
             await drain_spawned(plugin)
-        calls = [(c["text"], c["stream_id"]) for c in plugin.ctx.send.text_calls]
-        return calls, plugin.ctx.chat.queries
+        calls = sent_group_calls(plugin)
+        streams = [c["stream_id"] for c in plugin.ctx.maisaka.context.calls]
+        return calls, streams, plugin.ctx.chat.queries
 
-    calls, queries = asyncio.run(scenario())
-    assert calls == [("草", "stream-10001"), ("哈哈", "stream-10001")]
+    calls, streams, queries = asyncio.run(scenario())
+    assert calls == [("草", 10001), ("哈哈", 10001)]
+    assert streams == ["stream-10001"] * 4  # 2 出口 × (触发消息 + 行为文本)
     assert queries == ["10001"]
 
 
 def test_send_failure_result_logged_as_warning():
-    """ctx.send.text 返回失败：记 warning，不抛不重试。"""
-    plugin = make_plugin()
-    plugin.ctx.send.text_result = False
+    """直发返回失败（HTTP 200 + status=failed）：记 warning，止步不重试。"""
+    plugin = make_plugin(
+        {"send_group_msg": {"status": "failed", "retcode": 1200, "wording": "禁言中"}}
+    )
 
     async def scenario() -> list[str]:
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("草", sender))
+            await plugin.handle_repeat_message(message=group_message("草", sender))
         await drain_spawned(plugin)
         return sent_texts(plugin)
 
     assert asyncio.run(scenario()) == ["草"]  # 只调用一次
-    assert any("复读/打断发送失败" in t for t in plugin.ctx.logger.texts("warning"))
+    # 止步于触发消息注入：直发失败后无行为文本注入
+    assert len(plugin.ctx.maisaka.context.calls) == 1
+    warnings = plugin.ctx.logger.texts("warning")
+    assert any("直发失败" in t for t in warnings)
+    assert any("禁言中" in t for t in warnings)
 
 
 def test_empty_interrupt_pool_falls_back_with_warning():
@@ -581,7 +855,7 @@ def test_empty_interrupt_pool_falls_back_with_warning():
 
     async def scenario() -> list[str]:
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("草", sender))
+            await plugin.handle_repeat_message(message=group_message("草", sender))
         await drain_spawned(plugin)
         return sent_texts(plugin)
 
@@ -591,6 +865,189 @@ def test_empty_interrupt_pool_falls_back_with_warning():
     assert texts[0] in ("打断！", "够了！", "停！", "打住！", "别念了！")
     assert texts[0] != "草"  # 不是复读文本
     assert any("打断文本池为空" in t for t in plugin.ctx.logger.texts("warning"))
+
+
+def test_direct_send_success_choreography_order(monkeypatch):
+    """成功路径四步编舞（design D2）：触发消息注入 → 延迟 → 直发 → 行为文本注入。"""
+    plugin = make_plugin(
+        {"send_group_msg": {"status": "ok", "retcode": 0, "data": {"message_id": 987001}}}
+    )
+    plugin.config.behavior.delay_min_seconds = 1.5
+    plugin.config.behavior.delay_max_seconds = 1.5
+    events: list[str] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        events.append("delay")
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    original_append = plugin.ctx.maisaka.context.append
+
+    async def recording_append(**kwargs: Any) -> Any:
+        events.append("append")
+        return await original_append(**kwargs)
+
+    plugin.ctx.maisaka.context.append = recording_append  # type: ignore[method-assign]
+
+    original_call = plugin._call_protocol
+
+    async def recording_call(action_name: str, params: dict[str, Any]) -> Any:
+        events.append(f"protocol:{action_name}")
+        return await original_call(action_name, params)
+
+    plugin._call_protocol = recording_call  # type: ignore[assignment]
+
+    async def scenario() -> None:
+        for sender in ("20002", "20003", "20004"):
+            await plugin.handle_repeat_message(message=group_message("草", sender))
+        await drain_spawned(plugin)
+
+    asyncio.run(scenario())
+    assert events == ["append", "delay", "protocol:send_group_msg", "append"]
+    # 直发通路彻底替代标准发送链：全程不出现 ctx.send.text
+    assert plugin.ctx.send.text_calls == []
+
+
+def test_direct_send_unreachable_stops_after_trigger_injection():
+    """直发不可达（返回 None）：记 warning 止步，行为文本注入不出现（design D2）。"""
+    plugin = make_plugin({"send_group_msg": None})
+
+    async def scenario() -> list[str]:
+        for sender in ("20002", "20003", "20004"):
+            await plugin.handle_repeat_message(message=group_message("草", sender))
+        await drain_spawned(plugin)
+        return sent_texts(plugin)
+
+    assert asyncio.run(scenario()) == ["草"]  # 只尝试一次直发
+    # 止步于触发消息注入：恰好一条 append（触发消息），无行为文本注入
+    assert len(plugin.ctx.maisaka.context.calls) == 1
+    assert any("直发失败" in t for t in plugin.ctx.logger.texts("warning"))
+    assert plugin.ctx.send.text_calls == []
+
+
+def test_trigger_injection_stream_missing_still_direct_sends():
+    """触发消息注入失败（stream 查不到）记 warning 继续：直发照常执行（design D2）。"""
+    plugin = make_plugin()
+    plugin.ctx.chat.streams["10001"] = None
+
+    async def scenario() -> list[str]:
+        for sender in ("20002", "20003", "20004"):
+            await plugin.handle_repeat_message(message=group_message("草", sender))
+        await drain_spawned(plugin)
+        return sent_texts(plugin)
+
+    assert asyncio.run(scenario()) == ["草"]
+    assert plugin.ctx.maisaka.context.calls == []  # 两路注入都因无 stream 跳过
+    assert any("取不到群" in t for t in plugin.ctx.logger.texts("warning"))
+
+
+def test_append_failure_does_not_block_direct_send_or_intercept():
+    """注入失败（append 返回 success=false）不阻断直发、不回滚拦截、不重试。
+
+    delta spec「注入失败不回滚拦截」的主程序返回失败形态（fake 的
+    fail_next）：触发消息与行为文本两路注入各试一次即定格，直发照常成功，
+    handler 对触发消息照常 abort（拦截在同步段已定，与注入成败解耦）。
+    """
+    plugin = make_plugin()
+    plugin.ctx.maisaka.context.fail_next = True
+
+    async def scenario() -> tuple[dict[str, Any], list[str]]:
+        results = []
+        for sender in ("20002", "20003", "20004"):
+            results.append(await plugin.handle_repeat_message(message=group_message("草", sender)))
+        await drain_spawned(plugin)
+        return results[2], sent_texts(plugin)
+
+    trigger_result, texts = asyncio.run(scenario())
+    assert trigger_result["action"] == "abort"  # 注入失败不回滚拦截
+    assert texts == ["草"]  # 注入失败不阻断直发
+    calls = plugin.ctx.maisaka.context.calls
+    assert [c["source_kind"] for c in calls] == ["repeat_trigger", "repeat"]
+    failed = [t for t in plugin.ctx.logger.texts("warning") if "注入复读域上下文失败" in t]
+    assert len(failed) == 2  # 两路注入各失败一次，无重试
+
+
+def test_append_exception_does_not_block_direct_send_or_intercept():
+    """注入抛异常（主程序侧故障形态）同样不阻断直发、不回滚拦截、不重试。"""
+    plugin = make_plugin()
+    attempted: list[str] = []
+
+    async def boom_append(**kwargs: Any) -> Any:
+        attempted.append(str(kwargs["source_kind"]))
+        raise RuntimeError("append 内部异常")
+
+    plugin.ctx.maisaka.context.append = boom_append  # type: ignore[method-assign]
+
+    async def scenario() -> tuple[dict[str, Any], list[str]]:
+        results = []
+        for sender in ("20002", "20003", "20004"):
+            results.append(await plugin.handle_repeat_message(message=group_message("草", sender)))
+        await drain_spawned(plugin)
+        return results[2], sent_texts(plugin)
+
+    trigger_result, texts = asyncio.run(scenario())
+    assert trigger_result["action"] == "abort"
+    assert texts == ["草"]
+    assert attempted == ["repeat_trigger", "repeat"]  # 各试一次，次数定格
+    failed = [t for t in plugin.ctx.logger.texts("warning") if "注入复读域上下文异常" in t]
+    assert len(failed) == 2
+
+
+def test_repeat_outlet_injection_payloads():
+    """复读出口双注入载荷（design D3）：source_kind / message_id / 文案。"""
+    plugin = make_plugin(
+        {"send_group_msg": {"status": "ok", "retcode": 0, "data": {"message_id": 987001}}}
+    )
+    trigger = group_message(" 草 ", "20004")
+    trigger["message_id"] = "msg-42"
+    trigger["message_info"]["user_info"]["user_nickname"] = "触发者"
+
+    async def scenario() -> None:
+        await plugin.handle_repeat_message(message=group_message("草", "20002"))
+        await plugin.handle_repeat_message(message=group_message("草", "20003"))
+        await plugin.handle_repeat_message(message=trigger)
+        await drain_spawned(plugin)
+
+    asyncio.run(scenario())
+    calls = plugin.ctx.maisaka.context.calls
+    assert [c["source_kind"] for c in calls] == ["repeat_trigger", "repeat"]
+    trigger_call, behavior_call = calls
+    # 触发消息注入：附触发消息自身 ID，呈现发送者显示名与原文（原始空白保留）
+    assert trigger_call["message_id"] == "msg-42"
+    assert trigger_call["stream_id"] == "stream-10001"
+    assert "触发者" in trigger_call["visible_text"]
+    assert " 草 " in trigger_call["visible_text"]
+    assert trigger_call["segments"] == [{"type": "text", "data": trigger_call["visible_text"]}]
+    # 行为文本注入：附直发响应 data.message_id，呈现复读文本且可区分行为类型
+    assert behavior_call["message_id"] == 987001
+    assert "[复读]" in behavior_call["visible_text"]
+    assert " 草 " in behavior_call["visible_text"]
+
+
+def test_interrupt_outlet_injection_payloads():
+    """打断出口的行为文本注入：source_kind=interrupt、只呈现打断文本。"""
+    plugin = make_plugin(
+        {"send_group_msg": {"status": "ok", "retcode": 0, "data": {"message_id": 987002}}}
+    )
+    plugin.config.repeat.probability = 0.0
+    plugin.config.repeat.interrupt_probability = 1.0
+    plugin.config.repeat.interrupt_texts = ["停！"]
+    trigger = group_message("草", "20004")
+    trigger["message_id"] = "msg-43"
+
+    async def scenario() -> None:
+        for sender in ("20002", "20003", "20004"):
+            await plugin.handle_repeat_message(message=group_message("草", sender))
+        await drain_spawned(plugin)
+
+    asyncio.run(scenario())
+    calls = plugin.ctx.maisaka.context.calls
+    assert [c["source_kind"] for c in calls] == ["repeat_trigger", "interrupt"]
+    behavior_call = calls[1]
+    assert behavior_call["message_id"] == 987002
+    assert "[打断]" in behavior_call["visible_text"]
+    assert "停！" in behavior_call["visible_text"]
+    assert "草" not in behavior_call["visible_text"]  # 绝不附带复读文本
 
 
 # ---- Manifest（repeat-and-rebrand 改名与新 capability 声明）----
@@ -673,7 +1130,7 @@ def test_repeat_cooldown_does_not_affect_reaction_cooldown():
 
     async def scenario() -> tuple[list[str], list[str]]:
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("草", sender))
+            await plugin.handle_repeat_message(message=group_message("草", sender))
         await drain_spawned(plugin)
         # 复读冷却期内表情上报到来：表情冷却独立计时，不受复读冷却影响
         await plugin._on_reaction(event())
@@ -691,7 +1148,7 @@ def test_repeat_disabled_bandwagon_still_fires():
 
     async def scenario() -> tuple[list[str], list[str]]:
         for sender in ("20002", "20003", "20004"):
-            await plugin.observe_repeat(message=group_message("草", sender))
+            await plugin.handle_repeat_message(message=group_message("草", sender))
         await drain_spawned(plugin)
         await plugin._on_reaction(event())
         return sent_texts(plugin), actions_of(plugin)

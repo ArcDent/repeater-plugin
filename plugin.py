@@ -41,13 +41,17 @@ from .reactions import (
     parse_reaction_report,
     parse_self_qq,
     protocol_call_failed,
+    protocol_failure_detail,
     qq_set,
 )
 from .repeats import (
-    REPEAT,
     TRIGGER,
+    RepeatCandidate,
     RepeatDecision,
     RepeatState,
+    behavior_kind_label,
+    build_behavior_visible_text,
+    build_trigger_visible_text,
     decide_repeat,
     extract_repeat_candidate,
 )
@@ -494,45 +498,52 @@ class RepeaterPlugin(MaiBotPlugin):
             return {"action": "abort", "modified_kwargs": kwargs}
         return {"action": "continue", "modified_kwargs": kwargs}
 
-    # ---- 复读检测（chat.receive.before_process observe Hook）----
+    # ---- 复读检测（chat.receive.before_process blocking Hook）----
 
     @HookHandler(
         "chat.receive.before_process",
         name="repeat_detector",
-        mode="observe",
+        mode="blocking",
         order="late",
-        description="观测群消息累积复读链，达标后按概率把复读文本原样发出或发打断文本（ADR 0005）。",
+        description="累积复读链，达标掷骰：复读/打断出口命中时拦截触发消息并转后台发送，沉默与非候选放行（ADR 0005/0006）。",
     )
-    async def observe_repeat(self, **kwargs: Any) -> dict[str, Any]:
-        """复读检测入口（observe 模式，主程序后台调度，返回值被吞）。
+    async def handle_repeat_message(self, **kwargs: Any) -> dict[str, Any]:
+        """复读检测入口（blocking 模式：返回值决定触发消息在主链上的去留）。
 
-        handler 全程不得抛异常：observe 任务的异常虽被主程序吞掉并记日志，
-        但等于复读检测静默失效，必须自查兜底。observe 不得返回
-        modified_kwargs（主程序会对该返回打 warning），只声明继续。
+        复读/打断出口命中 → spawn 后台发送任务后返回 abort：触发消息不写入
+        主程序消息库、不进 planner 上下文（planner 拦截，design D1）。沉默
+        出口、非候选、开关关闭 → continue 放行。未捕获异常记 warning 后返回
+        continue——blocking 挂在主链上，宁可漏一条拦截也不让插件异常干扰
+        主程序消息处理；CancelledError 照常上抛。
         """
         try:
-            await self._process_repeat_message(kwargs.get("message"))
+            intercepted = await self._process_repeat_message(kwargs.get("message"))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self.ctx.logger.warning(f"复读检测处理消息失败: {exc}")
-        return {"action": "continue"}
+            return {"action": "continue", "modified_kwargs": kwargs}
+        action = "abort" if intercepted else "continue"
+        return {"action": action, "modified_kwargs": kwargs}
 
-    async def _process_repeat_message(self, message: Any) -> None:
-        """门禁 → 链累积 → 三出口决策；复读/打断出口写冷却后转后台发送。
+    async def _process_repeat_message(self, message: Any) -> bool:
+        """门禁 → 链累积 → 三出口决策；返回触发消息是否被出口消费（拦截）。
 
-        从门禁到写冷却、spawn 为止没有任何 await 点：同群同文本的并发
-        observe 任务不可能在同一链上双触发（design D3 的同步原子段）。
+        返回 True 即复读/打断出口命中：本方法内已完成写冷却与 spawn，handler
+        据此对触发消息 abort。沉默出口、非候选、门禁不过一律返回 False
+        （continue 放行）。从门禁到写冷却、spawn 为止没有任何 await 点：同群
+        同文本的并发任务不可能在同一链上双触发（design D3 的同步原子段，
+        终结标记在 record 内先于掷骰写入）。
         """
         repeat = self.config.repeat
         if not self.config.plugin.enabled or not repeat.enabled:
-            return
+            return False
         if not isinstance(message, dict) or not isinstance(message.get("message_info"), dict):
             # 形态漂移打 debug 不打 warning（design D4 / ADR 0005）：hook 每条
             # 群消息都过，warning 会刷屏；序列化 SessionMessage 必含 dict 形态
             # 的 message_info（主程序 message_utils._session_message_to_dict）。
             self.ctx.logger.debug(f"复读检测收到形态异常的消息: {str(message)[:120]}")
-            return
+            return False
         candidate = extract_repeat_candidate(
             message,
             self_qq=self._self_qq,
@@ -540,12 +551,12 @@ class RepeaterPlugin(MaiBotPlugin):
         )
         if candidate is None:
             # 私聊/通知/富媒体/命令/超长/麦麦自己：合法非候选，静默返回。
-            return
+            return False
         scope = self.config.scope
         if not group_allowed(candidate.group_id, scope.group_whitelist, scope.group_blacklist):
-            return
+            return False
         if candidate.sender_qq in qq_set(scope.ignore_senders):
-            return
+            return False
 
         now = time.time()
         suppressed = self._repeat_state.is_cooling_down(
@@ -559,7 +570,7 @@ class RepeaterPlugin(MaiBotPlugin):
             suppress_trigger=suppressed,
         )
         if result.status != TRIGGER:
-            return
+            return False
 
         decision = decide_repeat(
             result.text,
@@ -573,7 +584,7 @@ class RepeaterPlugin(MaiBotPlugin):
             self.ctx.logger.info(
                 f"复读链达标后保持沉默 group={candidate.group_id} text={result.text!r}"
             )
-            return
+            return False
         if decision.used_default_pool:
             # 空池回落内置默认池（design D5）：回落事实由决策结果携带，此处
             # 只读标志记 warning，不静默哑火，也不重复推断池是否为空。
@@ -583,33 +594,100 @@ class RepeaterPlugin(MaiBotPlugin):
         self.ctx.logger.info(
             f"复读链达标 group={candidate.group_id} {decision.reason} text={result.text!r}"
         )
-        self._spawn(self._send_repeat_decision(candidate.group_id, decision))
+        self._spawn(self._send_repeat_decision(candidate, decision))
+        return True
 
-    async def _send_repeat_decision(self, group_id: str, decision: RepeatDecision) -> None:
-        """经标准发送链发出复读/打断文本（design D5）：延迟 → 取流 → ctx.send.text。
+    async def _send_repeat_decision(
+        self, candidate: RepeatCandidate, decision: RepeatDecision
+    ) -> None:
+        """复读/打断出口的后台编舞（ADR 0006，change design D2）。
 
-        消息走主程序发送链、进麦麦上下文；延迟复用 behavior.delay_min/max 的
-        节奏，避免决策即发的机械感。发送异常或失败只记 warning，不重试不抛：
-        冷却与链终结在出口命中时已写入，与本任务的成败解耦。
+        触发消息注入（失败记 warning 继续）→ 延迟 → send_group_msg 协议端
+        直发（失败止步）→ 行为文本注入（仅直发成功）。直发只需群号，与
+        stream_id 彻底解耦（stream 仅注入需要），不走主程序标准发送链——
+        ctx.send.text 路过的 blocking hook 可改写/取消消息且默认不进内存
+        上下文（ADR 0006）。冷却与链终结在出口命中时已写入，与本任务成败
+        解耦；注入失败不重试、不回滚、不复用表情回应域的 InjectionState。
         """
+        group_id = candidate.group_id
         try:
+            # 1. 触发消息注入：补偿 planner 拦截造成的上下文缺失，与直发
+            #    成败解耦（失败记 warning 继续，不阻断后续直发）。文案呈现
+            #    发送者显示名与原文（design D3），message_id 附触发消息自身。
+            await self._append_repeat_context(
+                group_id,
+                build_trigger_visible_text(candidate),
+                "repeat_trigger",
+                candidate.message_id,
+            )
+            # 2. 延迟：沿用 behavior.delay_min/max 的节奏，避免决策即发。
             await self._delay()
-            stream_id = await self._get_stream_id(group_id)
-            if not stream_id:
-                self.ctx.logger.warning(f"取不到群 {group_id} 的 stream，复读/打断未发出")
-                return
-            response = await self.ctx.send.text(decision.text, stream_id)
+            # 3. 协议端直发（OneBot 11 核心动作，不做 retcode=1404 永久停用）。
+            response = await self._call_protocol(
+                "send_group_msg",
+                {
+                    # 群号与 message_id 同一协议端惯例：纯数字转 int。
+                    "group_id": coerce_message_id(group_id),
+                    "message": [{"type": "text", "data": {"text": decision.text}}],
+                },
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self.ctx.logger.warning(f"复读/打断发送失败（ctx.send.text 异常）: {exc}")
+            self.ctx.logger.warning(f"复读/打断直发失败（异常）: {exc}")
             return
-        if not response or (isinstance(response, dict) and not response.get("sent")):
-            # SDK 未开 return_details 时返回 bool；开了则返回 SendResult dict。
-            self.ctx.logger.warning(f"复读/打断发送失败: {response}")
+        if response is None:
+            self.ctx.logger.warning(f"复读/打断直发失败（协议端不可达）: group={group_id}")
             return
-        kind = "复读" if decision.kind == REPEAT else "打断文本"
-        self.ctx.logger.info(f"已发出{kind} group={group_id} text={decision.text!r}")
+        if protocol_call_failed(response):
+            detail = protocol_failure_detail(response)
+            self.ctx.logger.warning(f"复读/打断直发失败: group={group_id} 原因={detail}")
+            return
+        self.ctx.logger.info(
+            f"已直发{behavior_kind_label(decision.kind)}文本 group={group_id} text={decision.text!r}"
+        )
+        # 4. 行为文本注入：让麦麦知道自己发出了什么（仅直发成功）。文案
+        #    区分行为类型（design D3），message_id 附直发响应 data.message_id。
+        data = response.get("data")
+        sent_message_id = data.get("message_id") if isinstance(data, dict) else None
+        await self._append_repeat_context(
+            group_id, build_behavior_visible_text(decision), decision.kind, sent_message_id
+        )
+
+    async def _append_repeat_context(
+        self, group_id: str, text: str, source_kind: str, message_id: Any
+    ) -> None:
+        """把一条复读域上下文消息写入麦麦聊天历史（change design D3）。
+
+        复读注入是 planner 拦截的即时一次性补偿，无幂等键需求，不复用
+        表情回应域的 InjectionState（去重/聚合/回滚是外部事件流聚合的
+        需求）。失败（stream 查不到 / append 异常或失败）记 warning 即返：
+        不重试、不回滚，调用方照常走后续步骤——注入与直发成败解耦。
+        """
+        stream_id = await self._get_stream_id(group_id)
+        if not stream_id:
+            self.ctx.logger.warning(
+                f"取不到群 {group_id} 的 stream，跳过注入 source_kind={source_kind}"
+            )
+            return
+        try:
+            response = await self.ctx.maisaka.context.append(
+                stream_id=stream_id,
+                segments=[{"type": "text", "data": text}],
+                visible_text=text,
+                source_kind=source_kind,
+                message_id=message_id,
+            )
+        except Exception as exc:
+            # 宽捕获是有意的：注入失败不得拖垮编舞的后续步骤（BLE001 口径）。
+            self.ctx.logger.warning(f"注入复读域上下文异常 source_kind={source_kind}: {exc}")
+            return
+        if not (isinstance(response, dict) and response.get("success")):
+            self.ctx.logger.warning(f"注入复读域上下文失败 source_kind={source_kind}: {response}")
+            return
+        self.ctx.logger.info(
+            f"已注入复读域上下文 group={group_id} source_kind={source_kind} message_id={message_id}"
+        )
 
     async def _is_self_message(self, message_id: str, now: float) -> bool:
         """被回应消息的原作者是否是麦麦自己。查不到时按他人消息处理。"""
@@ -655,7 +733,7 @@ class RepeaterPlugin(MaiBotPlugin):
             )
             return
         if protocol_call_failed(response):
-            detail = str(response.get("wording") or response.get("message") or response.get("retcode"))
+            detail = protocol_failure_detail(response)
             self.ctx.logger.warning(f"贴表情被协议端拒绝: emoji={decision.emoji_id} 原因={detail}")
             return
         kind = "反义回应" if decision.kind == OPPOSITE else "跟风"
@@ -717,7 +795,7 @@ class RepeaterPlugin(MaiBotPlugin):
             self.ctx.logger.warning("协议端不可达，请检查 protocol.base_url 与网络")
             return
         if protocol_call_failed(response):
-            detail = str(response.get("wording") or response.get("message") or response.get("retcode"))
+            detail = protocol_failure_detail(response)
             self.ctx.logger.warning(f"协议端 get_login_info 返回失败（{detail}），请检查 access_token")
             return
 

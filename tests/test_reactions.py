@@ -29,6 +29,7 @@ from reactions import (
     parse_reaction_report,
     parse_self_qq,
     protocol_call_failed,
+    protocol_failure_detail,
     qq_set,
 )
 
@@ -548,6 +549,34 @@ def test_parse_self_qq():
 ])
 def test_protocol_call_failed(response, failed):
     assert protocol_call_failed(response) is failed
+
+
+def test_protocol_failure_detail_prefers_wording():
+    response = {"wording": "token 失效", "message": "internal error", "retcode": 1404}
+    assert protocol_failure_detail(response) == "token 失效"
+
+
+def test_protocol_failure_detail_falls_back_to_message():
+    response = {"message": "internal error", "retcode": 1404}
+    assert protocol_failure_detail(response) == "internal error"
+
+
+def test_protocol_failure_detail_falls_back_to_retcode():
+    assert protocol_failure_detail({"retcode": 1200}) == "1200"
+
+
+def test_protocol_failure_detail_skips_blank_fallback_values():
+    assert protocol_failure_detail({"wording": "", "message": "internal error"}) == "internal error"
+
+
+def test_protocol_failure_detail_empty_response():
+    # 与既有内联行为一致：三级全缺时 str(None) → "None"
+    assert protocol_failure_detail({}) == "None"
+
+
+def test_protocol_failure_detail_non_dict_response():
+    assert protocol_failure_detail("boom") == "boom"
+    assert protocol_failure_detail(None) == "None"
 
 
 def test_is_missing_action():

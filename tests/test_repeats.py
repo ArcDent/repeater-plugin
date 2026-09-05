@@ -19,7 +19,12 @@ from sending_emojis_plugin.repeats import (
     SUPPRESSED,
     TERMINATED,
     TRIGGER,
+    RepeatCandidate,
+    RepeatDecision,
     RepeatState,
+    behavior_kind_label,
+    build_behavior_visible_text,
+    build_trigger_visible_text,
     decide_repeat,
     extract_repeat_candidate,
     normalize_repeat_text,
@@ -173,6 +178,91 @@ def test_blank_text_is_rejected():
 ])
 def test_malformed_payloads_return_none(message):
     assert extract_repeat_candidate(message, self_qq=BOT_QQ) is None
+
+
+# ---- 触发消息上下文打包（blocking 拦截 / 注入用，change design D3）----
+
+def test_candidate_carries_trigger_message_id():
+    """触发消息自身 ID 随候选打包：拦截后的触发消息注入要附这个 ID。"""
+    message = _message()
+    message["message_id"] = "90001"
+    candidate = extract_repeat_candidate(message)
+    assert candidate is not None
+    assert candidate.message_id == "90001"
+
+
+def test_missing_message_id_still_qualifies_with_empty_id():
+    """形态漂移缺 message_id 不拒收候选（防御式口径），回落空串。"""
+    candidate = extract_repeat_candidate(_message())
+    assert candidate is not None
+    assert candidate.message_id == ""
+
+
+def test_display_name_prefers_cardname_over_nickname():
+    """群名片优先于昵称——对齐主程序 planner 侧的显示名惯例。"""
+    message = _message()
+    message["message_info"]["user_info"] = {
+        "user_id": "20002",
+        "user_nickname": "某人",
+        "user_cardname": "群名片名",
+    }
+    candidate = extract_repeat_candidate(message)
+    assert candidate is not None
+    assert candidate.sender_display_name == "群名片名"
+
+
+def test_display_name_falls_back_to_nickname_without_cardname():
+    """群名片未设置（None / 空串 / 缺键 / 空白）时回落昵称。"""
+    for cardname in (None, "", "   "):
+        message = _message()
+        message["message_info"]["user_info"] = {
+            "user_id": "20002",
+            "user_nickname": "某人",
+            "user_cardname": cardname,
+        }
+        candidate = extract_repeat_candidate(message)
+        assert candidate is not None, f"cardname={cardname!r}"
+        assert candidate.sender_display_name == "某人", f"cardname={cardname!r}"
+
+
+def test_display_name_falls_back_to_qq_when_names_unavailable():
+    """昵称与名片全缺失或全空白：显示名回落 QQ 号（design D3「取不到用 QQ 号」）。"""
+    for user_info in (
+        {"user_id": "20002"},
+        {"user_id": "20002", "user_nickname": "", "user_cardname": None},
+        {"user_id": "20002", "user_nickname": "   ", "user_cardname": "  "},
+    ):
+        message = _message()
+        message["message_info"]["user_info"] = user_info
+        candidate = extract_repeat_candidate(message)
+        assert candidate is not None, f"user_info={user_info!r}"
+        assert candidate.sender_display_name == "20002", f"user_info={user_info!r}"
+
+
+def test_display_name_is_trimmed():
+    message = _message()
+    message["message_info"]["user_info"] = {
+        "user_id": "20002",
+        "user_nickname": " 某人 ",
+        "user_cardname": "  群名片  ",
+    }
+    candidate = extract_repeat_candidate(message)
+    assert candidate is not None
+    assert candidate.sender_display_name == "群名片"
+
+
+def test_packed_fields_coerce_non_string_values():
+    """形态漂移防御：非字符串 message_id / 昵称按既有 id 强转口径处理。"""
+    message = _message()
+    message["message_id"] = 90001
+    message["message_info"]["user_info"] = {
+        "user_id": 20002,
+        "user_nickname": 12345,
+    }
+    candidate = extract_repeat_candidate(message)
+    assert candidate is not None
+    assert candidate.message_id == "90001"
+    assert candidate.sender_display_name == "12345"
 
 
 # ---- RepeatState ----
@@ -543,3 +633,40 @@ def test_garbage_probability_is_treated_as_zero():
     assert decide_repeat(
         "草", probability="很高", interrupt_probability=0.0, roll=_roll_never_called
     ) is None
+
+
+# ---- 注入文案构造（visible_text，change design D3；对齐 reactions 的
+# build_reaction_visible_text 先例：构造在纯逻辑层，plugin 只编排）----
+
+def test_build_trigger_visible_text_renders_display_name_and_raw_text():
+    candidate = RepeatCandidate(
+        group_id=GROUP_ID,
+        sender_qq="20002",
+        text=" 草 ",
+        message_id="msg-42",
+        sender_display_name="某人",
+    )
+    # 原始文本原样呈现（含首尾空白），显示名取 candidate 三级回落产物
+    assert build_trigger_visible_text(candidate) == "[复读触发] 某人： 草 "
+
+
+def test_build_trigger_visible_text_uses_sender_qq_when_no_display_name():
+    candidate = RepeatCandidate(
+        group_id=GROUP_ID, sender_qq="20002", text="草", sender_display_name="20002"
+    )
+    assert build_trigger_visible_text(candidate) == "[复读触发] 20002：草"
+
+
+def test_build_behavior_visible_text_labels_repeat_outlet():
+    decision = RepeatDecision(kind=REPEAT, text=" 草 ", reason="复读出口命中")
+    assert build_behavior_visible_text(decision) == "[复读]  草 "
+
+
+def test_build_behavior_visible_text_labels_interrupt_outlet():
+    decision = RepeatDecision(kind=INTERRUPT, text="够了！", reason="打断出口命中")
+    assert build_behavior_visible_text(decision) == "[打断] 够了！"
+
+
+def test_behavior_kind_label_maps_outlets():
+    assert behavior_kind_label(REPEAT) == "复读"
+    assert behavior_kind_label(INTERRUPT) == "打断"

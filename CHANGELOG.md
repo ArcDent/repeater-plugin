@@ -2,6 +2,24 @@
 
 本项目变更记录，格式遵循 Keep a Changelog，语义化版本见 `_manifest.json`。
 
+## [0.4.0] - 2026-09-05
+
+### BREAKING
+
+- **复读/打断出口 planner 拦截**：检测 handler `repeat_detector` 从 observe 改 blocking 模式——复读/打断出口命中即对触发消息返回 `abort`（不写库、不进主程序上下文、不被 planner 决策），根除「复读与 LLM 回复双重发言」；沉默出口 / 非候选 / `repeat.enabled=false` 照常放行。触发消息经 abort 后不进主程序消息库（重启后上下文恢复缺该条，由注入补偿当前会话可见性）。决策见 ADR 0006（取代 ADR 0005 的模式与发送决策，检测层设计仍有效）。
+- **复读/打断发送改协议端直发** `send_group_msg`（绕过主程序发送链与其他插件 blocking hook 干扰，直发只需群号、与 stream_id 解耦），不再走 `ctx.send.text`；manifest 移除 `send.text` 能力声明。发送失败记 warning 不重试，冷却与链终结不受影响。
+
+### Added
+
+- **触发消息注入**（`source_kind="repeat_trigger"`，文案 `[复读触发] {发送者}：{原文}`）：planner 拦截后无条件把触发消息原文写入麦麦聊天历史（`maisaka.context.append`），补偿拦截造成的上下文缺失；与直发成败解耦，注入失败不回滚拦截。
+- **行为文本注入**（`source_kind="repeat"/"interrupt"`，文案 `[复读]`/`[打断] {文本}`）：直发成功后把复读/打断文本写入麦麦聊天历史，麦麦知道自己发出了什么；直发失败不注入（上下文与事实一致）。
+- 拦截、直发与注入整体跟随 `repeat.enabled`（关闭时不拦截不注入不发送），与表情回应域的 `context.enabled` 解耦，两域开关互不影响。
+- 复读域纯逻辑扩展：`RepeatCandidate` 携带 `message_id` 与发送者显示名（群名片 → 昵称 → QQ 号三级回落）；注入文案构造 `build_trigger_visible_text` / `build_behavior_visible_text`；协议失败详情提取 `protocol_failure_detail`（顺带修复非 dict 响应的可达 `AttributeError`）。
+
+### 部署注意
+
+- 协议端 webhook 勿开 self-message 上报（SnowLuma `reportSelfMessage`，默认关闭即正确）：开启后直发消息会以普通 user 消息身份回流主程序入站链，污染 planner 上下文（详见 README 与 ADR 0006）。
+
 ## [0.3.0] - 2026-09-05
 
 ### BREAKING

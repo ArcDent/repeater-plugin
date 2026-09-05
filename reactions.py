@@ -382,6 +382,16 @@ def is_missing_action(response: Any) -> bool:
     return isinstance(response, dict) and response.get("retcode") == 1404
 
 
+def protocol_failure_detail(response: Any) -> str:
+    """从失败的动作响应里取人可读的失败原因：wording → message → retcode
+    逐级回落（对齐 SnowLuma 响应信封字段）。调用方只在
+    protocol_call_failed(response) 为真后取详情；非 dict 响应防御式
+    str() 兜底，不抛异常。"""
+    if not isinstance(response, dict):
+        return str(response)
+    return str(response.get("wording") or response.get("message") or response.get("retcode"))
+
+
 class ReactionState:
     """表情槽与群冷却，纯内存 + 双重裁剪（条数上界 & TTL）。见 docs/adr/0002。"""
 

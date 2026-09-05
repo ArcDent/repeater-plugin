@@ -7,10 +7,12 @@ plugin.py；术语见 CONTEXT.md，消息形态与防御式规则见 ADR 0005 �
 design（D1–D5）。
 
 序列化消息形态取自主程序 hook 侧（REFERENCE/MaiBot/src/plugin_runtime/
-host/message_utils.py）：message_info.group_info.group_id（私聊为 None）、
-message_info.user_info.user_id、raw_message 为段列表，其中文本段是
-{"type": "text", "data": <str>}。形态不认识时返回 None 而非抛异常——hook
-每条群消息都过，解析失败必须便宜且安静（调用方打 debug，design D4）。
+host/message_utils.py）：顶层 message_id、message_info.group_info.group_id
+（私聊为 None）、message_info.user_info 的 user_id / user_nickname /
+user_cardname（发送者显示名三级回落的来源）、raw_message 为段列表，其中
+文本段是 {"type": "text", "data": <str>}。形态不认识时返回 None 而非抛
+异常——hook 每条群消息都过，解析失败必须便宜且安静（调用方打 debug，
+design D4）。
 """
 
 from __future__ import annotations
@@ -40,12 +42,18 @@ class RepeatCandidate:
     """一条可能进入**复读链**的群消息。
 
     text 是原始文本（发送时的样子）：首尾空白与大小写原样保留——归一
-    只用于链键控，**复读**发回去的永远是原始文本。
+    只用于链键控，**复读**发回去的永远是原始文本。message_id 与
+    sender_display_name 是**触发消息**上下文打包（change design D3）：
+    拦截命中后的触发消息注入要附 message_id、visible_text 要呈现发送者，
+    显示名按 群名片 → 昵称 → QQ 号 三级回落（对齐主程序 planner 侧惯例），
+    永不为空（QQ 号兜底）。
     """
 
     group_id: str
     sender_qq: str
     text: str
+    message_id: str = ""
+    sender_display_name: str = ""
 
 
 def normalize_repeat_text(text: Any) -> str:
@@ -89,6 +97,11 @@ def extract_repeat_candidate(
     （@/reply/image/face/表情包/...）的消息一律返回 None。防御式设计：
     形态异常或漂移时返回 None 而非抛异常（design D4）——hook 每条群消息都
     过，解析失败必须便宜，由调用方打 debug。
+
+    通过判定的候选同时打包**触发消息**上下文（message_id 与
+    sender_display_name，change design D3）：链达标的这条消息就是触发
+    消息，拦截后的注入与直发编舞直接取候选字段，调用方无需二次解析
+    消息 dict。
     """
     if not isinstance(message, dict):
         return None
@@ -112,6 +125,14 @@ def extract_repeat_candidate(
     if self_qq and sender_qq == str(self_qq).strip():
         return None
 
+    # 触发消息上下文打包（change design D3）：message_id 顶层恒在（形态
+    # 漂移时容忍缺失，回落空串）；显示名按 群名片 → 昵称 → QQ 号 三级
+    # 回落，缺谁跳谁，QQ 号兜底。
+    message_id = str(message.get("message_id") or "").strip()
+    cardname = str(user_info.get("user_cardname") or "").strip()
+    nickname = str(user_info.get("user_nickname") or "").strip()
+    sender_display_name = cardname or nickname or sender_qq
+
     segments = _message_segments(message.get("raw_message"))
     if segments is None:
         return None
@@ -132,7 +153,13 @@ def extract_repeat_candidate(
         return None
     if max_text_length and len(text) > max_text_length:
         return None
-    return RepeatCandidate(group_id=group_id, sender_qq=sender_qq, text=text)
+    return RepeatCandidate(
+        group_id=group_id,
+        sender_qq=sender_qq,
+        text=text,
+        message_id=message_id,
+        sender_display_name=sender_display_name,
+    )
 
 
 # RepeatState.record 的四种结果状态。
@@ -306,6 +333,25 @@ class RepeatDecision:
     text: str
     reason: str
     used_default_pool: bool = False
+
+
+def behavior_kind_label(kind: str) -> str:
+    """决策出口 → 中文标签的**唯一映射来源**：日志与注入文案共用，
+    plugin.py 不得自带副本（AGENTS.md「不往 plugin.py 里塞可测逻辑」）。"""
+    return "复读" if kind == REPEAT else "打断"
+
+
+def build_trigger_visible_text(candidate: RepeatCandidate) -> str:
+    """**触发消息**注入的可见文案（change design D3）：呈现发送者显示名与
+    原始文本。显示名已由 extract_repeat_candidate 按 群名片 → 昵称 → QQ 号
+    三级回落打包进候选，此处只取用。"""
+    return f"[复读触发] {candidate.sender_display_name}：{candidate.text}"
+
+
+def build_behavior_visible_text(decision: RepeatDecision) -> str:
+    """**行为文本**注入的可见文案（change design D3）：标签区分复读/打断，
+    文案风格对齐 reactions.build_reaction_visible_text。"""
+    return f"[{behavior_kind_label(decision.kind)}] {decision.text}"
 
 
 def _interrupt_pool(interrupt_texts: Sequence[Any] | None) -> tuple[list[str], bool]:

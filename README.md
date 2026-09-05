@@ -15,9 +15,9 @@ MaiBot 插件，聚合两个群聊行为：
 
 达标后掷一次骰，三出口**严格互斥**：
 
-- `roll < probability`（默认 0.6）→ **复读**：把链内最后一条的原始**复读文本**作为一条新消息发出（走 `ctx.send.text`，进麦麦上下文，麦麦后续对话知道自己复读过什么）
-- `probability ≤ roll < probability + interrupt_probability`（默认再 0.15）→ **打断**：只发**打断文本**池里随机一条短文本（默认「打断！/够了！/停！/打住！/别念了！」），绝不附带**复读文本**
-- 其余 → 沉默：什么都不发
+- `roll < probability`（默认 0.6）→ **复读**：拦截触发消息（planner 看不到它，杜绝麦麦对同一条消息双发），把链内最后一条的原始**复读文本**经协议端直发（`send_group_msg`）发出，并把触发消息与复读文本注入上下文（麦麦知道群里谁触发的、自己复读了什么）
+- `probability ≤ roll < probability + interrupt_probability`（默认再 0.15）→ **打断**：同样拦截触发消息，只发**打断文本**池里随机一条短文本（默认「打断！/够了！/停！/打住！/别念了！」），绝不附带**复读文本**
+- 其余 → 沉默：触发消息照常放行进主链，麦麦可自行决定如何回应
 
 防护与节奏：
 
@@ -51,7 +51,7 @@ disabled_emojis = ["👍"]   # 把 👍 从反义映射里摘掉，让它回落�
 
 ## 上下文注入（实验性，默认关闭）
 
-`context.enabled` 默认 `false`，整块功能试验性地开、试验性地关。开启后：
+`context.enabled` 默认 `false`，只管**表情回应域**的注入，整块功能试验性地开、试验性地关。复读域的拦截与注入跟随 `repeat.enabled`，不受这个开关约束（见 [ADR 0006](docs/adr/0006-repeat-direct-send-with-injection-and-intercept.md)）。开启后：
 
 - **注入**：表情回应（含麦麦自己贴的）去重、聚合后作为**独立上下文消息**写入聊天历史（`source_kind="reaction"`，`message_id` 指向被回应消息），麦麦回复时会感知到群里发生过表情回应
 - **拦截**：插件挂 `chat.receive.before_process` Hook（blocking 模式），把主程序消息链上的表情回应通知消息 abort 掉，避免适配器转发 notice 时历史里出现两份记录（见 [ADR 0003](docs/adr/0003-reaction-context-injection-with-defensive-intercept.md)）
@@ -81,14 +81,18 @@ self_display_name = ""
 
 1. 目录整个放进 MaiBot 的 `plugins/`（目录名用插件 id `arcdent.repeater-plugin`，从旧版本迁移见下方迁移段落），无需打包
 2. 装依赖：`pip install aiohttp`
-3. 复读功能**开箱即用**：它走主程序 hook 观测 + SDK `ctx.send.text` 发送，不依赖协议端配置
+3. 复读功能需要配 `[protocol]`：检测与拦截走主程序 hook（blocking 模式），发送走协议端直调（`send_group_msg`），不依赖 webhook 上报目标
 4. 表情回应跟风需要两步：
    - 填 `config.toml` 的 `[protocol]`：协议端 OneBot HTTP 地址与 token
    - **给协议端新增一个 HTTP 上报目标**，URL 指向 `http://<插件所在容器>:18081/maibot/emoji_reaction`
 
-第 4 步对表情回应跟风是必需的。麦麦插件 SDK 的事件类型里没有 notice 通道，表情回应事件只能由协议端直接 POST 给插件，理由见 [ADR 0001](docs/adr/0001-webhook-instead-of-sdk-event.md)。如果同机的好友申请插件已经配过一个上报目标，这里要**再加一个**，两者端口不同（18080 / 18081）。不配 `[protocol]` 与上报目标时，复读功能不受影响，表情回应跟风不动作。
+第 4 步对表情回应跟风是必需的。麦麦插件 SDK 的事件类型里没有 notice 通道，表情回应事件只能由协议端直接 POST 给插件，理由见 [ADR 0001](docs/adr/0001-webhook-instead-of-sdk-event.md)。如果同机的好友申请插件已经配过一个上报目标，这里要**再加一个**，两者端口不同（18080 / 18081）。`[protocol]` 同时服务于表情回应跟风与复读直发；上报目标只影响表情回应。不配 `[protocol]` 时，表情回应跟风与复读直发都不动作（复读出口命中后拦截与注入照常，直发失败记 warning）。
 
 配了 `webhook.secret` 时，协议端上报需带 `X-Signature: sha1=<hmac>` 头，与协议端的 secret 配置一致即可。注意 SnowLuma 的 HTTP 上报带的是 `Authorization: Bearer` 头而非 `X-Signature`，所以配 SnowLuma 时 `webhook.secret` 应留空，靠 Docker 网络隔离。
+
+## 部署注意：勿开 self-message 上报
+
+协议端 webhook **不要开启 self-message 上报**（SnowLuma 的 `reportSelfMessage` 开关，默认关闭）。本插件的复读/打断出口经协议端直调 `send_group_msg` 发送，直发的消息不走主程序发送链，麦麦知道自己发过什么靠的是插件注入；协议端默认也不把麦麦自己发的群消息上报回主程序。一旦打开 `reportSelfMessage`，直发出去的复读/打断消息会以**普通 user 消息的身份**回流主程序入站链（主程序入站链对 bot 自发消息无过滤），planner 上下文里会出现「麦麦以 user 身份看到自己复读过」的形态污染——同一条复读既在注入记录里是麦麦发的、又在入站记录里是某个 user 发的。保持默认关闭即可，见 [ADR 0006](docs/adr/0006-repeat-direct-send-with-injection-and-intercept.md)。
 
 ## 配置：`[repeat]` 节
 
@@ -149,7 +153,7 @@ access_token = "<snowluma OneBot HTTP accessToken>"
 self_qq = ""   # 留空启动时自动获取
 
 [context]
-enabled = false   # 实验性功能，按需开启
+enabled = false   # 实验性功能，只管表情回应域注入（复读域注入跟随 repeat.enabled），按需开启
 EOF'
 
 # 3. 重启主容器让 MaiBot 重新发现插件
@@ -167,14 +171,14 @@ ssh arclinux 'rm -rf /home/arc/maimai/MaiBot/data/MaiMBot/plugins/arcdent.sendin
 
 部署后验证链路：
 
-- **复读**：去群里三个人接同一句话（如「草」），日志应出现 `复读链达标` → `已发出复读`（或 `已发出打断文本`）
+- **复读**：去群里三个人接同一句话（如「草」），日志应出现 `复读链达标` → `已直发复读文本`（或 `已直发打断文本`）
 - **表情回应**：给任意消息贴个表情回应，日志应出现 `表情回应上报已监听` → `表情回应触发`；若出现 `表情回应上报形态不认识，已忽略` 则协议端形态变了，把日志里的原始 JSON 贴回来
 
 ## 首次部署验证
 
 上报体形态与动作参数已对照 SnowLuma 源码核实（`packages/onebot/src/event-converter/to-notice.ts`、`actions/extended.ts`、`actions/message.ts`），字段布局与本插件一致；复读检测的消息形态取自主程序 hook 侧（`src/plugin_runtime/host/message_utils.py`）。装好后分两条链路验证：
 
-- 出现 `复读链达标` / `已发出复读` → 复读链路通了（三人接龙一次即可验证）
+- 出现 `复读链达标` / `已直发复读文本` → 复读链路通了（三人接龙一次即可验证）
 - 出现 `表情回应上报已监听` → webhook 端点起来了
 - 出现 `表情回应触发` / `已跟风贴表情` → 表情回应链路通了
 - 出现 `表情回应上报形态不认识，已忽略: {...}` → 协议端版本或实现变了，把日志里那段原始 JSON 贴出来，按实测补 `reactions.py` 的解析分支

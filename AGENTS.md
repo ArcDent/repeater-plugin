@@ -4,25 +4,28 @@ MaiBot 插件：聚合两个群聊行为——群内复读链达标后，麦麦�
 
 ## 结构
 
-- `plugin.py` — 插件主类：上报监听、门禁与掷骰编排、协议端直调、复读观测与发送、启动自检
+- `plugin.py` — 插件主类：上报监听、门禁与掷骰编排、协议端直发、复读拦截与直发、上下文注入、启动自检
 - `reactions.py` — 表情回应域纯逻辑层（上报解析、表情 ID 归一、反义映射、跟风/反义决策、表情槽与冷却），不依赖 SDK，可单测
-- `repeats.py` — 复读域纯逻辑层（复读文本宽松归一、消息资格判定、复读链状态机、三出口决策），不依赖 SDK，可单测
+- `repeats.py` — 复读域纯逻辑层（复读文本宽松归一、消息资格判定、复读链状态机、三出口决策、注入文案构造），不依赖 SDK，可单测
 - `config.py` — 配置模型（plugin/webhook/protocol/bandwagon/opposite/repeat/behavior/context/scope）
 - `config.toml` — 默认配置，值必须与 `config.py` 的 default 一致
 - `tests/` — pytest（fake maibot_sdk 注入，`uv run --with pytest --with aiohttp pytest tests/ -q`）
 - `docs/emoji-id-reference.md` — 表情 ID 两套编号体系（QQ 小黄脸编号 / Unicode 码点）查表与边界
-- `docs/adr/` — 0001 走 webhook 不走 SDK 事件链；0002 分支严格互斥 + 内存态；0003 防御式拦截通知 + 插件自建注入；0004 定时 flush 兜底 + 失败回滚；0005 复读检测走 before_process observe 通路 + `ctx.send.text` 发送
+- `docs/adr/` — 0001 走 webhook 不走 SDK 事件链；0002 分支严格互斥 + 内存态；0003 防御式拦截通知 + 插件自建注入；0004 定时 flush 兜底 + 失败回滚；0005 复读检测走 before_process hook（检测层仍有效，observe 模式与 `ctx.send.text` 发送决策被 0006 取代）；0006 复读/打断出口协议端直发 + planner 拦截 + 上下文注入
 - `CONTEXT.md` — 领域术语表
 
 ## 关键规则
 
 ### 复读域
 
-- 复读三出口**严格互斥**：一次掷骰只命中复读 / 打断 / 沉默之一，决策逻辑全在 `repeats.decide_repeat`；打断出口只发打断文本、绝不附带复读文本。改这个语义要先改 ADR 0005 与 change design D3/D5
-- **链终结**与表情槽同构，是自我循环的**必需**防护：先写终结标记再掷骰（`RepeatState.record` 同步原子段内完成），任何情况下不得先掷骰后写标记；`record` 必须保持纯同步方法（无 await 点），否则并发 observe 任务可在同一链上双触发
+- 复读三出口**严格互斥**：一次掷骰只命中复读 / 打断 / 沉默之一，决策逻辑全在 `repeats.decide_repeat`；打断出口只发打断文本、绝不附带复读文本。改这个语义要先改 ADR 0005/0006 与 change design D3/D5
+- **链终结**与表情槽同构，是自我循环的**必需**防护：先写终结标记再掷骰（`RepeatState.record` 同步原子段内完成），任何情况下不得先掷骰后写标记；`record` 必须保持纯同步方法（无 await 点），否则并发 handler 调用可在同一链上双触发（blocking 串行下该担忧天然消失，同步规则不放松，ADR 0006）
 - 复读群冷却与表情回应的群冷却**分开计时、互不牵扯**（各自 state 实例）；沉默出口消耗资格（链终结同样成立）但不进冷却，发送成败不影响已进入的冷却
-- 复读检测走 `chat.receive.before_process` hook 的 **observe 模式**（零阻塞主链，决策依据见 ADR 0005）；同 hook 上另有 blocking 模式的防御式拦截 handler（ADR 0003），同名 hook 两个 handler 组件并存是有意设计
-- 复读/打断发送走 SDK 标准能力 `ctx.send.text`（消息进麦麦上下文，麦麦知道自己在复读），stream_id 复用 `_get_stream_id` 群号缓存；发送异常或失败记 warning 不重试不熔断
+- 复读检测走 `chat.receive.before_process` hook 的 **blocking 模式**（`repeat_detector`，`order="late"`，仍在 `guard_reaction_notify` 之后，被 guard 拦的通知消息到不了本 handler；同 hook 两个 blocking handler 组件并存是有意设计，防御式拦截 handler 见 ADR 0003）
+- **planner 拦截**（ADR 0006）：复读/打断出口命中即对触发消息返回 `abort`（不写库、不进上下文、不进 planner，杜绝双重发言）；沉默出口 / 非候选 / `repeat.enabled=false` → `continue` 放行；handler 同步段纯内存判定无 IO，未捕获异常记 warning 返回 continue（宁可漏一条拦截，不可干扰主程序消息处理），`CancelledError` 照常上抛
+- 复读/打断发送走**协议端直发** `send_group_msg`（`{group_id, message: [text 段]}`），不走 `ctx.send.text`——直发只需群号，与 stream_id 彻底解耦（stream 仅注入需要）；发送异常或失败（不可达 / `protocol_call_failed`）记 warning 不重试不熔断，任务止步、不做行为文本注入
+- 出口命中后的**后台编舞**（ADR 0006，design D2）：触发消息注入（**无条件**，失败记 warning 继续）→ 延迟（沿用 `behavior.delay_min/max`，不新增配置项）→ 协议端直发（失败止步）→ 行为文本注入（仅直发成功）；两路注入均走 `maisaka.context.append`，`source_kind` 为 `repeat_trigger` / `repeat` / `interrupt`，文案构造在 `repeats.py`（`build_trigger_visible_text` / `build_behavior_visible_text`，发送者显示名按群名片 → 昵称 → QQ 号三级回落）；不复用表情回应域的 `InjectionState`（复读注入是即时一次性记录，无聚合无重试）；注入失败不重试、不回滚拦截
+- 复读域的拦截、直发与注入整体跟随 `repeat.enabled`（关闭时不拦截不注入不发送），与 `context.enabled` **解耦**——后者只管表情回应域注入，两域并列不混装（design D4）
 - hook 消息解析失败打 **debug 不打 warning**：hook 每条群消息都过，warning 会刷屏；这与 webhook 上报形态不认识必须打 warning（ADR 0001 的部署验证依赖）**口径相反、理由各自成立**，改哪边都要先想清楚。消息段形态由 QQ 客户端决定、高度稳定；上报形态由协议端决定、随版本漂移
 - 命令消息按文本 `/` 前缀排除：主程序命令标记在 before_process 时点尚未写入，只能按前缀判；自定义命令前缀的部署属已知盲区（README 有提示）
 - 只有纯文本消息产出**复读文本**（trim 后非空）；含 @、引用、图片、表情包段的消息一律不参与复读链累积；比对前宽松归一（trim / 空白折叠 / 大小写不敏感），复读发送用原始文本、不用归一产物；归一规则与链累积相互独立
@@ -41,7 +44,7 @@ MaiBot 插件：聚合两个群聊行为——群内复读链达标后，麦麦�
 ### 公共
 
 - 协议端行为有疑问先读源码：SnowLuma 已 clone 在 `/Users/arcdent/github/REFERENCE/snowluma`，表情回应相关在 `packages/onebot/src/event-converter/to-notice.ts`（上报）、`packages/onebot/src/actions/extended.ts`（`set_msg_emoji_like`）、`packages/onebot/src/actions/message.ts`（`get_msg`）；主程序 hook 消息形态看 `REFERENCE/MaiBot/src/plugin_runtime/host/message_utils.py`
-- 上下文注入默认关闭（`context.enabled`），整块试、整块关；注入路径复用 `scope` 白黑名单，但麦麦自己贴的回应不受 `ignore_reactors` 影响
+- 表情回应域的上下文注入默认关闭（`context.enabled`），整块试、整块关（复读域注入跟随 `repeat.enabled`，不受此开关约束）；注入路径复用 `scope` 白黑名单，但麦麦自己贴的回应不受 `ignore_reactors` 影响
 - 注入限流里**去重 ≠ 聚合**：去重（`dedup_ttl_seconds`）管「同一回应者+被回应消息+表情只注入一次」，聚合（`merge_window_seconds`）管「同一被回应消息同一表情的多条回应汇入一条注入消息」，`max_reactions_per_message` 兜住单条消息的注入条数
 - 注入文本显示名来源链：`context.self_display_name` → 主程序 `bot.nickname` → 空（不写名字）
 - 新增纯逻辑按领域写进对应纯逻辑层并加单测（表情回应域进 `reactions.py`，复读域进 `repeats.py`，两域并列、不混装）；不往 `plugin.py` 里塞可测逻辑
