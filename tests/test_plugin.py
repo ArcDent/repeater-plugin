@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import time
@@ -595,10 +596,43 @@ def test_empty_interrupt_pool_falls_back_with_warning():
 # ---- Manifest（repeat-and-rebrand 改名与新 capability 声明）----
 
 MANIFEST_JSON = Path(__file__).resolve().parent.parent / "_manifest.json"
+PLUGIN_PY = Path(__file__).resolve().parent.parent / "plugin.py"
+
+# Hook subscriptions are consumed via decorators, not self.ctx.* calls.
+HOOK_CAPABILITIES = {"chat.receive.before_process"}
+
+# ctx.logger rides the logging channel, not the capability authorization layer.
+_NON_CAPABILITY_PROXIES = {"logger"}
 
 
-def test_manifest_identity_and_capabilities():
-    """id/name/description 覆盖双行为；既有 capability 全保留并追加观测声明。"""
+def _ctx_call_capabilities(source: str) -> set[str]:
+    """Collect `self.ctx.<proxy>...<method>()` call sites as capability names."""
+    tree = ast.parse(source)
+    used: set[str] = set()
+
+    def dotted(node: ast.AST) -> list[str] | None:
+        if isinstance(node, ast.Name):
+            return [node.id]
+        if isinstance(node, ast.Attribute):
+            base = dotted(node.value)
+            if base is not None:
+                return base + [node.attr]
+        return None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        parts = dotted(node.func)
+        if parts is None or len(parts) < 4 or parts[0] != "self" or parts[1] != "ctx":
+            continue
+        if parts[2] in _NON_CAPABILITY_PROXIES:
+            continue
+        used.add(".".join(parts[2:]))
+    return used
+
+
+def test_manifest_identity():
+    """id/name/description 覆盖双行为；仓库改名是用户手动步骤，URL 本组不动。"""
     with MANIFEST_JSON.open("r", encoding="utf-8") as fp:
         manifest = json.load(fp)  # JSON 语法合法由 load 本身保证
     assert manifest["id"] == "arcdent.repeater-plugin"
@@ -606,15 +640,27 @@ def test_manifest_identity_and_capabilities():
     description = manifest["description"]
     assert "复读" in description and "打断" in description  # 复读 + 打断
     assert "表情" in description  # 表情回应跟风/反义
-    # 既有三项（上下文注入路径消费的能力）全保留，追加 before_process 观测声明
-    assert set(manifest["capabilities"]) == {
-        "maisaka.context.append",
-        "chat.get_stream_by_group_id",
-        "config.get",
-        "chat.receive.before_process",
-    }
-    # 仓库改名是用户手动步骤，URL 本组不动
     assert manifest["urls"]["repository"] == "https://github.com/arcdent/sending-emojis-plugin"
+
+
+def test_manifest_declares_every_consumed_capability():
+    """manifest capabilities 必须与代码实际消费的集合一致。
+
+    2026-09-05 线上事故：复读发送走 ctx.send.text 但 manifest 未声明，
+    Host 授权层逐次以 E_CAPABILITY_DENIED 拒绝；当时本文件用硬编码等值
+    断言，清单跟着代码一起漏。改为从 plugin.py 源码派生消费集合再比对，
+    漏声明与死声明双向都拦。
+    """
+    with MANIFEST_JSON.open("r", encoding="utf-8") as fp:
+        manifest = json.load(fp)
+    with PLUGIN_PY.open("r", encoding="utf-8") as fp:
+        source = fp.read()
+    consumed = _ctx_call_capabilities(source) | HOOK_CAPABILITIES
+    declared = set(manifest["capabilities"])
+    assert declared == consumed, (
+        f"manifest capabilities 与代码消费漂移: 缺 {sorted(consumed - declared)},"
+        f" 多余 {sorted(declared - consumed)}"
+    )
 
 
 # ---- 复读与表情回应的边界（两域独立）----

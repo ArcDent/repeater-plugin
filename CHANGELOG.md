@@ -14,6 +14,10 @@
 - **链终结防护**：达标掷骰后（含沉默出口）即终结，按（群，**复读文本**）记 TTL 标记，防止一轮群友复读里麦麦多次出声；TTL 过期后新一轮可再触发（与表情槽同构）。
 - **复读独立群冷却与门禁**：与表情回应的群冷却分开计时；新增 `[repeat]` 配置节（enabled/window_seconds/threshold/distinct_senders/probability/interrupt_probability/interrupt_texts/chain_ttl_seconds/cooldown_seconds/max_text_length/max_chains）与 `scope.ignore_senders` 忽略发送者名单。复读/打断发送前按 `behavior.delay_min/max` 随机延迟。
 
+### Fixed
+
+- **manifest 能力声明补上 `send.text`**：改版部署当日 `_manifest.json` 的 capabilities 漏声明复读/打断发送消费的 `ctx.send.text`，Host 授权层逐次以 `E_CAPABILITY_DENIED` 拒绝（线上三次复读/打断全数发送失败）。manifest 能力断言同步从硬编码清单改为从 `plugin.py` 源码派生消费集合，漏声明与死声明双向拦截，防同类漂移。
+
 ## [0.2.0] - 2026-08-23
 
 ### Added
