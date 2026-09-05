@@ -1,6 +1,6 @@
 # AGENTS.md
 
-MaiBot 插件：聚合两个群聊行为——群内复读链达标后，麦麦按概率复读（把复读文本原样发出）或按概率发打断文本唱反调；有人给某条消息贴了表情回应后，麦麦按概率跟风贴同款，或按概率贴反义回应。
+MaiBot 插件：聚合两个群聊行为——群内复读链达标后，麦麦掷一次骰按**出口权重**选中复读（把复读文本原样发出）、打断（发打断文本唱反调）或沉默之一；有人给某条消息贴了表情回应后，麦麦按概率跟风贴同款，或按概率贴反义回应。
 
 ## 结构
 
@@ -11,20 +11,20 @@ MaiBot 插件：聚合两个群聊行为——群内复读链达标后，麦麦�
 - `config.toml` — 默认配置，值必须与 `config.py` 的 default 一致
 - `tests/` — pytest（fake maibot_sdk 注入，`uv run --with pytest --with aiohttp pytest tests/ -q`）
 - `docs/emoji-id-reference.md` — 表情 ID 两套编号体系（QQ 小黄脸编号 / Unicode 码点）查表与边界
-- `docs/adr/` — 0001 走 webhook 不走 SDK 事件链；0002 分支严格互斥 + 内存态；0003 防御式拦截通知 + 插件自建注入；0004 定时 flush 兜底 + 失败回滚；0005 复读检测走 before_process hook（检测层仍有效，observe 模式与 `ctx.send.text` 发送决策被 0006 取代）；0006 复读/打断出口协议端直发 + planner 拦截 + 上下文注入
+- `docs/adr/` — 0001 走 webhook 不走 SDK 事件链；0002 分支严格互斥 + 内存态；0003 防御式拦截通知 + 插件自建注入；0004 定时 flush 兜底 + 失败回滚；0005 复读检测走 before_process hook（检测层仍有效，observe 模式与 `ctx.send.text` 发送决策被 0006 取代）；0006 复读/打断出口协议端直发 + planner 拦截 + 上下文注入（决策 3 的延迟沿用与串行编舞被 0008 取代）；0007 复读三出口改归一化出口权重（取代双概率配置口径）；0008 复读域独立延迟 + 触发消息注入与延迟并发
 - `CONTEXT.md` — 领域术语表
 
 ## 关键规则
 
 ### 复读域
 
-- 复读三出口**严格互斥**：一次掷骰只命中复读 / 打断 / 沉默之一，决策逻辑全在 `repeats.decide_repeat`；打断出口只发打断文本、绝不附带复读文本。改这个语义要先改 ADR 0005/0006 与 change design D3/D5
+- 复读三出口**严格互斥**（ADR 0007）：链达标后掷一次骰，按**出口权重**（`weight_repeat`/`weight_interrupt`/`weight_silence`）归一化选中复读 / 打断 / 沉默恰好一个，决策逻辑全在 `repeats.decide_repeat`；权重只有比例意义、同比例放大等价，三权重全为 0 时视为沉默、不掷骰；打断出口只发打断文本、绝不附带复读文本。改这个语义要先改 ADR 0005/0006/0007 与 change repeat-exit-weights-and-faster-send design D1
 - **链终结**与表情槽同构，是自我循环的**必需**防护：先写终结标记再掷骰（`RepeatState.record` 同步原子段内完成），任何情况下不得先掷骰后写标记；`record` 必须保持纯同步方法（无 await 点），否则并发 handler 调用可在同一链上双触发（blocking 串行下该担忧天然消失，同步规则不放松，ADR 0006）
 - 复读群冷却与表情回应的群冷却**分开计时、互不牵扯**（各自 state 实例）；沉默出口消耗资格（链终结同样成立）但不进冷却，发送成败不影响已进入的冷却
 - 复读检测走 `chat.receive.before_process` hook 的 **blocking 模式**（`repeat_detector`，`order="late"`，仍在 `guard_reaction_notify` 之后，被 guard 拦的通知消息到不了本 handler；同 hook 两个 blocking handler 组件并存是有意设计，防御式拦截 handler 见 ADR 0003）
 - **planner 拦截**（ADR 0006）：复读/打断出口命中即对触发消息返回 `abort`（不写库、不进上下文、不进 planner，杜绝双重发言）；沉默出口 / 非候选 / `repeat.enabled=false` → `continue` 放行；handler 同步段纯内存判定无 IO，未捕获异常记 warning 返回 continue（宁可漏一条拦截，不可干扰主程序消息处理），`CancelledError` 照常上抛
 - 复读/打断发送走**协议端直发** `send_group_msg`（`{group_id, message: [text 段]}`），不走 `ctx.send.text`——直发只需群号，与 stream_id 彻底解耦（stream 仅注入需要）；发送异常或失败（不可达 / `protocol_call_failed`）记 warning 不重试不熔断，任务止步、不做行为文本注入
-- 出口命中后的**后台编舞**（ADR 0006，design D2）：触发消息注入（**无条件**，失败记 warning 继续）→ 延迟（沿用 `behavior.delay_min/max`，不新增配置项）→ 协议端直发（失败止步）→ 行为文本注入（仅直发成功）；两路注入均走 `maisaka.context.append`，`source_kind` 为 `repeat_trigger` / `repeat` / `interrupt`，文案构造在 `repeats.py`（`build_trigger_visible_text` / `build_behavior_visible_text`，发送者显示名按群名片 → 昵称 → QQ 号三级回落）；不复用表情回应域的 `InjectionState`（复读注入是即时一次性记录，无聚合无重试）；注入失败不重试、不回滚拦截
+- 出口命中后的**后台编舞**（ADR 0006/0008，design D4）：触发消息注入（**无条件**，失败记 warning 继续）与延迟（复读段 `repeat.delay_min/max_seconds`，默认 0.3/1.5，与表情回应域的 `behavior.delay_min/max` 互不牵扯）经 `asyncio.gather` **并发**（`return_exceptions=True`，异常项记 warning 继续，可见延迟 = max(注入 RTT, 延迟)）→ 协议端直发（失败止步）→ 行为文本注入（仅直发成功）；两路注入均走 `maisaka.context.append`，`source_kind` 为 `repeat_trigger` / `repeat` / `interrupt`，文案构造在 `repeats.py`（`build_trigger_visible_text` / `build_behavior_visible_text`，发送者显示名按群名片 → 昵称 → QQ 号三级回落）；不复用表情回应域的 `InjectionState`（复读注入是即时一次性记录，无聚合无重试）；注入失败不重试、不回滚拦截
 - 复读域的拦截、直发与注入整体跟随 `repeat.enabled`（关闭时不拦截不注入不发送），与 `context.enabled` **解耦**——后者只管表情回应域注入，两域并列不混装（design D4）
 - hook 消息解析失败打 **debug 不打 warning**：hook 每条群消息都过，warning 会刷屏；这与 webhook 上报形态不认识必须打 warning（ADR 0001 的部署验证依赖）**口径相反、理由各自成立**，改哪边都要先想清楚。消息段形态由 QQ 客户端决定、高度稳定；上报形态由协议端决定、随版本漂移
 - 命令消息按文本 `/` 前缀排除：主程序命令标记在 before_process 时点尚未写入，只能按前缀判；自定义命令前缀的部署属已知盲区（README 有提示）
@@ -56,7 +56,7 @@ uv run --with pytest --with aiohttp pytest tests/ -q       # 全部通过
 uv run --with pyright --with aiohttp pyright              # 生产代码零错误
 ```
 
-`pyrightconfig.json` 只检查四个生产文件（config/plugin/reactions/repeats），且关掉 `reportMissingImports`：真实 `maibot_sdk` 只存在于 MaiBot 容器内，本机永远解析不到；测试目录里的替身（`FakeRequest`、故意传非法概率值）也会产生大量与正确性无关的类型噪声。
+`pyrightconfig.json` 只检查四个生产文件（config/plugin/reactions/repeats），且关掉 `reportMissingImports`：真实 `maibot_sdk` 只存在于 MaiBot 容器内，本机永远解析不到；测试目录里的替身（`FakeRequest`、故意传非法概率或权重值）也会产生大量与正确性无关的类型噪声。
 
 `ruff check` 下有四类有意偏离，改代码时不要「顺手修掉」：
 
@@ -67,6 +67,6 @@ uv run --with pyright --with aiohttp pyright              # 生产代码零错�
 
 ## 测试注意
 
-- 插件行为依赖 `random.random()`。**「断言不触发」的用例必须把概率拉满**（`make_plugin` 已默认设为 1.0，复读侧同样：复读概率 1.0、打断概率 0），否则门禁失效时用例仍会按默认概率蒙对，回归检测形同虚设。
+- 插件行为依赖 `random.random()`。**「断言不触发」的用例必须把目标出口权重拉满、其余归零**（`make_plugin` 已默认如此：表情回应概率 1.0；复读侧复读权重拉满、打断与沉默权重归零、延迟区间归零），否则门禁失效时用例仍会按默认值蒙对，回归检测形同虚设。
 - 涉及表情槽或冷却的用例传时间戳要用 `time.time()`，不能传 `0.0`：`_evaluate` 内部取当前时间，传 0 会让记录直接被 TTL 判成过期。
-- 「断言不触发」的沉默用例反向操作：把复读概率与打断概率都归零，保证掷骰必落沉默。
+- 「断言不触发」的沉默用例反向操作：把沉默权重拉满、复读与打断权重归零（不能用三权重全 0——那走的是不掷骰分支，证明不了掷骰确实发生过），保证掷骰必落沉默。

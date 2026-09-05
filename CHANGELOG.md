@@ -2,6 +2,22 @@
 
 本项目变更记录，格式遵循 Keep a Changelog，语义化版本见 `_manifest.json`。
 
+## [0.5.0] - 2026-09-05
+
+### BREAKING
+
+- **复读出口概率字段删除，改归一化出口权重**：`repeat.probability` / `repeat.interrupt_probability` 移除，换成 `weight_repeat` / `weight_interrupt` / `weight_silence`（默认 85 / 15 / 0 ≈ 85% 复读、15% 打断、从不沉默）。链达标仍掷一次骰，三个权重按比例恰好选中一个出口，只有比例意义、同比例放大等价。**升级后请重调一次权重**：主程序检出 `config_version` 1.0.0 → 1.1.0 后自动重建 `config.toml`（补新键、删废弃键、保留其余用户值），手调过的旧概率值键名已变、不会迁移，三个权重取新默认值。决策见 ADR 0007。
+- **默认沉默权重 0 的行为含义**：链一达标必出声（复读或打断），触发消息也就必被 **planner 拦截**——复读文本不再有机会当普通消息交给 planner 回复。唯一的放行口是复读群冷却的压制期（冷却期内链达标不掷骰、不拦截，消息照常进主链）。要恢复「偶尔沉默」就给 `weight_silence` 设正值。
+
+### Changed
+
+- **复读延迟独立**：新增 `repeat.delay_min_seconds` / `delay_max_seconds`（默认 0.3~1.5 秒），复读/打断直发只读这一对，不再沿用表情回应的 `behavior.delay_min/max`（默认 1~6 秒不变）——复读接龙是秒级节奏，按表情回应的节奏等待会错过时机，两域延迟从此分开调（ADR 0008）。
+- **触发消息注入与延迟并发**：后台编舞里触发消息注入不再串在延迟之前，改为 `asyncio.gather(触发消息注入, 延迟, return_exceptions=True)`，可见延迟从「注入 RTT + 延迟」变成「两者取较大值」；行为文本注入仍在直发成功之后，麦麦聊天历史里「谁发了什么」始终早于「麦麦复读了/打断了什么」。ADR 0008 取代 ADR 0006 决策 3 的这两点，0006 其余内容（planner 拦截、协议端直发、两路注入语义）仍有效。
+
+### 部署注意
+
+- 回滚到 0.4.0 前，手工清掉 `config.toml` 里的 `weight_*` / `repeat.delay_*` 残留键并把 `config_version` 改回 `1.0.0`（旧版本对未知键的容忍度取决于 SDK `PluginConfigBase`，容器内未验证）。
+
 ## [0.4.0] - 2026-09-05
 
 ### BREAKING
