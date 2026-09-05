@@ -87,20 +87,35 @@ def test_context_section_accepts_overrides():
     assert cfg.context.self_display_name == "麦麦"
 
 
+def test_config_version_updated_to_1_1_0():
+    """config_version 是配置结构版本：出口权重 + 复读自有延迟引入时从 1.0.0 升到 1.1.0。"""
+    cfg = RepeaterConfig()
+    assert cfg.plugin.config_version == "1.1.0"
+
+
 def test_repeat_section_defaults():
-    """repeat 节默认值与 design D6 表逐项一致（独立字面量，不引自实现）。"""
+    """repeat 节默认值与 design D2 表逐项一致（独立字面量，不引自实现）。"""
     cfg = RepeaterConfig()
     assert cfg.repeat.enabled is True
     assert cfg.repeat.window_seconds == 120
     assert cfg.repeat.threshold == 3
     assert cfg.repeat.distinct_senders is True
-    assert cfg.repeat.probability == 0.6
-    assert cfg.repeat.interrupt_probability == 0.15
+    assert cfg.repeat.weight_repeat == 85
+    assert cfg.repeat.weight_interrupt == 15
+    assert cfg.repeat.weight_silence == 0
+    assert cfg.repeat.delay_min_seconds == 0.3
+    assert cfg.repeat.delay_max_seconds == 1.5
     assert cfg.repeat.interrupt_texts == ["打断！", "够了！", "停！", "打住！", "别念了！"]
     assert cfg.repeat.chain_ttl_seconds == 1800
     assert cfg.repeat.cooldown_seconds == 120
     assert cfg.repeat.max_text_length == 200
     assert cfg.repeat.max_chains == 2000
+
+
+def test_repeat_delay_window_is_ordered():
+    """复读发送延迟的区间语义与 [behavior] 延迟一样：最小不超过最大。"""
+    cfg = RepeaterConfig()
+    assert cfg.repeat.delay_min_seconds <= cfg.repeat.delay_max_seconds
 
 
 def test_repeat_interrupt_texts_independent_per_instance():
@@ -118,17 +133,21 @@ def test_scope_ignore_senders_defaults_empty():
 
 @pytest.mark.skipif(tomllib is None, reason="需要 Python 3.11+ 的 tomllib")
 def test_config_toml_repeat_defaults_match_design():
-    """[repeat] 节与 [scope].ignore_senders 的 toml 默认值与 design D6 表逐项一致（独立字面量）。"""
+    """[repeat] 节与 [plugin].config_version 的 toml 默认值与 design D2 表逐项一致（独立字面量）；scope.ignore_senders 的默认空列表一并在此钉死（与 config.py 默认同口径，防 toml 侧漂移）。"""
     with CONFIG_TOML.open("rb") as fp:
         raw = tomllib.load(fp)
     repeat = raw.get("repeat")
     assert isinstance(repeat, dict), "config.toml 缺少 [repeat] 节"
+    assert raw["plugin"]["config_version"] == "1.1.0"
     assert repeat["enabled"] is True
     assert repeat["window_seconds"] == 120
     assert repeat["threshold"] == 3
     assert repeat["distinct_senders"] is True
-    assert repeat["probability"] == 0.6
-    assert repeat["interrupt_probability"] == 0.15
+    assert repeat["weight_repeat"] == 85
+    assert repeat["weight_interrupt"] == 15
+    assert repeat["weight_silence"] == 0
+    assert repeat["delay_min_seconds"] == 0.3
+    assert repeat["delay_max_seconds"] == 1.5
     assert repeat["interrupt_texts"] == ["打断！", "够了！", "停！", "打住！", "别念了！"]
     assert repeat["chain_ttl_seconds"] == 1800
     assert repeat["cooldown_seconds"] == 120

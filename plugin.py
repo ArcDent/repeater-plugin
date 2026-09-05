@@ -264,7 +264,12 @@ class RepeaterPlugin(MaiBotPlugin):
             # 先占表情槽再发，避免同一条消息的并发上报重复贴。
             self._state.take_slot(event.message_id, now)
             self._state.mark_group(event.group_id, now)
-            await self._delay()
+            # 表情回应路径取 behavior 段延迟区间（change design D3：延迟按域
+            # 取值，与复读段互不牵扯）。
+            behavior = self.config.behavior
+            # 归一逻辑在 _delay 内部（docstring：high < low 按 low、high <= 0
+            # 不等待），调用点只传区间字段即可。
+            await self._delay(behavior.delay_min_seconds, behavior.delay_max_seconds)
             await self._send_reaction(event, decision)
         except asyncio.CancelledError:
             raise
@@ -574,8 +579,9 @@ class RepeaterPlugin(MaiBotPlugin):
 
         decision = decide_repeat(
             result.text,
-            probability=repeat.probability,
-            interrupt_probability=repeat.interrupt_probability,
+            weight_repeat=repeat.weight_repeat,
+            weight_interrupt=repeat.weight_interrupt,
+            weight_silence=repeat.weight_silence,
             interrupt_texts=repeat.interrupt_texts,
             roll=random.random,
         )
@@ -600,28 +606,43 @@ class RepeaterPlugin(MaiBotPlugin):
     async def _send_repeat_decision(
         self, candidate: RepeatCandidate, decision: RepeatDecision
     ) -> None:
-        """复读/打断出口的后台编舞（ADR 0006，change design D2）。
+        """复读/打断出口的后台编舞（ADR 0006/0008，change design D4）。
 
-        触发消息注入（失败记 warning 继续）→ 延迟 → send_group_msg 协议端
-        直发（失败止步）→ 行为文本注入（仅直发成功）。直发只需群号，与
-        stream_id 彻底解耦（stream 仅注入需要），不走主程序标准发送链——
-        ctx.send.text 路过的 blocking hook 可改写/取消消息且默认不进内存
-        上下文（ADR 0006）。冷却与链终结在出口命中时已写入，与本任务成败
-        解耦；注入失败不重试、不回滚、不复用表情回应域的 InjectionState。
+        触发消息注入与延迟并发（gather，ADR 0008）：注入 RTT 与延迟取较大值、
+        不串行叠加；之后 send_group_msg 协议端直发（失败止步）→ 行为文本注入
+        （仅直发成功）——「谁发了什么」始终早于「麦麦复读/打断了什么」。
+        直发只需群号，与 stream_id 彻底解耦（stream 仅注入需要），不走主程序
+        标准发送链——ctx.send.text 路过的 blocking hook 可改写/取消消息且默认
+        不进内存上下文（ADR 0006）。冷却与链终结在出口命中时已写入，与本任务
+        成败解耦；注入失败不重试、不回滚、不复用表情回应域的 InjectionState。
         """
         group_id = candidate.group_id
+        repeat = self.config.repeat
         try:
-            # 1. 触发消息注入：补偿 planner 拦截造成的上下文缺失，与直发
-            #    成败解耦（失败记 warning 继续，不阻断后续直发）。文案呈现
-            #    发送者显示名与原文（design D3），message_id 附触发消息自身。
-            await self._append_repeat_context(
-                group_id,
-                build_trigger_visible_text(candidate),
-                "repeat_trigger",
-                candidate.message_id,
+            # 1+2. 触发消息注入与延迟并发（ADR 0008）：补偿 planner 拦截造成
+            #    的上下文缺失，同时避免决策即发。注入协程自身已吞常规异常，
+            #    return_exceptions 兜住任何未预期异常——否则异常会落到外层
+            #    except、把直发一并丢掉（design D4，return_exceptions 必需）。
+            outcomes = await asyncio.gather(
+                self._append_repeat_context(
+                    group_id,
+                    build_trigger_visible_text(candidate),
+                    "repeat_trigger",
+                    candidate.message_id,
+                ),
+                self._delay(repeat.delay_min_seconds, repeat.delay_max_seconds),
+                return_exceptions=True,
             )
-            # 2. 延迟：沿用 behavior.delay_min/max 的节奏，避免决策即发。
-            await self._delay()
+            for exc in outcomes:
+                if isinstance(exc, Exception):
+                    # 异常项显式记 warning 后继续（design D4）。CancelledError
+                    # 不是 Exception 子类，不会被这里吞掉。exc 是 gather 返回
+                    # 的异常实例而非当前抛出的异常，exc_info 需三元组形式
+                    # 才能带出 traceback（logger.exception 在此不可用）。
+                    self.ctx.logger.warning(
+                        f"复读/打断后台并发协程异常: {exc}",
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
             # 3. 协议端直发（OneBot 11 核心动作，不做 retcode=1404 永久停用）。
             response = await self._call_protocol(
                 "send_group_msg",
@@ -704,10 +725,15 @@ class RepeaterPlugin(MaiBotPlugin):
         self._state.remember_author(message_id, author, now)
         return author == self._self_qq
 
-    async def _delay(self) -> None:
-        behavior = self.config.behavior
-        low = max(float(behavior.delay_min_seconds), 0.0)
-        high = max(float(behavior.delay_max_seconds), low)
+    async def _delay(self, low: float, high: float) -> None:
+        """按调用方给定的 (low, high) 区间随机延迟（change design D3）。
+
+        参数化区间而不是复制第二份延迟函数：表情回应路径传 behavior 段、
+        复读路径传 repeat 段，两域延迟从此分开调。归一逻辑留在函数内：
+        high < low 时按 low 处理、high <= 0 时不等待。
+        """
+        low = max(float(low), 0.0)
+        high = max(float(high), low)
         if high <= 0.0:
             return
         await asyncio.sleep(random.uniform(low, high))

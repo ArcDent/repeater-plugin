@@ -25,23 +25,29 @@ BOT_QQ = "40004"
 
 
 class FakeLogger:
+    """logging.Logger 接口形态的替身：记录 (level, 文本) 便于断言。
+
+    warning 等方法按标准 logging 签名收 *args/**kwargs——plugin 调用方可能
+    传 exc_info=（生产侧是标准 logger，测试侧必须兼容同形签名）。
+    """
+
     def __init__(self) -> None:
         self.records: list[tuple[str, str]] = []
 
-    def _log(self, level: str, message: str) -> None:
-        self.records.append((level, str(message)))
+    def _log(self, level: str, message: str, *args: Any, **kwargs: Any) -> None:
+        self.records.append((level, message % args if args else str(message)))
 
-    def info(self, message: str) -> None:
-        self._log("info", message)
+    def info(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log("info", message, *args, **kwargs)
 
-    def warning(self, message: str) -> None:
-        self._log("warning", message)
+    def warning(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log("warning", message, *args, **kwargs)
 
-    def error(self, message: str) -> None:
-        self._log("error", message)
+    def error(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log("error", message, *args, **kwargs)
 
-    def debug(self, message: str) -> None:
-        self._log("debug", message)
+    def debug(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log("debug", message, *args, **kwargs)
 
     def texts(self, level: str) -> list[str]:
         return [message for lvl, message in self.records if lvl == level]
@@ -103,8 +109,8 @@ class FakeRequest:
 def make_plugin(protocol_responses: dict[str, Any] | None = None) -> RepeaterPlugin:
     """构造一个绕过 MaiBot 运行时的插件实例，协议端调用被替换为查表返回。
 
-    所有概率默认拉满：这样「断言不触发」的门禁用例在门禁失效时必然失败，
-    而不是靠默认概率蒙对。需要验证概率分流的用例自行覆盖具体值。
+    所有骰默认拉满（概率与出口权重同口径）：这样「断言不触发」的门禁用例在
+    门禁失效时必然失败，而不是靠默认值蒙对。需要验证分流的用例自行覆盖具体值。
     """
     plugin = RepeaterPlugin()
     plugin.config = RepeaterConfig()
@@ -117,10 +123,15 @@ def make_plugin(protocol_responses: dict[str, Any] | None = None) -> RepeaterPlu
     plugin.config.opposite.probability = 1.0
     plugin.config.bandwagon.probability = 1.0
     plugin.config.bandwagon.self_message_probability = 1.0
-    # 复读骰同样定死：复读概率拉满、打断归零，「断言不触发」的门禁用例不靠
-    # 默认概率蒙对；冷却归零避免跨用例牵扯，需冷却的用例自行开启。
-    plugin.config.repeat.probability = 1.0
-    plugin.config.repeat.interrupt_probability = 0.0
+    # 复读骰同样定死（权重口径）：复读权重拉满（1000）、打断与沉默归零，
+    # 「断言不触发」的门禁用例在门禁失效时必然失败，不靠默认权重蒙对；
+    # 复读延迟归零——不归零的话每个复读用例都会真睡 0.3~1.5 秒；冷却归零
+    # 避免跨用例牵扯，需冷却的用例自行开启。
+    plugin.config.repeat.weight_repeat = 1000
+    plugin.config.repeat.weight_interrupt = 0
+    plugin.config.repeat.weight_silence = 0
+    plugin.config.repeat.delay_min_seconds = 0.0
+    plugin.config.repeat.delay_max_seconds = 0.0
     plugin.config.repeat.cooldown_seconds = 0
     # 聚合窗口拉平：注入测试不控制时钟，聚合必须随事件即时 flush 才可断言。
     plugin.config.context.merge_window_seconds = 0
@@ -348,42 +359,56 @@ def test_third_sender_consumes_qualification_and_rolls():
 
 
 def test_cooldown_suppresses_and_restores_qualification(monkeypatch):
-    """冷却期内另一文本达标不消耗资格不掷骰；冷却结束后新发送者加入即触发。"""
+    """冷却期内另一文本达标不消耗资格不掷骰；冷却结束后新发送者加入即触发。
+
+    make_plugin 的默认沉默权重为 0（链达标必出声），因此压制期一并覆盖
+    delta spec「沉默权重为零时冷却压制期仍放行触发消息」：被压制的那条
+    触发消息 MUST 拿到 continue（不拦截、照常进主程序消息链）——沉默权重
+    为 0 时这是触发消息唯一的放行口。
+    """
     plugin = make_plugin()
     plugin.config.repeat.cooldown_seconds = 5
     clock = StepClock()
     monkeypatch.setattr("time.time", clock)
 
-    async def scenario() -> list[str]:
+    async def scenario() -> tuple[list[str], list[str]]:
         for sender in ("20002", "20003", "20004"):
             await plugin.handle_repeat_message(message=group_message("草", sender))
         await drain_spawned(plugin)
         # 冷却期内（起点 +1s < 5s）：另一文本「哈哈」三人接龙达标 → 压制不发送
         clock.now += 1
+        suppressed = []
         for sender in ("20002", "20003", "20004"):
-            await plugin.handle_repeat_message(message=group_message("哈哈", sender))
+            suppressed.append(
+                await plugin.handle_repeat_message(message=group_message("哈哈", sender))
+            )
         await drain_spawned(plugin)
         # 冷却结束（起点 +6s ≥ 5s）：新发送者加入「哈哈」链 → 直接取得资格掷骰
         clock.now += 5
         await plugin.handle_repeat_message(message=group_message("哈哈", "20005"))
         await drain_spawned(plugin)
-        return sent_texts(plugin)
+        return sent_texts(plugin), [result["action"] for result in suppressed]
 
-    assert asyncio.run(scenario()) == ["草", "哈哈"]
+    texts, suppressed_actions = asyncio.run(scenario())
+    assert texts == ["草", "哈哈"]
+    # 压制期内三条（含使链达标的那条）全部放行，无一被拦截
+    assert suppressed_actions == ["continue"] * 3
 
 
 def test_silence_outlet_does_not_enter_cooldown():
     """沉默出口消耗资格（链终结）但不进入群冷却：另一文本照常可触发。"""
     plugin = make_plugin()
-    plugin.config.repeat.probability = 0.0
-    plugin.config.repeat.interrupt_probability = 0.0
+    plugin.config.repeat.weight_repeat = 0
+    plugin.config.repeat.weight_interrupt = 0
+    plugin.config.repeat.weight_silence = 1000
     plugin.config.repeat.cooldown_seconds = 600
 
     async def scenario() -> list[str]:
         for sender in ("20002", "20003", "20004"):
             await plugin.handle_repeat_message(message=group_message("草", sender))
-        # 若沉默也进冷却，「哈哈」链会被压制；概率翻回拉满验证它仍能触发
-        plugin.config.repeat.probability = 1.0
+        # 若沉默也进冷却，「哈哈」链会被压制；权重翻回复读拉满验证它仍能触发
+        plugin.config.repeat.weight_repeat = 1000
+        plugin.config.repeat.weight_silence = 0
         for sender in ("20002", "20003", "20004"):
             await plugin.handle_repeat_message(message=group_message("哈哈", sender))
         await drain_spawned(plugin)
@@ -395,8 +420,8 @@ def test_silence_outlet_does_not_enter_cooldown():
 def test_interrupt_outlet_enters_cooldown():
     """打断出口与复读出口同样进入群冷却。"""
     plugin = make_plugin()
-    plugin.config.repeat.probability = 0.0
-    plugin.config.repeat.interrupt_probability = 1.0
+    plugin.config.repeat.weight_repeat = 0
+    plugin.config.repeat.weight_interrupt = 1000
     plugin.config.repeat.interrupt_texts = ["停！"]
     plugin.config.repeat.cooldown_seconds = 600
 
@@ -522,10 +547,12 @@ def test_blocking_continues_while_chain_accumulates():
 
 
 def test_blocking_continue_on_silence_outlet():
-    """沉默出口放行触发消息：continue（用沉默日志证明掷骰确实发生，非门禁失效）。"""
+    """沉默出口放行触发消息：continue（沉默权重拉满、复读打断归零——用沉默
+    日志证明掷骰确实发生，非门禁失效，也非三权重全 0 的不掷骰分支）。"""
     plugin = make_plugin()
-    plugin.config.repeat.probability = 0.0
-    plugin.config.repeat.interrupt_probability = 0.0
+    plugin.config.repeat.weight_repeat = 0
+    plugin.config.repeat.weight_interrupt = 0
+    plugin.config.repeat.weight_silence = 1000
     messages = [group_message("草", sender) for sender in ("20002", "20003", "20004")]
 
     async def scenario() -> list[dict[str, Any]]:
@@ -609,8 +636,8 @@ def test_blocking_abort_on_repeat_outlet():
 def test_blocking_abort_on_interrupt_outlet():
     """打断出口同样拦截触发消息：abort，后台只发打断文本。"""
     plugin = make_plugin()
-    plugin.config.repeat.probability = 0.0
-    plugin.config.repeat.interrupt_probability = 1.0
+    plugin.config.repeat.weight_repeat = 0
+    plugin.config.repeat.weight_interrupt = 1000
     plugin.config.repeat.interrupt_texts = ["停！"]
     messages = [group_message("草", sender) for sender in ("20002", "20003", "20004")]
 
@@ -712,8 +739,8 @@ def test_repeat_outlet_sends_last_raw_text():
 def test_interrupt_outlet_sends_single_pool_text_without_repeat_text():
     """打断出口只直发池内一条文本，不附带复读文本。"""
     plugin = make_plugin()
-    plugin.config.repeat.probability = 0.0
-    plugin.config.repeat.interrupt_probability = 1.0
+    plugin.config.repeat.weight_repeat = 0
+    plugin.config.repeat.weight_interrupt = 1000
     # 单条池子让随机取值确定化
     plugin.config.repeat.interrupt_texts = ["停！"]
 
@@ -729,7 +756,7 @@ def test_interrupt_outlet_sends_single_pool_text_without_repeat_text():
 def test_direct_send_carries_group_id_and_text_segment():
     """send_group_msg 完整参数形态：group_id 数字化、message 为单条 text 段。
 
-    两出口共用同一形态：第 1 链走复读出口（默认概率已拉满），第 2 链概率
+    two outlets share one shape: 第 1 链走复读出口（默认权重已拉满），第 2 链权重
     反向拉满走打断出口，整包比对（对齐贴表情侧 test_send_carries_* 惯例）。
     """
     plugin = make_plugin()
@@ -739,8 +766,8 @@ def test_direct_send_carries_group_id_and_text_segment():
         for sender in ("20002", "20003", "20004"):
             await plugin.handle_repeat_message(message=group_message("草", sender))
         await drain_spawned(plugin)
-        plugin.config.repeat.probability = 0.0
-        plugin.config.repeat.interrupt_probability = 1.0
+        plugin.config.repeat.weight_repeat = 0
+        plugin.config.repeat.weight_interrupt = 1000
         for sender in ("20002", "20003", "20004"):
             await plugin.handle_repeat_message(message=group_message("哈哈", sender))
         await drain_spawned(plugin)
@@ -759,18 +786,21 @@ def test_direct_send_carries_group_id_and_text_segment():
 
 
 def test_silence_outlet_sends_nothing():
-    """双概率皆 0：链达标掷骰后保持沉默，零调用（决策机制由后续触发验证活着）。"""
+    """沉默权重拉满、复读打断归零：链达标掷骰后保持沉默，零调用（决策机制
+    由后续触发验证活着）。"""
     plugin = make_plugin()
-    plugin.config.repeat.probability = 0.0
-    plugin.config.repeat.interrupt_probability = 0.0
+    plugin.config.repeat.weight_repeat = 0
+    plugin.config.repeat.weight_interrupt = 0
+    plugin.config.repeat.weight_silence = 1000
 
     async def scenario() -> list[str]:
         for sender in ("20002", "20003", "20004"):
             await plugin.handle_repeat_message(message=group_message("草", sender))
         await drain_spawned(plugin)
-        # 机制活性探针：概率翻满后另一文本的链必须能发出，证明前面的零调用
-        # 来自沉默出口而非门禁失效
-        plugin.config.repeat.probability = 1.0
+        # 机制活性探针：权重翻回复读拉满后另一文本的链必须能发出，证明前面
+        # 的零调用来自沉默出口而非门禁失效
+        plugin.config.repeat.weight_repeat = 1000
+        plugin.config.repeat.weight_silence = 0
         for sender in ("20002", "20003", "20004"):
             await plugin.handle_repeat_message(message=group_message("哈哈", sender))
         await drain_spawned(plugin)
@@ -779,11 +809,11 @@ def test_silence_outlet_sends_nothing():
     assert asyncio.run(scenario()) == ["哈哈"]
 
 
-def test_send_waits_behavior_delay_before_sending(monkeypatch):
-    """直发经 behavior.delay_min/max 随机延迟后执行，不出现决策即发。"""
+def test_send_waits_repeat_delay_before_sending(monkeypatch):
+    """直发经 repeat.delay_min/max 随机延迟后执行，不出现决策即发。"""
     plugin = make_plugin()
-    plugin.config.behavior.delay_min_seconds = 1.5
-    plugin.config.behavior.delay_max_seconds = 1.5
+    plugin.config.repeat.delay_min_seconds = 1.5
+    plugin.config.repeat.delay_max_seconds = 1.5
     sleeps: list[float] = []
 
     async def fake_sleep(seconds: float) -> None:
@@ -801,6 +831,79 @@ def test_send_waits_behavior_delay_before_sending(monkeypatch):
 
     assert asyncio.run(scenario()) == ["草"]
     assert sleeps == [1.5]  # min==max 时区间内随机值唯一
+
+
+def test_repeat_delay_high_below_low_wait_uses_low(monkeypatch):
+    """复读段延迟上限低于下限时按下限等待（_delay 既有归一逻辑保留）。"""
+    plugin = make_plugin()
+    plugin.config.repeat.delay_min_seconds = 2.0
+    plugin.config.repeat.delay_max_seconds = 0.5  # 上限低于下限：归一按 low
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    async def scenario() -> list[str]:
+        for sender in ("20002", "20003", "20004"):
+            await plugin.handle_repeat_message(message=group_message("草", sender))
+        await drain_spawned(plugin)
+        return sent_texts(plugin)
+
+    assert asyncio.run(scenario()) == ["草"]
+    assert sleeps == [2.0]  # uniform(2.0, 2.0) == 2.0
+
+
+def test_behavior_delay_config_does_not_affect_repeat_delay(monkeypatch):
+    """只改 behavior.delay_min/max 不影响复读延迟：直发仍按 repeat 段时长。
+
+    delta spec「复读延迟与表情回应延迟互不牵扯」：behavior 段即使拉到 9 秒，
+    复读路径仍读 repeat 段的区间。
+    """
+    plugin = make_plugin()
+    plugin.config.behavior.delay_min_seconds = 9.0
+    plugin.config.behavior.delay_max_seconds = 9.0
+    plugin.config.repeat.delay_min_seconds = 0.7
+    plugin.config.repeat.delay_max_seconds = 0.7
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    async def scenario() -> list[str]:
+        for sender in ("20002", "20003", "20004"):
+            await plugin.handle_repeat_message(message=group_message("草", sender))
+        await drain_spawned(plugin)
+        return sent_texts(plugin)
+
+    assert asyncio.run(scenario()) == ["草"]
+    assert sleeps == [0.7]  # behavior 9 秒不生效，min==max 时随机值唯一
+
+
+def test_reaction_wait_uses_behavior_delay_range(monkeypatch):
+    """表情回应路径的延迟取 behavior.delay_min/max，与复读段互不牵扯。
+
+    复读段延迟即使拉满也不影响表情回应路径（change design D3：延迟按域
+    取值）；表情回应侧既有延迟用例仍取 behavior 段。
+    """
+    plugin = make_plugin()
+    plugin.config.repeat.delay_min_seconds = 9.0
+    plugin.config.repeat.delay_max_seconds = 9.0
+    plugin.config.behavior.delay_min_seconds = 2.0
+    plugin.config.behavior.delay_max_seconds = 2.0
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    asyncio.run(plugin._on_reaction(event()))
+    assert "set_msg_emoji_like" in actions_of(plugin)
+    assert sleeps == [2.0]  # min==max 时区间内随机值唯一
 
 
 def test_stream_id_resolved_once_per_group_across_sends():
@@ -849,8 +952,8 @@ def test_send_failure_result_logged_as_warning():
 def test_empty_interrupt_pool_falls_back_with_warning():
     """配置池被清空：回落内置默认池（design D6 五条）并打 warning，不静默哑火。"""
     plugin = make_plugin()
-    plugin.config.repeat.probability = 0.0
-    plugin.config.repeat.interrupt_probability = 1.0
+    plugin.config.repeat.weight_repeat = 0
+    plugin.config.repeat.weight_interrupt = 1000
     plugin.config.repeat.interrupt_texts = []
 
     async def scenario() -> list[str]:
@@ -868,12 +971,19 @@ def test_empty_interrupt_pool_falls_back_with_warning():
 
 
 def test_direct_send_success_choreography_order(monkeypatch):
-    """成功路径四步编舞（design D2）：触发消息注入 → 延迟 → 直发 → 行为文本注入。"""
+    """成功路径编舞（ADR 0008 gather 语义）：直发之前注入与延迟都已完成、
+    直发之后是行为文本注入。
+
+    触发消息注入与延迟同进 gather，两者先后不再确定，故不钉它们的相对
+    顺序；可钉死的边界是：直发（protocol:send_group_msg）之前两者都发生
+    过、行为文本注入（第二个 append）在直发之后——source_kind 序
+    repeat_trigger → repeat/interrupt 由 await 顺序保证，不会因并发反转。
+    """
     plugin = make_plugin(
         {"send_group_msg": {"status": "ok", "retcode": 0, "data": {"message_id": 987001}}}
     )
-    plugin.config.behavior.delay_min_seconds = 1.5
-    plugin.config.behavior.delay_max_seconds = 1.5
+    plugin.config.repeat.delay_min_seconds = 1.5
+    plugin.config.repeat.delay_max_seconds = 1.5
     events: list[str] = []
 
     async def fake_sleep(seconds: float) -> None:
@@ -903,9 +1013,132 @@ def test_direct_send_success_choreography_order(monkeypatch):
         await drain_spawned(plugin)
 
     asyncio.run(scenario())
-    assert events == ["append", "delay", "protocol:send_group_msg", "append"]
+    assert events.count("append") == 2  # 触发消息注入 + 行为文本注入
+    assert events.count("delay") == 1
+    protocol_pos = events.index("protocol:send_group_msg")
+    first_append, second_append = [
+        position for position, name in enumerate(events) if name == "append"
+    ]
+    # 直发在注入与延迟之后（两者同进 gather，相对顺序不钉死）
+    assert first_append < protocol_pos
+    assert events.index("delay") < protocol_pos
+    # 行为文本注入仍在直发之后（历史顺序：先触发消息后行为文本）
+    assert protocol_pos < second_append
+    assert events[-1] == "append"
     # 直发通路彻底替代标准发送链：全程不出现 ctx.send.text
     assert plugin.ctx.send.text_calls == []
+
+
+def test_direct_send_waits_for_slow_trigger_injection(monkeypatch):
+    """注入慢于延迟（ADR 0008 gather 语义）：直发不在延迟到期就提前发出。
+
+    delta spec「注入不叠加在延迟之前」：触发消息注入与延迟并发，延迟（fake
+    sleep 即时返回）先到期时直发仍必须等注入完成——可见延迟是两者的较大值
+    而非之和。
+    """
+    plugin = make_plugin(
+        {"send_group_msg": {"status": "ok", "retcode": 0, "data": {"message_id": 987001}}}
+    )
+    plugin.config.repeat.delay_min_seconds = 1.0
+    plugin.config.repeat.delay_max_seconds = 1.0
+    events: list[str] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+    # 真 sleep 必须在 patch 前保存：假 sleep 没有 await 点，测试自身轮询若用
+    # 被替换的 asyncio.sleep 就不交还事件循环——后台任务在轮询期间根本不被
+    # 调度，用例退化成只测 drain 之后的顺序，串行实现也会照常通过（回归防护
+    # 空洞，修法见下）。fake_sleep 只管「延迟到期」这个事件本身。
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        events.append("delay")
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    async def slow_append(**kwargs: Any) -> Any:
+        if kwargs["source_kind"] == "repeat_trigger":
+            # 触发消息注入：挂起直到测试放行（模拟慢注入），期间延迟已可到期。
+            events.append("inject-start")
+            started.set()
+            await release.wait()
+            events.append("inject-end")
+        return {"success": True, "index": 0}
+
+    plugin.ctx.maisaka.context.append = slow_append  # type: ignore[method-assign]
+
+    original_call = plugin._call_protocol
+
+    async def recording_call(action_name: str, params: dict[str, Any]) -> Any:
+        events.append(f"protocol:{action_name}")
+        return await original_call(action_name, params)
+
+    plugin._call_protocol = recording_call  # type: ignore[assignment]
+
+    async def scenario() -> None:
+        for sender in ("20002", "20003", "20004"):
+            await plugin.handle_repeat_message(message=group_message("草", sender))
+        # 轮询一律 sleep(0) 交还事件循环（真 sleep），后台任务才会被调度。
+        # 先等注入协程的 started 信号、确认它真的挂起在 release 上；再等延迟
+        # 分支先到期——串行实现下延迟排在注入完成之后、此循环必然超时，这就
+        # 是「注入与延迟并发」的可观测证据（inject-start 与 delay 的相对先后
+        # 是 gather 子任务的调度细节，不构成契约，docstring 同口径）。
+        for _ in range(1000):
+            if started.is_set():
+                break
+            await real_sleep(0)
+        else:
+            raise AssertionError("注入协程未在放行前挂起：并发结构缺失？")
+        for _ in range(1000):
+            if "delay" in events:
+                break
+            await real_sleep(0)
+        else:
+            raise AssertionError("延迟未在注入完成前启动：注入仍串在延迟之前？")
+        # 注入已确认挂起、延迟已到期：直发不得提前发生
+        assert not [name for name in events if name.startswith("protocol:")]
+        release.set()
+        await drain_spawned(plugin)
+
+    asyncio.run(scenario())
+    # 并发语义可钉死的只有完成边界：延迟先到期并完成、注入随后完成，两者都
+    # 在直发之前；inject-start 与 delay 的先后是 gather 子任务的调度细节，
+    # 不构成契约。
+    assert "inject-start" in events
+    assert events.index("delay") < events.index("inject-end")
+    assert events.index("inject-end") < events.index("protocol:send_group_msg")
+    assert events.index("delay") < events.index("protocol:send_group_msg")
+    assert events[-1] == "protocol:send_group_msg"  # 行为文本注入不再记事件
+
+
+def test_injection_coroutine_exception_keeps_direct_send(monkeypatch):
+    """触发消息注入协程抛未预期异常（gather return_exceptions 兜底，
+    design D4）：异常项记 warning 后继续，直发照常发生。
+
+    _append_repeat_context 自身吞掉常规异常；这里直接替换成抛异常的注入
+    协程，专打 gather 的异常兜底——没有 return_exceptions 时异常会上抛、
+    外层 except 会把直发一并丢掉。
+    """
+    plugin = make_plugin()
+    original_append_context = plugin._append_repeat_context
+
+    async def flaky_injection(
+        group_id: str, text: str, source_kind: str, message_id: Any
+    ) -> None:
+        if source_kind == "repeat_trigger":
+            raise RuntimeError("注入协程炸了")
+        await original_append_context(group_id, text, source_kind, message_id)
+
+    plugin._append_repeat_context = flaky_injection  # type: ignore[assignment]
+
+    async def scenario() -> list[str]:
+        for sender in ("20002", "20003", "20004"):
+            await plugin.handle_repeat_message(message=group_message("草", sender))
+        await drain_spawned(plugin)
+        return sent_texts(plugin)
+
+    assert asyncio.run(scenario()) == ["草"]  # 注入异常不阻断直发
+    warnings = plugin.ctx.logger.texts("warning")
+    assert any("并发协程异常" in t for t in warnings)  # 异常项有显式 warning
 
 
 def test_direct_send_unreachable_stops_after_trigger_injection():
@@ -1029,8 +1262,8 @@ def test_interrupt_outlet_injection_payloads():
     plugin = make_plugin(
         {"send_group_msg": {"status": "ok", "retcode": 0, "data": {"message_id": 987002}}}
     )
-    plugin.config.repeat.probability = 0.0
-    plugin.config.repeat.interrupt_probability = 1.0
+    plugin.config.repeat.weight_repeat = 0
+    plugin.config.repeat.weight_interrupt = 1000
     plugin.config.repeat.interrupt_texts = ["停！"]
     trigger = group_message("草", "20004")
     trigger["message_id"] = "msg-43"

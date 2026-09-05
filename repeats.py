@@ -22,7 +22,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .reactions import GroupCooldown, clamp_probability
+from .reactions import GroupCooldown
 
 # 内置打断文本变体池，与配置默认值同源（design D6）。配置池为空时回落到这里。
 DEFAULT_INTERRUPT_TEXTS: tuple[str, ...] = (
@@ -364,46 +364,77 @@ def _interrupt_pool(interrupt_texts: Sequence[Any] | None) -> tuple[list[str], b
     return list(DEFAULT_INTERRUPT_TEXTS), True
 
 
+def _clamp_non_negative(value: Any) -> float:
+    """非负 clamp：负数 / 非数字 / None 一律按 0，正数原样返回。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, number)
+
+
+def normalize_exit_weights(
+    weight_repeat: Any,
+    weight_interrupt: Any,
+    weight_silence: Any,
+) -> tuple[tuple[float, float, float], float]:
+    """**出口权重**非负归一：返回 clamp 后的（复读, 打断, 沉默）三元组与其总和。
+
+    三个权重各自按非负数 clamp：负数 / 非数字 / None 一律按 0（口径对齐
+    reactions.clamp_probability 的垃圾值处理，但只按 0 不设 [0,1] 上界——
+    权重只有比例意义，上界由配置模型约束）。单个权重非法不影响其余权重。
+    总和为 0 表示必落沉默，decide_repeat 据此直接不掷骰（ADR 0007）。
+    """
+    repeat = _clamp_non_negative(weight_repeat)
+    interrupt = _clamp_non_negative(weight_interrupt)
+    silence = _clamp_non_negative(weight_silence)
+    return (repeat, interrupt, silence), repeat + interrupt + silence
+
+
 def decide_repeat(
     text: str,
     *,
-    probability: float,
-    interrupt_probability: float,
+    weight_repeat: Any,
+    weight_interrupt: Any,
+    weight_silence: Any,
     interrupt_texts: Sequence[Any] | None = None,
     roll: Callable[[], float] = random.random,
     choice: Callable[[Sequence[str]], str] = random.choice,
 ) -> RepeatDecision | None:
-    """对一条已取得资格的**复读链**做**三出口决策**。
+    """对一条已取得资格的**复读链**做**三出口决策**（出口权重口径，ADR 0007）。
 
-    只掷一次骰，三出口严格互斥：roll < probability → REPEAT（发链内最后
-    一条原始**复读文本**）；probability ≤ roll < probability +
-    interrupt_probability → INTERRUPT（从池内随机发一条**打断文本**，绝不
-    带**复读文本**）；其余 → 沉默（None，什么都不发）。
+    三个权重先各自非负归一（负数 / 非数字 / None 按 0，见
+    normalize_exit_weights）；归一后求和，总和为 0 时出口必为沉默，直接返回
+    None 不掷骰。否则只掷一次骰：把 roll()（[0,1)）乘总和得到数轴落点，按
+    **复读 → 打断 → 沉默** 的固定顺序与累加阈值比较，命中即返回——落点 <
+    复读权重 → REPEAT（发链内最后一条原始**复读文本**）；落点 < 复读权重 +
+    打断权重 → INTERRUPT（从池内随机发一条**打断文本**，绝不带**复读文本**）；
+    其余 → 沉默（None，什么都不发）。三出口严格互斥；权重只有比例意义，
+    同比例放大命中分布不变。
 
-    概率逐出口 clamp 到 [0, 1]（垃圾值按 0，对齐 reactions.decide_reaction），
-    按先复读后打断的优先级求值，两者之和超过 1 只是挤掉沉默的空间。两个概率
-    都是 0 时直接不掷骰。interrupt_texts 为空（或全空白）时回落内置默认池
-    不抛异常，回落事实记在决策结果的 used_default_pool 上，由调用方打日志
-    （design D5）。
+    interrupt_texts 为空（或全空白）时回落内置默认池不抛异常，回落事实记在
+    决策结果的 used_default_pool 上，由调用方打日志（design D5）。
     """
-    repeat_probability = clamp_probability(probability)
-    interrupt = clamp_probability(interrupt_probability)
-    if repeat_probability <= 0.0 and interrupt <= 0.0:
+    (repeat_weight, interrupt_weight, silence_weight), total = normalize_exit_weights(
+        weight_repeat, weight_interrupt, weight_silence
+    )
+    if total <= 0.0:
         return None
 
     pool, used_default_pool = _interrupt_pool(interrupt_texts)
-    value = roll()
-    if value < repeat_probability:
+    value = roll() * total
+    weight_summary = f"{repeat_weight:g}/{interrupt_weight:g}/{silence_weight:g}"
+    if value < repeat_weight:
         return RepeatDecision(
             kind=REPEAT,
             text=text,
-            reason=f"复读出口命中（p={repeat_probability}）",
+            reason=f"复读出口命中（权重 {weight_summary}）",
         )
-    if value < repeat_probability + interrupt:
+    if value < repeat_weight + interrupt_weight:
         return RepeatDecision(
             kind=INTERRUPT,
             text=choice(pool),
-            reason=f"打断出口命中（p={repeat_probability}，打断 p={interrupt}）",
+            reason=f"打断出口命中（权重 {weight_summary}）",
             used_default_pool=used_default_pool,
         )
     return None

@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "arcdent.repeater-plugin",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "name": "复读插件",
   "description": "群内同一句复读接龙达标后，麦麦按概率复读原文或发打断文本唱反调；有人给消息贴表情回应后，麦麦按概率跟着贴同款或语义相反的表情",
   "author": {

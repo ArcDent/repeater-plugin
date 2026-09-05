@@ -27,6 +27,7 @@ from sending_emojis_plugin.repeats import (
     build_trigger_visible_text,
     decide_repeat,
     extract_repeat_candidate,
+    normalize_exit_weights,
     normalize_repeat_text,
 )
 
@@ -474,53 +475,89 @@ def test_group_repeat_cooldown_scoped_per_group():
     assert state.is_cooling_down("10002", 120.0, now) is False
 
 
+# ---- normalize_exit_weights（出口权重非负归一，ADR 0007 / design D1）----
+
+def test_normalize_exit_weights_negative_garbage_none_become_zero():
+    """负数 / 非数字 / None 一律按 0，三个都非法时总和为 0。"""
+    triple, total = normalize_exit_weights(-5, "很高", None)
+    assert triple == (0.0, 0.0, 0.0)
+    assert total == 0.0
+
+
+def test_normalize_exit_weights_keeps_numbers_and_sums_them():
+    """85 原样（85.0），总和为三者之和。"""
+    triple, total = normalize_exit_weights(85, 15, 0)
+    assert triple == (85.0, 15.0, 0.0)
+    assert total == 100.0
+
+
+def test_normalize_exit_weights_invalid_single_weight_keeps_others():
+    """单个权重非法只把自身按 0 计，不影响其余权重与总和。"""
+    triple, total = normalize_exit_weights("很高", 15, -3)
+    assert triple == (0.0, 15.0, 0.0)
+    assert total == 15.0
+
+
 # ---- decide_repeat ----
 
 def _roll_never_called():
-    raise AssertionError("both probabilities are 0 — no roll should happen")
+    raise AssertionError("三个权重全为 0——不应掷骰")
 
 
-def test_repeat_outlet_when_roll_below_probability():
+def test_repeat_outlet_when_scaled_roll_below_repeat_weight():
+    """权重 85/15/0：roll 落点 0.5 × 100 = 50 < 85 → 复读出口。"""
     decision = decide_repeat(
         " 草 ",
-        probability=0.6,
-        interrupt_probability=0.15,
+        weight_repeat=85,
+        weight_interrupt=15,
+        weight_silence=0,
         roll=lambda: 0.5,
     )
     assert decision is not None
     assert decision.kind == REPEAT
     assert decision.text == " 草 "  # carries the raw text
+    assert decision.reason == "复读出口命中（权重 85/15/0）"
 
 
-def test_interrupt_outlet_starts_at_the_probability_boundary():
+def test_interrupt_outlet_starts_at_the_repeat_weight_boundary():
+    """落点恰等于复读权重上界（0.85 × 100 == 85.0）→ 打断区间，不是复读。
+
+    复读区间 [0, 85)，打断区间 [85, 85 + 15)（上界 = 0.85 + 0.15 = 1.0 的
+    100 倍，触及总和）。"""
     decision = decide_repeat(
         "草",
-        probability=0.6,
-        interrupt_probability=0.15,
+        weight_repeat=85,
+        weight_interrupt=15,
+        weight_silence=0,
         interrupt_texts=["停！"],
-        roll=lambda: 0.6,  # roll == probability → interrupt range, not repeat
+        roll=lambda: 0.85,
         choice=lambda pool: pool[0],
     )
     assert decision is not None
     assert decision.kind == INTERRUPT
     assert decision.text == "停！"  # interrupt text only, never the repeat text
+    assert decision.reason == "打断出口命中（权重 85/15/0）"
 
 
-def test_silence_when_both_outlets_miss():
+def test_silence_outlet_when_roll_lands_in_silence_weight():
+    """权重 60/15/25：roll 落点 0.9 × 100 = 90 ≥ 60 + 15 → 沉默出口。"""
     decision = decide_repeat(
         "草",
-        probability=0.6,
-        interrupt_probability=0.15,
+        weight_repeat=60,
+        weight_interrupt=15,
+        weight_silence=25,
         roll=lambda: 0.9,
     )
     assert decision is None
 
 
-def test_silence_when_roll_reaches_one():
+def test_silence_outlet_when_roll_approaches_one():
+    """roll 逼近 1（0.999999 × 100 = 99.9999）仍落在沉默区间。"""
     decision = decide_repeat(
         "草",
-        probability=0.6,
-        interrupt_probability=0.15,
+        weight_repeat=60,
+        weight_interrupt=15,
+        weight_silence=25,
         roll=lambda: 0.999999,
     )
     assert decision is None
@@ -535,8 +572,9 @@ def test_interrupt_picks_from_the_configured_pool():
 
     decision = decide_repeat(
         "草",
-        probability=0.0,
-        interrupt_probability=1.0,
+        weight_repeat=0,
+        weight_interrupt=1,
+        weight_silence=0,
         interrupt_texts=["够了！", "停！"],
         roll=lambda: 0.3,
         choice=fake_choice,
@@ -556,8 +594,9 @@ def test_empty_interrupt_pool_falls_back_to_builtin_defaults():
 
     decision = decide_repeat(
         "草",
-        probability=0.0,
-        interrupt_probability=1.0,
+        weight_repeat=0,
+        weight_interrupt=1,
+        weight_silence=0,
         interrupt_texts=[],
         roll=lambda: 0.3,
         choice=fake_choice,
@@ -573,8 +612,9 @@ def test_empty_interrupt_pool_falls_back_to_builtin_defaults():
 def test_configured_pool_keeps_used_default_pool_false():
     decision = decide_repeat(
         "草",
-        probability=0.0,
-        interrupt_probability=1.0,
+        weight_repeat=0,
+        weight_interrupt=1,
+        weight_silence=0,
         interrupt_texts=["够了！", "停！"],
         roll=lambda: 0.3,
     )
@@ -586,8 +626,9 @@ def test_configured_pool_keeps_used_default_pool_false():
 def test_repeat_outlet_carries_used_default_pool_false():
     decision = decide_repeat(
         " 草 ",
-        probability=0.6,
-        interrupt_probability=0.15,
+        weight_repeat=85,
+        weight_interrupt=15,
+        weight_silence=0,
         roll=lambda: 0.5,
     )
     assert decision is not None
@@ -598,8 +639,9 @@ def test_repeat_outlet_carries_used_default_pool_false():
 def test_all_blank_pool_falls_back_to_builtin_defaults():
     decision = decide_repeat(
         "草",
-        probability=0.0,
-        interrupt_probability=1.0,
+        weight_repeat=0,
+        weight_interrupt=1,
+        weight_silence=0,
         interrupt_texts=["   ", ""],
         roll=lambda: 0.3,
     )
@@ -612,8 +654,9 @@ def test_all_blank_pool_falls_back_to_builtin_defaults():
 def test_missing_interrupt_pool_falls_back_to_builtin_defaults():
     decision = decide_repeat(
         "草",
-        probability=0.0,
-        interrupt_probability=1.0,
+        weight_repeat=0,
+        weight_interrupt=1,
+        weight_silence=0,
         interrupt_texts=None,
         roll=lambda: 0.3,
     )
@@ -623,16 +666,52 @@ def test_missing_interrupt_pool_falls_back_to_builtin_defaults():
     assert decision.used_default_pool is True
 
 
-def test_zero_probabilities_skip_the_roll():
+@pytest.mark.parametrize("roll_value", [0.2, 0.5, 0.9])
+def test_same_roll_hits_same_outlet_when_weights_scaled(roll_value):
+    """权重同比例放大（85/15/0 → 170/30/0）只换数轴刻度，不换出口。
+
+    roll_value × 100 与 × 200 落在同一累计阈值区间：0.2 与 0.5 都进复读
+    区间、0.9 都进打断区间（design D1 的 85/15/0 示例，0.85 + 0.15 = 1.0
+    触及上界）。"""
+    def outlet_of(weight_repeat: int, weight_interrupt: int, weight_silence: int) -> str:
+        decision = decide_repeat(
+            "草",
+            weight_repeat=weight_repeat,
+            weight_interrupt=weight_interrupt,
+            weight_silence=weight_silence,
+            interrupt_texts=["停！"],
+            roll=lambda: roll_value,
+        )
+        return decision.kind if decision is not None else "silence"
+
+    assert outlet_of(85, 15, 0) == outlet_of(170, 30, 0)
+
+
+def test_all_zero_weights_skip_the_roll():
     assert decide_repeat(
-        "草", probability=0.0, interrupt_probability=0.0, roll=_roll_never_called
+        "草",
+        weight_repeat=0,
+        weight_interrupt=0,
+        weight_silence=0,
+        roll=_roll_never_called,
     ) is None
 
 
-def test_garbage_probability_is_treated_as_zero():
-    assert decide_repeat(
-        "草", probability="很高", interrupt_probability=0.0, roll=_roll_never_called
-    ) is None
+def test_garbage_weight_is_treated_as_zero():
+    """非法权重 clamp 成 0：复读份额为 0、打断权重独占——掷骰照常、不报错。"""
+    decision = decide_repeat(
+        "草",
+        weight_repeat="很高",
+        weight_interrupt=15,
+        weight_silence=0,
+        interrupt_texts=["停！"],
+        roll=lambda: 0.5,
+        choice=lambda pool: pool[0],
+    )
+    assert decision is not None
+    assert decision.kind == INTERRUPT
+    assert decision.text == "停！"
+    assert decision.used_default_pool is False
 
 
 # ---- 注入文案构造（visible_text，change design D3；对齐 reactions 的

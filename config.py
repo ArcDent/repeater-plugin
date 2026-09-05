@@ -28,7 +28,7 @@ class PluginSection(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="1.0.0",
+        default="1.1.0",
         json_schema_extra={"disabled": True, "hidden": True, "label": "配置版本", "order": 99},
     )
 
@@ -243,25 +243,43 @@ class RepeatSection(PluginConfigBase):
             "order": 3,
         },
     )
-    probability: float = Field(
-        default=0.6, ge=0.0, le=1.0,
-        json_schema_extra={
-            "hint": "复读链达标后掷的第一颗骰：命中则复读链内最后一条的原始文本。0 = 从不复读。",
-            "label": "复读概率",
-            "order": 4,
-            "step": 0.05,
-        },
-    )
-    interrupt_probability: float = Field(
-        default=0.15, ge=0.0, le=1.0,
+    weight_repeat: int = Field(
+        default=85, ge=0, le=1000,
         json_schema_extra={
             "hint": (
-                "复读骰未中后掷的第二颗骰：命中则从打断文本池随机取一条发出，不附带复读文本；"
-                "两颗骰都未中保持沉默。0 = 从不打断。"
+                "三个出口权重是复读链达标后一次掷骰的三个面，按比例恰好命中一个出口："
+                "复读 / 打断 / 沉默，三者严格互斥。默认 85 / 15 / 0 = 85% 复读、15% 打断、从不沉默。"
+                "三个数只有比例意义，同比例放大等价（如 170 / 30 / 0 与默认分布相同）；"
+                "想恢复偶尔沉默，给沉默权重填正数即可。"
             ),
-            "label": "打断概率",
+            "label": "复读权重",
+            "order": 4,
+            "step": 5,
+        },
+    )
+    weight_interrupt: int = Field(
+        default=15, ge=0, le=1000,
+        json_schema_extra={
+            "hint": (
+                "打断出口的权重：命中则从打断文本池随机取一条发出，绝不附带复读文本。"
+                "与复读 / 沉默权重按比例决定同一次掷骰的出口，只有比例意义。"
+            ),
+            "label": "打断权重",
             "order": 5,
-            "step": 0.05,
+            "step": 5,
+        },
+    )
+    weight_silence: int = Field(
+        default=0, ge=0, le=1000,
+        json_schema_extra={
+            "hint": (
+                "沉默出口的权重：命中则不出声，触发消息放行进主程序消息链。"
+                "默认 0 = 从不沉默（链达标必出声，冷却压制期除外）；"
+                "与复读 / 打断权重按比例决定同一次掷骰的出口，只有比例意义。"
+            ),
+            "label": "沉默权重",
+            "order": 6,
+            "step": 5,
         },
     )
     interrupt_texts: list[str] = Field(
@@ -269,8 +287,32 @@ class RepeatSection(PluginConfigBase):
         json_schema_extra={
             "hint": "打断出口的变体池，每次随机取一条。全部留空时回落内置默认池并记日志，不会静默哑火。",
             "label": "打断文本池",
-            "order": 6,
+            "order": 7,
             "placeholder": "打断！",
+        },
+    )
+    delay_min_seconds: float = Field(
+        default=0.3, ge=0.0, le=300.0,
+        json_schema_extra={
+            "hint": (
+                "复读 / 打断出口命中后发送前的最短等待秒数，避免命中即瞬间发出显得机械；"
+                "与「节奏与限流」里表情回应的延迟互相独立。"
+            ),
+            "label": "复读发送延迟下限（秒）",
+            "order": 8,
+            "step": 0.1,
+        },
+    )
+    delay_max_seconds: float = Field(
+        default=1.5, ge=0.0, le=300.0,
+        json_schema_extra={
+            "hint": (
+                "复读 / 打断出口命中后发送前的最大等待秒数，实际等待在最小 / 最大之间随机取；"
+                "小于最小延迟时按最小延迟处理。"
+            ),
+            "label": "复读发送延迟上限（秒）",
+            "order": 9,
+            "step": 0.1,
         },
     )
     chain_ttl_seconds: int = Field(
@@ -281,7 +323,7 @@ class RepeatSection(PluginConfigBase):
                 "过期后重新累积可再达标。0 = 不做链终结。"
             ),
             "label": "链终结保留时长（秒）",
-            "order": 7,
+            "order": 10,
             "step": 60,
         },
     )
@@ -293,7 +335,7 @@ class RepeatSection(PluginConfigBase):
                 "冷却期内链达标不掷骰、不消耗决策资格。0 = 不限。"
             ),
             "label": "复读群冷却（秒）",
-            "order": 8,
+            "order": 11,
             "step": 5,
         },
     )
@@ -302,7 +344,7 @@ class RepeatSection(PluginConfigBase):
         json_schema_extra={
             "hint": "超过此长度的文本消息不产出复读文本、不参与复读链累积。0 = 不限。",
             "label": "复读文本长度上限",
-            "order": 9,
+            "order": 12,
             "step": 50,
         },
     )
@@ -311,7 +353,7 @@ class RepeatSection(PluginConfigBase):
         json_schema_extra={
             "hint": "内存中复读链记录的条数上界，超出后丢弃最旧的链，与表情槽条数上界同理。",
             "label": "复读链条数上界",
-            "order": 10,
+            "order": 13,
             "step": 100,
         },
     )
