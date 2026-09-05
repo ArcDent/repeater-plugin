@@ -12,7 +12,7 @@ class PluginConfigBase:
     """按注解逐字段取默认值；默认值深拷贝，保证每个实例的嵌套 section 互相独立。
 
     kwargs 里的 dict 覆盖值自动转为对应嵌套 section（对齐真实 maibot_sdk 的
-    pydantic 语义，如 ``SendingEmojisConfig(context={"enabled": True})``）。
+    pydantic 语义，如 ``RepeaterConfig(context={"enabled": True})``）。
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -44,6 +44,36 @@ class MaiBotPlugin:
     def __init__(self) -> None:
         self.ctx: Any = None
         self.config: Any = None
+
+
+class FakeSendCapability:
+    """ctx.send 替身（design D8）：记录每次调用供断言，不做真实校验。
+
+    对齐真实 SDK 的 SendCapability.text 签名（maibot_sdk/capabilities/send.py：
+    ``text(text, stream_id, *, return_details=False, **kwargs) -> bool | SendResult``）。
+    raise_on_text 置为异常实例时每次调用都抛出（失败注入）；text_result 控制
+    返回值（True/False，或 SendResult 形态的 dict），默认成功 True。
+    """
+
+    def __init__(self) -> None:
+        self.text_calls: list[dict[str, Any]] = []
+        self.raise_on_text: BaseException | None = None
+        self.text_result: Any = True
+
+    async def text(
+        self,
+        text: str,
+        stream_id: str,
+        *,
+        return_details: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        self.text_calls.append(
+            {"text": text, "stream_id": stream_id, "return_details": return_details, **kwargs}
+        )
+        if self.raise_on_text is not None:
+            raise self.raise_on_text
+        return self.text_result
 
 
 class _FakeHookInfo:

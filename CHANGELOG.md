@@ -2,6 +2,18 @@
 
 本项目变更记录，格式遵循 Keep a Changelog，语义化版本见 `_manifest.json`。
 
+## [0.3.0] - 2026-09-05
+
+### BREAKING
+
+- **项目全面改名**：`sending-emojis-plugin` → `repeater-plugin`。manifest id 从 `arcdent.sending-emojis-plugin` 变更为 `arcdent.repeater-plugin`（对 MaiBot 而言是新插件，已部署实例需按 README 迁移段落重装）；类名 `SendingEmojisPlugin`/`SendingEmojisConfig` → `RepeaterPlugin`/`RepeaterConfig`。发布时需同步 bump `_manifest.json` 的 version；GitHub 仓库与 MaiBot 容器目录改名由用户手动执行。
+
+### Added
+
+- **复读功能**：滚动时间窗口内同一**复读文本**（宽松归一比对，默认仅计不同发送者人头）累积达阈值后，麦麦掷骰三出口互斥决策——**复读**（把链内最后一条的原始**复读文本**作为一条新消息发出）、**打断**（只发变体池随机一条**打断文本**）、沉默。检测走 `chat.receive.before_process` hook observe 通路（零阻塞主链，ADR 0005），发送走 SDK 标准能力 `ctx.send.text`（消息进麦麦上下文）。
+- **链终结防护**：达标掷骰后（含沉默出口）即终结，按（群，**复读文本**）记 TTL 标记，防止一轮群友复读里麦麦多次出声；TTL 过期后新一轮可再触发（与表情槽同构）。
+- **复读独立群冷却与门禁**：与表情回应的群冷却分开计时；新增 `[repeat]` 配置节（enabled/window_seconds/threshold/distinct_senders/probability/interrupt_probability/interrupt_texts/chain_ttl_seconds/cooldown_seconds/max_text_length/max_chains）与 `scope.ignore_senders` 忽略发送者名单。复读/打断发送前按 `behavior.delay_min/max` 随机延迟。
+
 ## [0.2.0] - 2026-08-23
 
 ### Added

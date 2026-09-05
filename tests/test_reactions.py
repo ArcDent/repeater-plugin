@@ -29,6 +29,7 @@ from reactions import (
     parse_reaction_report,
     parse_self_qq,
     protocol_call_failed,
+    qq_set,
 )
 
 THUMBS_UP = str(ord("👍"))
@@ -226,6 +227,21 @@ def test_whitelist_limits_when_non_empty():
 def test_empty_lists_allow_everything_but_empty_group():
     assert group_allowed("1") is True
     assert group_allowed("") is False
+
+
+# ---- 名单归一（scope.ignore_reactors / ignore_senders 共用）----
+
+def test_qq_set_strips_and_filters_empty_entries():
+    assert qq_set([" 40004 ", "20002", "   ", ""]) == {"20002", "40004"}
+
+
+def test_qq_set_tolerates_none_and_empty_list():
+    assert qq_set(None) == set()
+    assert qq_set([]) == set()
+
+
+def test_qq_set_deduplicates_and_coerces_to_str():
+    assert qq_set([20002, "20002", "20003"]) == {"20002", "20003"}
 
 
 # ---- 决策 ----

@@ -1,7 +1,9 @@
-"""表情跟风插件。
+"""复读插件。
 
-群里有人给某条消息贴表情回应后，麦麦按概率跟着贴同款；触发表情命中反义映射时，
-按另一套概率贴语义相反的表情。术语见 CONTEXT.md，通路与取舍见 docs/adr/。
+聚合两个群聊行为：群内**复读链**达标后，麦麦按概率**复读**（把链内最后一条的
+**复读文本**原样发出），或按概率唱反调**打断**；有人给某条消息贴了**表情回应**
+后，麦麦按概率**跟风**贴同款，或按概率贴**反义回应**。术语见 CONTEXT.md，
+通路与取舍见 docs/adr/。
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ import aiohttp
 from aiohttp import web
 from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, HookHandler, MaiBotPlugin
 
-from .config import SendingEmojisConfig
+from .config import RepeaterConfig
 from .reactions import (
     OPPOSITE,
     Decision,
@@ -39,6 +41,15 @@ from .reactions import (
     parse_reaction_report,
     parse_self_qq,
     protocol_call_failed,
+    qq_set,
+)
+from .repeats import (
+    REPEAT,
+    TRIGGER,
+    RepeatDecision,
+    RepeatState,
+    decide_repeat,
+    extract_repeat_candidate,
 )
 
 _PROTOCOL_TIMEOUT_SECONDS = 10
@@ -47,12 +58,13 @@ _PROTOCOL_TIMEOUT_SECONDS = 10
 _INJECTION_FLUSH_TICK_SECONDS = 5
 
 
-class SendingEmojisPlugin(MaiBotPlugin):
-    config_model = SendingEmojisConfig
+class RepeaterPlugin(MaiBotPlugin):
+    config_model = RepeaterConfig
 
     _runner: web.AppRunner | None
     _site: web.BaseSite | None
     _state: ReactionState
+    _repeat_state: RepeatState
     _opposite_map: dict[str, str]
     _self_qq: str
     _tasks: set[asyncio.Task]
@@ -85,7 +97,7 @@ class SendingEmojisPlugin(MaiBotPlugin):
             await self._startup_checks()
         except Exception as exc:
             self.ctx.logger.warning(f"启动自检失败: {exc}")
-        self.ctx.logger.info("表情跟风插件已加载")
+        self.ctx.logger.info("复读插件已加载（复读与表情回应双行为）")
 
     async def on_unload(self) -> None:
         for task in list(self._tasks):
@@ -119,6 +131,14 @@ class SendingEmojisPlugin(MaiBotPlugin):
         self._state = ReactionState(
             slot_ttl_seconds=float(behavior.slot_ttl_seconds),
             max_slots=int(behavior.max_slots),
+        )
+        repeat = self.config.repeat
+        self._repeat_state = RepeatState(
+            window_seconds=float(repeat.window_seconds),
+            threshold=int(repeat.threshold),
+            distinct_senders=bool(repeat.distinct_senders),
+            chain_ttl_seconds=float(repeat.chain_ttl_seconds),
+            max_chains=int(repeat.max_chains),
         )
         configured_self_qq = str(self.config.protocol.self_qq or "").strip()
         if configured_self_qq:
@@ -257,7 +277,7 @@ class SendingEmojisPlugin(MaiBotPlugin):
         scope = self.config.scope
         if not group_allowed(event.group_id, scope.group_whitelist, scope.group_blacklist):
             return None
-        ignored = {str(qq).strip() for qq in (scope.ignore_reactors or []) if str(qq).strip()}
+        ignored = qq_set(scope.ignore_reactors)
         if event.reactor_qq and event.reactor_qq in ignored:
             return None
         # 麦麦自己贴的表情不触发跟风；表情槽是这条环路的兜底防护。
@@ -300,7 +320,7 @@ class SendingEmojisPlugin(MaiBotPlugin):
         scope = self.config.scope
         if not group_allowed(event.group_id, scope.group_whitelist, scope.group_blacklist):
             return
-        ignored = {str(qq).strip() for qq in (scope.ignore_reactors or []) if str(qq).strip()}
+        ignored = qq_set(scope.ignore_reactors)
         if event.reactor_qq and event.reactor_qq in ignored and event.reactor_qq != self._self_qq:
             return
 
@@ -474,6 +494,123 @@ class SendingEmojisPlugin(MaiBotPlugin):
             return {"action": "abort", "modified_kwargs": kwargs}
         return {"action": "continue", "modified_kwargs": kwargs}
 
+    # ---- 复读检测（chat.receive.before_process observe Hook）----
+
+    @HookHandler(
+        "chat.receive.before_process",
+        name="repeat_detector",
+        mode="observe",
+        order="late",
+        description="观测群消息累积复读链，达标后按概率把复读文本原样发出或发打断文本（ADR 0005）。",
+    )
+    async def observe_repeat(self, **kwargs: Any) -> dict[str, Any]:
+        """复读检测入口（observe 模式，主程序后台调度，返回值被吞）。
+
+        handler 全程不得抛异常：observe 任务的异常虽被主程序吞掉并记日志，
+        但等于复读检测静默失效，必须自查兜底。observe 不得返回
+        modified_kwargs（主程序会对该返回打 warning），只声明继续。
+        """
+        try:
+            await self._process_repeat_message(kwargs.get("message"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ctx.logger.warning(f"复读检测处理消息失败: {exc}")
+        return {"action": "continue"}
+
+    async def _process_repeat_message(self, message: Any) -> None:
+        """门禁 → 链累积 → 三出口决策；复读/打断出口写冷却后转后台发送。
+
+        从门禁到写冷却、spawn 为止没有任何 await 点：同群同文本的并发
+        observe 任务不可能在同一链上双触发（design D3 的同步原子段）。
+        """
+        repeat = self.config.repeat
+        if not self.config.plugin.enabled or not repeat.enabled:
+            return
+        if not isinstance(message, dict) or not isinstance(message.get("message_info"), dict):
+            # 形态漂移打 debug 不打 warning（design D4 / ADR 0005）：hook 每条
+            # 群消息都过，warning 会刷屏；序列化 SessionMessage 必含 dict 形态
+            # 的 message_info（主程序 message_utils._session_message_to_dict）。
+            self.ctx.logger.debug(f"复读检测收到形态异常的消息: {str(message)[:120]}")
+            return
+        candidate = extract_repeat_candidate(
+            message,
+            self_qq=self._self_qq,
+            max_text_length=int(repeat.max_text_length),
+        )
+        if candidate is None:
+            # 私聊/通知/富媒体/命令/超长/麦麦自己：合法非候选，静默返回。
+            return
+        scope = self.config.scope
+        if not group_allowed(candidate.group_id, scope.group_whitelist, scope.group_blacklist):
+            return
+        if candidate.sender_qq in qq_set(scope.ignore_senders):
+            return
+
+        now = time.time()
+        suppressed = self._repeat_state.is_cooling_down(
+            candidate.group_id, float(repeat.cooldown_seconds), now
+        )
+        result = self._repeat_state.record(
+            candidate.group_id,
+            candidate.sender_qq,
+            candidate.text,
+            now,
+            suppress_trigger=suppressed,
+        )
+        if result.status != TRIGGER:
+            return
+
+        decision = decide_repeat(
+            result.text,
+            probability=repeat.probability,
+            interrupt_probability=repeat.interrupt_probability,
+            interrupt_texts=repeat.interrupt_texts,
+            roll=random.random,
+        )
+        if decision is None:
+            # 沉默出口：资格已在 record 内消耗（链终结同样成立），但不进群冷却。
+            self.ctx.logger.info(
+                f"复读链达标后保持沉默 group={candidate.group_id} text={result.text!r}"
+            )
+            return
+        if decision.used_default_pool:
+            # 空池回落内置默认池（design D5）：回落事实由决策结果携带，此处
+            # 只读标志记 warning，不静默哑火，也不重复推断池是否为空。
+            self.ctx.logger.warning("打断文本池为空，已回落内置默认池")
+        # 复读/打断出口：先写冷却再转后台发送——发送成败不影响已进入的冷却。
+        self._repeat_state.mark_group(candidate.group_id, now)
+        self.ctx.logger.info(
+            f"复读链达标 group={candidate.group_id} {decision.reason} text={result.text!r}"
+        )
+        self._spawn(self._send_repeat_decision(candidate.group_id, decision))
+
+    async def _send_repeat_decision(self, group_id: str, decision: RepeatDecision) -> None:
+        """经标准发送链发出复读/打断文本（design D5）：延迟 → 取流 → ctx.send.text。
+
+        消息走主程序发送链、进麦麦上下文；延迟复用 behavior.delay_min/max 的
+        节奏，避免决策即发的机械感。发送异常或失败只记 warning，不重试不抛：
+        冷却与链终结在出口命中时已写入，与本任务的成败解耦。
+        """
+        try:
+            await self._delay()
+            stream_id = await self._get_stream_id(group_id)
+            if not stream_id:
+                self.ctx.logger.warning(f"取不到群 {group_id} 的 stream，复读/打断未发出")
+                return
+            response = await self.ctx.send.text(decision.text, stream_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ctx.logger.warning(f"复读/打断发送失败（ctx.send.text 异常）: {exc}")
+            return
+        if not response or (isinstance(response, dict) and not response.get("sent")):
+            # SDK 未开 return_details 时返回 bool；开了则返回 SendResult dict。
+            self.ctx.logger.warning(f"复读/打断发送失败: {response}")
+            return
+        kind = "复读" if decision.kind == REPEAT else "打断文本"
+        self.ctx.logger.info(f"已发出{kind} group={group_id} text={decision.text!r}")
+
     async def _is_self_message(self, message_id: str, now: float) -> bool:
         """被回应消息的原作者是否是麦麦自己。查不到时按他人消息处理。"""
         if not self._self_qq:
@@ -595,5 +732,5 @@ class SendingEmojisPlugin(MaiBotPlugin):
             )
 
 
-def create_plugin() -> SendingEmojisPlugin:
-    return SendingEmojisPlugin()
+def create_plugin() -> RepeaterPlugin:
+    return RepeaterPlugin()

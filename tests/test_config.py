@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from config import SendingEmojisConfig
+from config import RepeaterConfig
 
 try:
     import tomllib
@@ -28,7 +28,7 @@ REQUIRED_CAPABILITIES = {
 
 
 def test_default_probabilities():
-    config = SendingEmojisConfig()
+    config = RepeaterConfig()
     assert config.plugin.enabled is True
     assert config.bandwagon.probability == 0.25
     assert config.bandwagon.self_message_probability == 0.12
@@ -39,35 +39,35 @@ def test_default_probabilities():
 
 def test_self_message_probability_not_higher_than_others():
     """给麦麦自己的消息跟风应更保守，否则观感像自吹。"""
-    config = SendingEmojisConfig()
+    config = RepeaterConfig()
     assert config.bandwagon.self_message_probability <= config.bandwagon.probability
 
 
 def test_default_webhook_port_avoids_friend_request_plugin():
-    config = SendingEmojisConfig()
+    config = RepeaterConfig()
     assert config.webhook.port == 18081
     assert config.webhook.path.startswith("/")
 
 
 def test_delay_window_is_ordered():
-    config = SendingEmojisConfig()
+    config = RepeaterConfig()
     assert config.behavior.delay_min_seconds <= config.behavior.delay_max_seconds
 
 
 def test_list_fields_are_independent_per_instance():
-    first, second = SendingEmojisConfig(), SendingEmojisConfig()
+    first, second = RepeaterConfig(), RepeaterConfig()
     first.scope.group_blacklist.append("10001")
     assert second.scope.group_blacklist == []
 
 
 def test_all_sections_present():
-    config = SendingEmojisConfig()
-    for section in ("plugin", "webhook", "protocol", "bandwagon", "opposite", "behavior", "context", "scope"):
+    config = RepeaterConfig()
+    for section in ("plugin", "webhook", "protocol", "bandwagon", "opposite", "repeat", "behavior", "context", "scope"):
         assert getattr(config, section) is not None
 
 
 def test_context_section_defaults():
-    cfg = SendingEmojisConfig()
+    cfg = RepeaterConfig()
     assert cfg.context.enabled is False
     assert cfg.context.dedup_ttl_seconds == 3600
     assert cfg.context.merge_window_seconds == 30
@@ -76,7 +76,7 @@ def test_context_section_defaults():
 
 
 def test_context_section_accepts_overrides():
-    cfg = SendingEmojisConfig(context={"enabled": True, "dedup_ttl_seconds": 120,
+    cfg = RepeaterConfig(context={"enabled": True, "dedup_ttl_seconds": 120,
                                        "merge_window_seconds": 5,
                                        "max_reactions_per_message": 3,
                                        "self_display_name": "麦麦"})
@@ -87,12 +87,62 @@ def test_context_section_accepts_overrides():
     assert cfg.context.self_display_name == "麦麦"
 
 
+def test_repeat_section_defaults():
+    """repeat 节默认值与 design D6 表逐项一致（独立字面量，不引自实现）。"""
+    cfg = RepeaterConfig()
+    assert cfg.repeat.enabled is True
+    assert cfg.repeat.window_seconds == 120
+    assert cfg.repeat.threshold == 3
+    assert cfg.repeat.distinct_senders is True
+    assert cfg.repeat.probability == 0.6
+    assert cfg.repeat.interrupt_probability == 0.15
+    assert cfg.repeat.interrupt_texts == ["打断！", "够了！", "停！", "打住！", "别念了！"]
+    assert cfg.repeat.chain_ttl_seconds == 1800
+    assert cfg.repeat.cooldown_seconds == 120
+    assert cfg.repeat.max_text_length == 200
+    assert cfg.repeat.max_chains == 2000
+
+
+def test_repeat_interrupt_texts_independent_per_instance():
+    """打断文本池是可变列表，两个实例不得共享同一份默认值。"""
+    first, second = RepeaterConfig(), RepeaterConfig()
+    first.repeat.interrupt_texts.append("自定义")
+    assert second.repeat.interrupt_texts == ["打断！", "够了！", "停！", "打住！", "别念了！"]
+
+
+def test_scope_ignore_senders_defaults_empty():
+    """scope.ignore_senders 默认空列表，与 ignore_reactors 并列。"""
+    cfg = RepeaterConfig()
+    assert cfg.scope.ignore_senders == []
+
+
+@pytest.mark.skipif(tomllib is None, reason="需要 Python 3.11+ 的 tomllib")
+def test_config_toml_repeat_defaults_match_design():
+    """[repeat] 节与 [scope].ignore_senders 的 toml 默认值与 design D6 表逐项一致（独立字面量）。"""
+    with CONFIG_TOML.open("rb") as fp:
+        raw = tomllib.load(fp)
+    repeat = raw.get("repeat")
+    assert isinstance(repeat, dict), "config.toml 缺少 [repeat] 节"
+    assert repeat["enabled"] is True
+    assert repeat["window_seconds"] == 120
+    assert repeat["threshold"] == 3
+    assert repeat["distinct_senders"] is True
+    assert repeat["probability"] == 0.6
+    assert repeat["interrupt_probability"] == 0.15
+    assert repeat["interrupt_texts"] == ["打断！", "够了！", "停！", "打住！", "别念了！"]
+    assert repeat["chain_ttl_seconds"] == 1800
+    assert repeat["cooldown_seconds"] == 120
+    assert repeat["max_text_length"] == 200
+    assert repeat["max_chains"] == 2000
+    assert raw["scope"]["ignore_senders"] == []
+
+
 @pytest.mark.skipif(tomllib is None, reason="需要 Python 3.11+ 的 tomllib")
 def test_config_toml_matches_model_defaults():
     assert tomllib is not None
     with CONFIG_TOML.open("rb") as fp:
         raw = tomllib.load(fp)
-    config = SendingEmojisConfig()
+    config = RepeaterConfig()
 
     for section_name, entries in raw.items():
         section = getattr(config, section_name, None)
@@ -106,12 +156,16 @@ def test_config_toml_matches_model_defaults():
 
 
 def test_manifest_declares_injection_capabilities():
-    """The manifest must declare every capability the injection path consumes."""
+    """The manifest must declare every capability the injection path consumes.
+
+    注入能力改用包含断言：repeat-and-rebrand 起 capabilities 还声明了复读
+    观测的 chat.receive.before_process（完整集合由 test_plugin.py 的
+    manifest 断言钉死）。
+    """
     with MANIFEST_JSON.open("r", encoding="utf-8") as fp:
         manifest = json.load(fp)
     capabilities = manifest.get("capabilities")
     assert isinstance(capabilities, list), "_manifest.json 缺少 capabilities 数组"
-    assert set(capabilities) == REQUIRED_CAPABILITIES, (
-        f"manifest capabilities 漂移: 缺 {REQUIRED_CAPABILITIES - set(capabilities)}，"
-        f"多 {set(capabilities) - REQUIRED_CAPABILITIES}"
+    assert REQUIRED_CAPABILITIES <= set(capabilities), (
+        f"manifest capabilities 漂移: 缺 {REQUIRED_CAPABILITIES - set(capabilities)}"
     )

@@ -1,4 +1,4 @@
-"""表情跟风插件 — 纯逻辑层。
+"""复读插件 — 表情回应域纯逻辑层。
 
 只包含不依赖 maibot_sdk 的纯函数与纯内存状态：上报解析、表情 ID 归一、
 反义映射构建、跟风/反义决策、表情槽与群冷却。编排逻辑在 plugin.py。
@@ -235,7 +235,13 @@ def group_allowed(
     return True
 
 
-def _clamp(probability: Any) -> float:
+def qq_set(qq_list: Any) -> set[str]:
+    """配置层 QQ 名单 → 去空白去重的集合（ignore_reactors/ignore_senders 共用）。"""
+    return {str(qq).strip() for qq in (qq_list or ()) if str(qq).strip()}
+
+
+def clamp_probability(probability: Any) -> float:
+    """概率归一：非数值或负数按 0，超过 1 按 1。决策函数的统一入口。"""
     try:
         value = float(probability)
     except (TypeError, ValueError):
@@ -243,6 +249,27 @@ def _clamp(probability: Any) -> float:
     if value <= 0.0:
         return 0.0
     return min(1.0, value)
+
+
+class GroupCooldown:
+    """群级发送冷却时钟。表情回应域与复读域各持**独立实例**（分开计时是
+    spec 要求，互不牵扯），只共用方法体：mark_group 记录起点，
+    is_cooling_down 判定窗口。冷却记录无 TTL，随实例生命周期存续。"""
+
+    def __init__(self) -> None:
+        self._last_sent: dict[str, float] = {}
+
+    def is_cooling_down(self, group_id: str, cooldown_seconds: float, now: float) -> bool:
+        cooldown = max(float(cooldown_seconds), 0.0)
+        if cooldown <= 0.0:
+            return False
+        last = self._last_sent.get(str(group_id or ""))
+        return last is not None and now - last < cooldown
+
+    def mark_group(self, group_id: str, now: float) -> None:
+        key = str(group_id or "")
+        if key:
+            self._last_sent[key] = now
 
 
 def decide_reaction(
@@ -266,7 +293,7 @@ def decide_reaction(
     if event.removed:
         return None
 
-    respond_probability = _clamp(
+    respond_probability = clamp_probability(
         self_message_probability if is_self_message else bandwagon_probability
     )
     if respond_probability <= 0.0:
@@ -276,7 +303,7 @@ def decide_reaction(
 
     opposite_id = opposite_map.get(event.emoji_id, "")
     if opposite_id:
-        probability = _clamp(opposite_probability)
+        probability = clamp_probability(opposite_probability)
         if probability > 0.0 and roll() < probability:
             return Decision(
                 kind=OPPOSITE,
@@ -362,7 +389,7 @@ class ReactionState:
         self.slot_ttl_seconds = max(float(slot_ttl_seconds), 0.0)
         self.max_slots = max(int(max_slots), 1)
         self._slots: dict[str, float] = {}
-        self._group_last_sent: dict[str, float] = {}
+        self._group_cooldown = GroupCooldown()
         self._authors: dict[str, tuple[float, str]] = {}
 
     def is_slot_taken(self, message_id: str, now: float) -> bool:
@@ -383,16 +410,10 @@ class ReactionState:
         self.prune(now)
 
     def is_cooling_down(self, group_id: str, cooldown_seconds: float, now: float) -> bool:
-        cooldown = max(float(cooldown_seconds), 0.0)
-        if cooldown <= 0.0:
-            return False
-        last = self._group_last_sent.get(str(group_id or ""))
-        return last is not None and now - last < cooldown
+        return self._group_cooldown.is_cooling_down(group_id, cooldown_seconds, now)
 
     def mark_group(self, group_id: str, now: float) -> None:
-        key = str(group_id or "")
-        if key:
-            self._group_last_sent[key] = now
+        self._group_cooldown.mark_group(group_id, now)
 
     def remember_author(self, message_id: str, author_qq: str, now: float) -> None:
         """缓存被回应消息的原作者，避免同一条消息被多人贴表情时重复查协议端。"""

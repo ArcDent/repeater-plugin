@@ -1,0 +1,545 @@
+"""repeats.py pure-logic tests: normalization, message qualification,
+chain state machine, three-outlet decision."""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+# repeats.py uses package-relative imports like plugin.py; the root
+# conftest registers the hyphenated repo dir as the synthetic package
+# "sending_emojis_plugin" and only aliases plugin/config/reactions at
+# top level, so repeats is imported through the package name.
+from sending_emojis_plugin.repeats import (
+    ACCUMULATE,
+    DEFAULT_INTERRUPT_TEXTS,
+    INTERRUPT,
+    REPEAT,
+    SUPPRESSED,
+    TERMINATED,
+    TRIGGER,
+    RepeatState,
+    decide_repeat,
+    extract_repeat_candidate,
+    normalize_repeat_text,
+)
+
+GROUP_ID = "10001"
+BOT_QQ = "40004"
+
+
+def _message(
+    text: str = "草",
+    sender: str = "20002",
+    group: str | None = GROUP_ID,
+    is_notify: bool = False,
+    segments: list | None = None,
+) -> dict:
+    """Build a serialized SessionMessage dict in the hook payload shape.
+
+    group=None writes group_info: None, the real private-chat form from
+    _message_info_to_dict (the key is present, the value is None).
+    """
+    if segments is None:
+        segments = [{"type": "text", "data": text}]
+    message_info: dict = {"user_info": {"user_id": sender, "user_nickname": "某人"}}
+    if group is None:
+        message_info["group_info"] = None
+    else:
+        message_info["group_info"] = {"group_id": group, "group_name": "某群"}
+    return {
+        "is_notify": is_notify,
+        "message_info": message_info,
+        "raw_message": segments,
+    }
+
+
+# ---- normalize_repeat_text ----
+
+def test_normalize_trims_and_collapses_whitespace():
+    assert normalize_repeat_text(" 草 ") == "草"
+    assert normalize_repeat_text("哈  哈") == "哈 哈"
+    assert normalize_repeat_text("\t哈\n\n 哈喽 \t") == "哈 哈喽"
+
+
+def test_normalize_is_case_insensitive():
+    assert normalize_repeat_text("HHH") == "hhh"
+    assert normalize_repeat_text("HHH") == normalize_repeat_text("hhh")
+
+
+def test_normalize_empty_and_blank_inputs_do_not_crash():
+    assert normalize_repeat_text("") == ""
+    assert normalize_repeat_text("   \t\n ") == ""
+    assert normalize_repeat_text(None) == ""
+
+
+# ---- extract_repeat_candidate ----
+
+def test_pure_text_message_yields_candidate_with_raw_text():
+    candidate = extract_repeat_candidate(_message(" 草 "), self_qq=BOT_QQ)
+    assert candidate is not None
+    assert candidate.group_id == GROUP_ID
+    assert candidate.sender_qq == "20002"
+    assert candidate.text == " 草 "  # raw text, whitespace preserved
+
+
+def test_multiple_text_segments_are_concatenated_raw():
+    segments = [
+        {"type": "text", "data": "哈"},
+        {"type": "text", "data": " 哈喽 "},
+    ]
+    candidate = extract_repeat_candidate(_message(segments=segments))
+    assert candidate is not None
+    assert candidate.text == "哈 哈喽 "
+
+
+def test_numeric_ids_are_coerced_to_strings():
+    message = _message()
+    message["message_info"]["group_info"] = {"group_id": 10001, "group_name": "某群"}
+    message["message_info"]["user_info"] = {"user_id": 20002, "user_nickname": "某人"}
+    candidate = extract_repeat_candidate(message)
+    assert candidate is not None
+    assert candidate.group_id == "10001"
+    assert candidate.sender_qq == "20002"
+
+
+def test_components_dict_form_is_tolerated():
+    message = _message()
+    message["raw_message"] = {"components": [{"type": "text", "data": "草"}]}
+    candidate = extract_repeat_candidate(message)
+    assert candidate is not None
+    assert candidate.text == "草"
+
+
+@pytest.mark.parametrize("segment", [
+    {"type": "at", "data": {"target_user_id": "40004"}},
+    {"type": "reply", "data": "555"},
+    {"type": "image", "data": "base64...", "hash": "abc"},
+    {"type": "face", "data": "76"},
+    {"type": "emoji", "data": "[表情包]", "hash": "abc"},
+])
+def test_message_with_non_text_segment_is_rejected(segment):
+    message = _message(segments=[{"type": "text", "data": "草"}, segment])
+    assert extract_repeat_candidate(message) is None
+
+
+def test_notify_message_is_rejected():
+    assert extract_repeat_candidate(_message(is_notify=True)) is None
+
+
+def test_command_message_is_rejected():
+    assert extract_repeat_candidate(_message("/help")) is None
+    assert extract_repeat_candidate(_message("  /help  ")) is None
+
+
+def test_over_length_text_is_rejected():
+    assert extract_repeat_candidate(_message("草" * 201), max_text_length=200) is None
+    # exactly at the limit still qualifies
+    candidate = extract_repeat_candidate(_message("草" * 200), max_text_length=200)
+    assert candidate is not None
+
+
+def test_self_message_is_rejected():
+    assert extract_repeat_candidate(_message(sender=BOT_QQ), self_qq=BOT_QQ) is None
+
+
+def test_private_chat_is_rejected():
+    assert extract_repeat_candidate(_message(group=None)) is None
+
+
+def test_blank_text_is_rejected():
+    assert extract_repeat_candidate(_message("   ")) is None
+    assert extract_repeat_candidate(_message(segments=[])) is None
+
+
+@pytest.mark.parametrize("message", [
+    None,
+    "not a dict",
+    12345,
+    {},
+    {"is_notify": False},
+    {"message_info": "garbage", "raw_message": []},
+    {"message_info": {}},
+    {"message_info": {"group_info": None, "user_info": {"user_id": "20002"}}, "raw_message": []},
+    {"message_info": {"group_info": {"group_id": ""}, "user_info": {"user_id": "20002"}}, "raw_message": []},
+    {"message_info": {"group_info": {"group_id": "10001"}, "user_info": {}}, "raw_message": []},
+    {"message_info": {"group_info": {"group_id": "10001"}, "user_info": {"user_id": "20002"}}},
+    {"message_info": {"group_info": {"group_id": "10001"}, "user_info": {"user_id": "20002"}}, "raw_message": "garbage"},
+    {"message_info": {"group_info": {"group_id": "10001"}, "user_info": {"user_id": "20002"}}, "raw_message": {"components": "garbage"}},
+    {"message_info": {"group_info": {"group_id": "10001"}, "user_info": {"user_id": "20002"}}, "raw_message": ["text"]},
+    {"message_info": {"group_info": {"group_id": "10001"}, "user_info": {"user_id": "20002"}}, "raw_message": [{"data": "草"}]},
+    {"message_info": {"group_info": {"group_id": "10001"}, "user_info": {"user_id": "20002"}}, "raw_message": [{"type": "text", "data": 123}]},
+])
+def test_malformed_payloads_return_none(message):
+    assert extract_repeat_candidate(message, self_qq=BOT_QQ) is None
+
+
+# ---- RepeatState ----
+
+def _state(**overrides) -> RepeatState:
+    params = {
+        "window_seconds": 120.0,
+        "threshold": 3,
+        "distinct_senders": True,
+        "chain_ttl_seconds": 1800.0,
+        "max_chains": 2000,
+    }
+    params.update(overrides)
+    return RepeatState(**params)
+
+
+def test_three_distinct_senders_trigger():
+    state = _state()
+    now = time.time()
+    assert state.record("10001", "A", "草", now).status == ACCUMULATE
+    assert state.record("10001", "B", "草", now + 1).status == ACCUMULATE
+    assert state.record("10001", "C", "草", now + 2).status == TRIGGER
+
+
+def test_chain_key_spans_lenient_normalization():
+    """首尾空白不打散链: "草" and " 草 " feed the same chain."""
+    state = _state(threshold=3)
+    now = time.time()
+    assert state.record("10001", "A", "草", now).status == ACCUMULATE
+    assert state.record("10001", "B", " 草 ", now + 1).status == ACCUMULATE
+    assert state.record("10001", "C", "草", now + 2).status == TRIGGER
+
+
+def test_chain_key_is_case_insensitive():
+    state = _state(threshold=2)
+    now = time.time()
+    assert state.record("10001", "A", "HHH", now).status == ACCUMULATE
+    assert state.record("10001", "B", "hhh", now + 1).status == TRIGGER
+
+
+def test_same_sender_does_not_increase_count():
+    state = _state(threshold=3, distinct_senders=True)
+    now = time.time()
+    assert state.record("10001", "A", "草", now).status == ACCUMULATE
+    assert state.record("10001", "A", "草", now + 1).status == ACCUMULATE
+    assert state.record("10001", "A", "草", now + 2).status == ACCUMULATE  # one distinct sender
+
+
+def test_per_message_counting_when_distinct_senders_disabled():
+    state = _state(threshold=3, distinct_senders=False)
+    now = time.time()
+    assert state.record("10001", "A", "草", now).status == ACCUMULATE
+    assert state.record("10001", "A", "草", now + 1).status == ACCUMULATE
+    assert state.record("10001", "A", "草", now + 2).status == TRIGGER
+
+
+def test_trigger_carries_last_raw_text_not_normalized():
+    state = _state(threshold=2)
+    now = time.time()
+    state.record("10001", "A", "草", now)
+    result = state.record("10001", "B", " 草 ", now + 1)
+    assert result.status == TRIGGER
+    assert result.text == " 草 "  # raw text of the chain's last message
+
+
+def test_window_rolling_expires_early_entries():
+    state = _state(threshold=3, window_seconds=60.0)
+    now = time.time()
+    assert state.record("10001", "A", "草", now).status == ACCUMULATE
+    # A's entry is now older than the window: only B, C, D count
+    later = now + 61
+    assert state.record("10001", "B", "草", later).status == ACCUMULATE
+    assert state.record("10001", "C", "草", later + 1).status == ACCUMULATE
+    assert state.record("10001", "D", "草", later + 2).status == TRIGGER
+
+
+def test_followup_senders_get_no_qualification_within_marker_ttl():
+    state = _state(threshold=3, chain_ttl_seconds=1800.0)
+    now = time.time()
+    state.record("10001", "A", "草", now)
+    state.record("10001", "B", "草", now + 1)
+    state.record("10001", "C", "草", now + 2)  # trigger, marker written
+    # The qualification is consumed inside record(), before any dice —
+    # whichever outlet the caller later rolls (silence included), D and
+    # E only extend the record within the marker TTL.
+    assert state.record("10001", "D", "草", now + 10).status == TERMINATED
+    assert state.record("10001", "E", "草", now + 11).status == TERMINATED
+
+
+def test_new_round_triggers_after_marker_ttl_expiry():
+    state = _state(threshold=3, chain_ttl_seconds=100.0, window_seconds=50.0)
+    now = time.time()
+    state.record("10001", "A", "草", now)
+    state.record("10001", "B", "草", now + 1)
+    state.record("10001", "C", "草", now + 2)  # trigger + marker at now+2
+    # Both the marker TTL (100s) and the window (50s) have elapsed.
+    later = now + 200
+    assert state.record("10001", "A", "草", later).status == ACCUMULATE
+    assert state.record("10001", "B", "草", later + 1).status == ACCUMULATE
+    assert state.record("10001", "C", "草", later + 2).status == TRIGGER
+
+
+def test_terminated_sender_entry_counts_after_marker_expiry():
+    """只续记录: a sender arriving while the marker is active still gets an
+    entry; once the marker expires and the original senders have fallen out
+    of the window, that entry counts toward the next qualification."""
+    state = _state(threshold=2, chain_ttl_seconds=50.0, window_seconds=100.0)
+    now = time.time()
+    state.record("10001", "A", "草", now)
+    state.record("10001", "B", "草", now + 1)
+    state.record("10001", "C", "草", now + 2)  # trigger, marker at now+2
+    assert state.record("10001", "D", "草", now + 10).status == TERMINATED
+    # At now+105: marker expired (103 > 50), A/B/C entries out of the
+    # 100s window, D's entry (now+10) still inside — D + E reach 2.
+    assert state.record("10001", "E", "草", now + 105).status == TRIGGER
+
+
+def test_chains_are_scoped_per_group():
+    state = _state(threshold=2)
+    now = time.time()
+    assert state.record("10001", "A", "草", now).status == ACCUMULATE
+    # Same text in another group is a different chain: B alone doesn't reach 2
+    assert state.record("10002", "B", "草", now + 1).status == ACCUMULATE
+
+
+def test_max_chains_evicts_least_recently_active_chain():
+    state = _state(threshold=2, window_seconds=3600.0, max_chains=1)
+    now = time.time()
+    assert state.record("10001", "A", "草", now).status == ACCUMULATE
+    # Recording another text overflows max_chains=1: the least recently
+    # active chain ("草") is evicted.
+    assert state.record("10001", "A", "哈哈", now + 1).status == ACCUMULATE
+    # "草" starts a fresh chain: B alone cannot reach threshold 2
+    assert state.record("10001", "B", "草", now + 2).status == ACCUMULATE
+
+
+def test_eviction_drops_the_termination_marker_with_the_chain():
+    state = _state(threshold=2, window_seconds=3600.0, max_chains=1)
+    now = time.time()
+    state.record("10001", "A", "草", now)
+    state.record("10001", "B", "草", now + 1)  # trigger, marker written
+    # Evicting the "草" chain takes its marker along (终结标记随链淘汰)
+    state.record("10001", "A", "哈哈", now + 2)
+    # A fresh round for "草" may qualify again immediately
+    assert state.record("10001", "A", "草", now + 3).status == ACCUMULATE
+    assert state.record("10001", "B", "草", now + 4).status == TRIGGER
+
+
+# ---- 冷却压制（suppress_trigger 与复读专用群冷却）----
+
+def test_suppressed_threshold_consumes_no_qualification():
+    """冷却压制：压制期间达标不写终结标记、不消耗资格。
+
+    压制结束后新发送者的消息到达时，链已达标的直接取得资格（group 3 报告的
+    API 缺口；spec「冷却期内达标不掷骰」场景的状态机层语义）。
+    """
+    state = _state(threshold=3, chain_ttl_seconds=1800.0)
+    now = time.time()
+    assert state.record("10001", "A", "草", now, suppress_trigger=True).status == ACCUMULATE
+    assert state.record("10001", "B", "草", now + 1, suppress_trigger=True).status == ACCUMULATE
+    assert state.record("10001", "C", "草", now + 2, suppress_trigger=True).status == SUPPRESSED
+    # 压制持续期间：后续发送者照常累积（仍达标、仍压制），始终不写终结标记
+    assert state.record("10001", "D", "草", now + 3, suppress_trigger=True).status == SUPPRESSED
+    # 压制结束：这一次 record 直接取得资格，触发携带链内最后一条原始文本
+    result = state.record("10001", "E", " 草 ", now + 10)
+    assert result.status == TRIGGER
+    assert result.text == " 草 "
+
+
+def test_active_marker_terminates_even_when_suppressed():
+    """终结标记优先于压制：资格已消耗的链在标记 TTL 内不因压制复活。"""
+    state = _state(threshold=2, chain_ttl_seconds=1800.0)
+    now = time.time()
+    state.record("10001", "A", "草", now)
+    state.record("10001", "B", "草", now + 1)  # TRIGGER，写终结标记
+    assert state.record("10001", "C", "草", now + 2, suppress_trigger=True).status == TERMINATED
+
+
+def test_unsuppressed_trigger_still_consumes_qualification():
+    """未压制时既有语义不变：达标即写终结标记（沉默口径同样终结）。"""
+    state = _state(threshold=2, chain_ttl_seconds=1800.0)
+    now = time.time()
+    assert state.record("10001", "A", "草", now).status == ACCUMULATE
+    assert state.record("10001", "B", "草", now + 1).status == TRIGGER
+    assert state.record("10001", "C", "草", now + 2).status == TERMINATED
+
+
+def test_group_repeat_cooldown_marks_and_expires():
+    """复读专用群冷却：与 reactions.ReactionState 的表情群冷却互不相干。"""
+    state = RepeatState()
+    now = time.time()
+    assert state.is_cooling_down("10001", 120.0, now) is False
+    state.mark_group("10001", now)
+    assert state.is_cooling_down("10001", 120.0, now + 119.9) is True
+    assert state.is_cooling_down("10001", 120.0, now + 120.0) is False
+
+
+def test_group_repeat_cooldown_zero_disables():
+    state = RepeatState()
+    now = time.time()
+    state.mark_group("10001", now)
+    assert state.is_cooling_down("10001", 0.0, now) is False
+
+
+def test_group_repeat_cooldown_scoped_per_group():
+    state = RepeatState()
+    now = time.time()
+    state.mark_group("10001", now)
+    assert state.is_cooling_down("10002", 120.0, now) is False
+
+
+# ---- decide_repeat ----
+
+def _roll_never_called():
+    raise AssertionError("both probabilities are 0 — no roll should happen")
+
+
+def test_repeat_outlet_when_roll_below_probability():
+    decision = decide_repeat(
+        " 草 ",
+        probability=0.6,
+        interrupt_probability=0.15,
+        roll=lambda: 0.5,
+    )
+    assert decision is not None
+    assert decision.kind == REPEAT
+    assert decision.text == " 草 "  # carries the raw text
+
+
+def test_interrupt_outlet_starts_at_the_probability_boundary():
+    decision = decide_repeat(
+        "草",
+        probability=0.6,
+        interrupt_probability=0.15,
+        interrupt_texts=["停！"],
+        roll=lambda: 0.6,  # roll == probability → interrupt range, not repeat
+        choice=lambda pool: pool[0],
+    )
+    assert decision is not None
+    assert decision.kind == INTERRUPT
+    assert decision.text == "停！"  # interrupt text only, never the repeat text
+
+
+def test_silence_when_both_outlets_miss():
+    decision = decide_repeat(
+        "草",
+        probability=0.6,
+        interrupt_probability=0.15,
+        roll=lambda: 0.9,
+    )
+    assert decision is None
+
+
+def test_silence_when_roll_reaches_one():
+    decision = decide_repeat(
+        "草",
+        probability=0.6,
+        interrupt_probability=0.15,
+        roll=lambda: 0.999999,
+    )
+    assert decision is None
+
+
+def test_interrupt_picks_from_the_configured_pool():
+    picked: list[list[str]] = []
+
+    def fake_choice(pool):
+        picked.append(list(pool))
+        return pool[-1]
+
+    decision = decide_repeat(
+        "草",
+        probability=0.0,
+        interrupt_probability=1.0,
+        interrupt_texts=["够了！", "停！"],
+        roll=lambda: 0.3,
+        choice=fake_choice,
+    )
+    assert decision is not None
+    assert decision.kind == INTERRUPT
+    assert decision.text == "停！"
+    assert picked == [["够了！", "停！"]]
+
+
+def test_empty_interrupt_pool_falls_back_to_builtin_defaults():
+    picked: list[list[str]] = []
+
+    def fake_choice(pool):
+        picked.append(list(pool))
+        return pool[0]
+
+    decision = decide_repeat(
+        "草",
+        probability=0.0,
+        interrupt_probability=1.0,
+        interrupt_texts=[],
+        roll=lambda: 0.3,
+        choice=fake_choice,
+    )
+    assert decision is not None
+    assert decision.kind == INTERRUPT
+    assert picked == [list(DEFAULT_INTERRUPT_TEXTS)]
+    assert decision.text == DEFAULT_INTERRUPT_TEXTS[0]
+    # 回落事实由决策结果携带（used_default_pool），调用方只读标志打 warning
+    assert decision.used_default_pool is True
+
+
+def test_configured_pool_keeps_used_default_pool_false():
+    decision = decide_repeat(
+        "草",
+        probability=0.0,
+        interrupt_probability=1.0,
+        interrupt_texts=["够了！", "停！"],
+        roll=lambda: 0.3,
+    )
+    assert decision is not None
+    assert decision.kind == INTERRUPT
+    assert decision.used_default_pool is False
+
+
+def test_repeat_outlet_carries_used_default_pool_false():
+    decision = decide_repeat(
+        " 草 ",
+        probability=0.6,
+        interrupt_probability=0.15,
+        roll=lambda: 0.5,
+    )
+    assert decision is not None
+    assert decision.kind == REPEAT
+    assert decision.used_default_pool is False
+
+
+def test_all_blank_pool_falls_back_to_builtin_defaults():
+    decision = decide_repeat(
+        "草",
+        probability=0.0,
+        interrupt_probability=1.0,
+        interrupt_texts=["   ", ""],
+        roll=lambda: 0.3,
+    )
+    assert decision is not None
+    assert decision.kind == INTERRUPT
+    assert decision.text in DEFAULT_INTERRUPT_TEXTS
+    assert decision.used_default_pool is True
+
+
+def test_missing_interrupt_pool_falls_back_to_builtin_defaults():
+    decision = decide_repeat(
+        "草",
+        probability=0.0,
+        interrupt_probability=1.0,
+        interrupt_texts=None,
+        roll=lambda: 0.3,
+    )
+    assert decision is not None
+    assert decision.kind == INTERRUPT
+    assert decision.text in DEFAULT_INTERRUPT_TEXTS
+    assert decision.used_default_pool is True
+
+
+def test_zero_probabilities_skip_the_roll():
+    assert decide_repeat(
+        "草", probability=0.0, interrupt_probability=0.0, roll=_roll_never_called
+    ) is None
+
+
+def test_garbage_probability_is_treated_as_zero():
+    assert decide_repeat(
+        "草", probability="很高", interrupt_probability=0.0, roll=_roll_never_called
+    ) is None

@@ -1,10 +1,17 @@
-"""表情跟风插件 — 配置模型。"""
+"""复读插件 — 配置模型。
+
+覆盖两个行为域：**复读**（**复读链**达标后按概率**复读**或**打断**）与
+**表情回应**（按概率**跟风**或**反义回应**）。字段默认值须与 config.toml
+逐项一致（项目铁律）。术语见 CONTEXT.md。
+"""
 
 from __future__ import annotations
 
 from typing import ClassVar
 
 from maibot_sdk import Field, PluginConfigBase
+
+from .repeats import DEFAULT_INTERRUPT_TEXTS
 
 
 class PluginSection(PluginConfigBase):
@@ -198,9 +205,121 @@ class OppositeSection(PluginConfigBase):
     )
 
 
+class RepeatSection(PluginConfigBase):
+    __ui_label__: ClassVar[str] = "复读"
+    __ui_order__: ClassVar[int] = 5
+
+    enabled: bool = Field(
+        default=True,
+        json_schema_extra={
+            "hint": "复读独立开关：关闭后仅停用复读，表情回应跟风不受影响；插件总开关关闭时全部停用。",
+            "label": "启用复读",
+            "order": 0,
+        },
+    )
+    window_seconds: int = Field(
+        default=120, ge=1, le=3600,
+        json_schema_extra={
+            "hint": "滚动窗口：窗口内归一后相同的复读文本按口径累积，早于窗口的历史消息随滚动失效。",
+            "label": "滚动窗口（秒）",
+            "order": 1,
+            "step": 10,
+        },
+    )
+    threshold: int = Field(
+        default=3, ge=2, le=50,
+        json_schema_extra={
+            "hint": "窗口内计数达到该值时复读链达标，取得一次决策资格；掷骰后（含沉默出口）链即终结。",
+            "label": "达标阈值",
+            "order": 2,
+            "step": 1,
+        },
+    )
+    distinct_senders: bool = Field(
+        default=True,
+        json_schema_extra={
+            "hint": "统计口径：开启时仅计不同发送者人头，同一发送者连发不增计数；关闭后逐条消息计数。",
+            "label": "仅计不同发送者",
+            "order": 3,
+        },
+    )
+    probability: float = Field(
+        default=0.6, ge=0.0, le=1.0,
+        json_schema_extra={
+            "hint": "复读链达标后掷的第一颗骰：命中则复读链内最后一条的原始文本。0 = 从不复读。",
+            "label": "复读概率",
+            "order": 4,
+            "step": 0.05,
+        },
+    )
+    interrupt_probability: float = Field(
+        default=0.15, ge=0.0, le=1.0,
+        json_schema_extra={
+            "hint": (
+                "复读骰未中后掷的第二颗骰：命中则从打断文本池随机取一条发出，不附带复读文本；"
+                "两颗骰都未中保持沉默。0 = 从不打断。"
+            ),
+            "label": "打断概率",
+            "order": 5,
+            "step": 0.05,
+        },
+    )
+    interrupt_texts: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_INTERRUPT_TEXTS),
+        json_schema_extra={
+            "hint": "打断出口的变体池，每次随机取一条。全部留空时回落内置默认池并记日志，不会静默哑火。",
+            "label": "打断文本池",
+            "order": 6,
+            "placeholder": "打断！",
+        },
+    )
+    chain_ttl_seconds: int = Field(
+        default=1800, ge=0, le=604800,
+        json_schema_extra={
+            "hint": (
+                "链终结标记的保留时长：掷骰后同一复读文本在此时长内不再触发新一轮，"
+                "过期后重新累积可再达标。0 = 不做链终结。"
+            ),
+            "label": "链终结保留时长（秒）",
+            "order": 7,
+            "step": 60,
+        },
+    )
+    cooldown_seconds: int = Field(
+        default=120, ge=0, le=86400,
+        json_schema_extra={
+            "hint": (
+                "复读专用的群冷却，独立于「节奏与限流」里表情回应的群冷却，互不牵扯。"
+                "冷却期内链达标不掷骰、不消耗决策资格。0 = 不限。"
+            ),
+            "label": "复读群冷却（秒）",
+            "order": 8,
+            "step": 5,
+        },
+    )
+    max_text_length: int = Field(
+        default=200, ge=0, le=4096,
+        json_schema_extra={
+            "hint": "超过此长度的文本消息不产出复读文本、不参与复读链累积。0 = 不限。",
+            "label": "复读文本长度上限",
+            "order": 9,
+            "step": 50,
+        },
+    )
+    max_chains: int = Field(
+        default=2000, ge=100, le=100000,
+        json_schema_extra={
+            "hint": "内存中复读链记录的条数上界，超出后丢弃最旧的链，与表情槽条数上界同理。",
+            "label": "复读链条数上界",
+            "order": 10,
+            "step": 100,
+        },
+    )
+
+
 class BehaviorSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "节奏与限流"
-    __ui_order__: ClassVar[int] = 5
+    __ui_order__: ClassVar[int] = 6
 
     cooldown_seconds: int = Field(
         default=60, ge=0, le=86400,
@@ -251,7 +370,7 @@ class BehaviorSection(PluginConfigBase):
 
 class ContextSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "上下文注入"
-    __ui_order__: ClassVar[int] = 6
+    __ui_order__: ClassVar[int] = 7
 
     enabled: bool = Field(
         default=False,
@@ -310,7 +429,7 @@ class ContextSection(PluginConfigBase):
 
 class ScopeSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "生效范围"
-    __ui_order__: ClassVar[int] = 7
+    __ui_order__: ClassVar[int] = 8
 
     group_whitelist: list[str] = Field(
         default_factory=list,
@@ -339,14 +458,27 @@ class ScopeSection(PluginConfigBase):
             "placeholder": "请输入 QQ 号",
         },
     )
+    ignore_senders: list[str] = Field(
+        default_factory=list,
+        json_schema_extra={
+            "hint": (
+                "忽略这些 QQ 发出的消息，其文本不进入复读链累积；"
+                "与「忽略的回应者」（针对表情回应）是两个名单。通常填其他机器人，防止互相复读。"
+            ),
+            "label": "忽略的发送者",
+            "order": 3,
+            "placeholder": "请输入 QQ 号",
+        },
+    )
 
 
-class SendingEmojisConfig(PluginConfigBase):
+class RepeaterConfig(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     webhook: WebhookSection = Field(default_factory=WebhookSection)
     protocol: ProtocolSection = Field(default_factory=ProtocolSection)
     bandwagon: BandwagonSection = Field(default_factory=BandwagonSection)
     opposite: OppositeSection = Field(default_factory=OppositeSection)
+    repeat: RepeatSection = Field(default_factory=RepeatSection)
     behavior: BehaviorSection = Field(default_factory=BehaviorSection)
     context: ContextSection = Field(default_factory=ContextSection)
     scope: ScopeSection = Field(default_factory=ScopeSection)
