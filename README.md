@@ -135,11 +135,13 @@ self_display_name = ""
 
 ```bash
 # 1. 推送插件文件（排除本地开发与内部文件；目录名即插件 id）
+#    config.toml 一并排除：覆盖部署不抹掉服务器上的配置（含 token），首次部署走步骤 2 写入
 rsync -av --delete \
   --exclude .git --exclude .local --exclude .serena --exclude .superpowers \
   --exclude .pytest_cache --exclude .ruff_cache --exclude __pycache__ \
   --exclude tests --exclude docs/superpowers \
-  --exclude conftest.py --exclude pyrightconfig.json \
+  --exclude .cursor --exclude openspec \
+  --exclude conftest.py --exclude pyrightconfig.json --exclude config.toml \
   ./ arclinux:/home/arc/maimai/MaiBot/data/MaiMBot/plugins/arcdent.repeater-plugin/
 
 # 2. 在服务器上写部署配置（含协议端 token，勿入库；未写的节用默认值）
