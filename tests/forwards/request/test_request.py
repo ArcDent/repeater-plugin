@@ -6,7 +6,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from sending_emojis_plugin.forwards.request.source.models import ViewObservationKind
+from repeater_plugin.forwards.request.source.models import ViewObservationKind
 
 from tests.forwards.request.support import (
     FakeMessageCapability,

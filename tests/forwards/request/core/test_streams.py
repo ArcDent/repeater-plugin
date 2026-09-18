@@ -6,7 +6,7 @@ import asyncio
 import logging
 from types import SimpleNamespace
 
-from sending_emojis_plugin.forwards.request.core.streams import GroupStreamRegistry
+from repeater_plugin.forwards.request.core.streams import GroupStreamRegistry
 
 from tests.forwards.request.support import FakeChatCapability
 

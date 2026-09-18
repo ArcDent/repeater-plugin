@@ -16,8 +16,8 @@ import logging
 from pathlib import Path
 
 import pytest
-from sending_emojis_plugin.forwards.request.core.state import ForwardStateStore
-from sending_emojis_plugin.forwards.request.source.authorization import (
+from repeater_plugin.forwards.request.core.state import ForwardStateStore
+from repeater_plugin.forwards.request.source.authorization import (
     FORWARD_TOOL_NAME,
 )
 

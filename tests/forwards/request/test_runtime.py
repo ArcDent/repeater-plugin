@@ -12,10 +12,10 @@ import asyncio
 from copy import deepcopy
 from pathlib import Path
 
-from sending_emojis_plugin.forwards.request.source.authorization import (
+from repeater_plugin.forwards.request.source.authorization import (
     FORWARD_TOOL_NAME,
 )
-from sending_emojis_plugin.forwards.request.source.models import ViewEligibilityStatus
+from repeater_plugin.forwards.request.source.models import ViewEligibilityStatus
 
 from tests.forwards.request.support import build_plugin
 

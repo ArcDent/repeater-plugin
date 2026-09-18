@@ -7,7 +7,7 @@ import pytest
 
 # forwards is a subpackage of the synthetic package registered by the root
 # conftest; the hyphenated repo dir cannot be imported by name directly.
-from sending_emojis_plugin.forwards.nodes import (
+from repeater_plugin.forwards.nodes import (
     ForwardNode,
     extract_forward_nodes,
     nodes_to_onebot_messages,

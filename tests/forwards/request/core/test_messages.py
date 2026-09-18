@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sending_emojis_plugin.forwards.request.core.messages import ForwardMessageParser
+from repeater_plugin.forwards.request.core.messages import ForwardMessageParser
 
 from tests.forwards.request.support import build_forward_message
 

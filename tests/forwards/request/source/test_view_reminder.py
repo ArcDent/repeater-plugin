@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from sending_emojis_plugin.forwards.request.source.history import VIEW_FORWARD_TOOL_NAME
-from sending_emojis_plugin.forwards.request.source.models import ViewEligibilityStatus
+from repeater_plugin.forwards.request.source.history import VIEW_FORWARD_TOOL_NAME
+from repeater_plugin.forwards.request.source.models import ViewEligibilityStatus
 
 from tests.forwards.request.source.support import (
     build_output_item_call,

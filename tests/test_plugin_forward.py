@@ -14,17 +14,17 @@ import time
 from pathlib import Path
 from typing import Any
 
-from sending_emojis_plugin.forwards.request import (
+from repeater_plugin.forwards.request import (
     FORWARD_AUTHORIZATION_ROUND_KWARG,
     FORWARD_CONTEXT_TOKEN_ARGUMENT,
     FORWARD_TOOL_NAME,
     build_delivered_key,
 )
-from sending_emojis_plugin.forwards.request.source.history import ViewToolObservation
-from sending_emojis_plugin.forwards.request.source.models import ViewObservationKind
-from sending_emojis_plugin.forwards.source import ForwardSource, parse_forward_source
-from sending_emojis_plugin.forwards.state import ForwardState
-from sending_emojis_plugin.forwards.texts import (
+from repeater_plugin.forwards.request.source.history import ViewToolObservation
+from repeater_plugin.forwards.request.source.models import ViewObservationKind
+from repeater_plugin.forwards.source import ForwardSource, parse_forward_source
+from repeater_plugin.forwards.state import ForwardState
+from repeater_plugin.forwards.texts import (
     build_forced_comment_intent,
     build_forward_content_text,
     build_forward_trace_text,

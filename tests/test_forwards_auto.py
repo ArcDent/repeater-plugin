@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sending_emojis_plugin.forwards.auto import decide_forward_targets
+from repeater_plugin.forwards.auto import decide_forward_targets
 
 
 class _RollCounter:

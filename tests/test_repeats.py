@@ -9,9 +9,9 @@ import pytest
 
 # repeats.py uses package-relative imports like plugin.py; the root
 # conftest registers the hyphenated repo dir as the synthetic package
-# "sending_emojis_plugin" and only aliases plugin/config/reactions at
+# "repeater_plugin" and only aliases plugin/config/reactions at
 # top level, so repeats is imported through the package name.
-from sending_emojis_plugin.repeats import (
+from repeater_plugin.repeats import (
     ACCUMULATE,
     DEFAULT_INTERRUPT_TEXTS,
     INTERRUPT,

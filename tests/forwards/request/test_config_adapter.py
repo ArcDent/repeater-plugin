@@ -13,12 +13,12 @@ import json
 from pathlib import Path
 
 import pytest
-from sending_emojis_plugin.forwards.request import (
+from repeater_plugin.forwards.request import (
     ForwardingRuntime,
     read_plugin_version,
 )
-from sending_emojis_plugin.forwards.request.source.models import ViewObservationKind
-from sending_emojis_plugin.forwards.state import (
+from repeater_plugin.forwards.request.source.models import ViewObservationKind
+from repeater_plugin.forwards.state import (
     DeliveredRegistry,
     GroupAvailabilityCache,
 )

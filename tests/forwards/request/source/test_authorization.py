@@ -7,7 +7,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
-from sending_emojis_plugin.forwards.request.source.authorization import (
+from repeater_plugin.forwards.request.source.authorization import (
     FORWARD_AUTHORIZATION_ROUND_KWARG,
     FORWARD_CONTEXT_TOKEN_ARGUMENT,
     FORWARD_TOOL_NAME,

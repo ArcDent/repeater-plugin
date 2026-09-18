@@ -11,7 +11,7 @@ from typing import Any
 
 # repeats 只经合成包名导入（conftest 未给它建顶层别名，其相对导入决定
 # 顶层形态加载不了），与 tests/test_repeats.py 的导入方式一致。
-from sending_emojis_plugin.repeats import REPEAT
+from repeater_plugin.repeats import REPEAT
 
 from config import RepeaterConfig
 from plugin import RepeaterPlugin
@@ -1362,7 +1362,7 @@ def test_manifest_identity():
     description = manifest["description"]
     assert "复读" in description and "打断" in description  # 复读 + 打断
     assert "表情" in description  # 表情回应跟风/反义
-    assert manifest["urls"]["repository"] == "https://github.com/arcdent/sending-emojis-plugin"
+    assert manifest["urls"]["repository"] == "https://github.com/arcdent/repeater-plugin"
 
 
 def test_manifest_declares_every_consumed_capability():

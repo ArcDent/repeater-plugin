@@ -10,7 +10,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from sending_emojis_plugin.forwards.request.core.models import ForwardJob
+from repeater_plugin.forwards.request.core.models import ForwardJob
 
 from tests.forwards.request.support import (
     FakeDelayedMessageCapability,

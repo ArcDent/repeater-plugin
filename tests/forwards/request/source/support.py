@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from sending_emojis_plugin.forwards.request.source.authorization import (
+from repeater_plugin.forwards.request.source.authorization import (
     FORWARD_CONTEXT_TOKEN_ARGUMENT,
     FORWARD_TOOL_NAME,
 )

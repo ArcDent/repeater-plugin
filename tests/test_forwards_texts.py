@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from sending_emojis_plugin.forwards.nodes import ForwardNode
-from sending_emojis_plugin.forwards.source import ForwardSource
-from sending_emojis_plugin.forwards.texts import (
+from repeater_plugin.forwards.nodes import ForwardNode
+from repeater_plugin.forwards.source import ForwardSource
+from repeater_plugin.forwards.texts import (
     build_forced_comment_intent,
     build_forward_content_text,
     build_forward_trace_text,

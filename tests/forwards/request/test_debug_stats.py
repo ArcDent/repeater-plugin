@@ -9,13 +9,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sending_emojis_plugin.forwards.request.core.models import ForwardJob
-from sending_emojis_plugin.forwards.request.debug_stats import (
+from repeater_plugin.forwards.request.core.models import ForwardJob
+from repeater_plugin.forwards.request.debug_stats import (
     DEBUG_STATS_ENV_VAR,
     DEBUG_STATS_FILENAME,
     DebugForwardStatsStore,
 )
-from sending_emojis_plugin.forwards.request.source.authorization import (
+from repeater_plugin.forwards.request.source.authorization import (
     FORWARD_CONTEXT_TOKEN_ARGUMENT,
     FORWARD_TOOL_NAME,
 )

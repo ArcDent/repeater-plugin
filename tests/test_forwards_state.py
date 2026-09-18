@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import inspect
 
-from sending_emojis_plugin.forwards.state import (
+from repeater_plugin.forwards.state import (
     DeliveredRegistry,
     ForwardState,
     GroupAvailabilityCache,

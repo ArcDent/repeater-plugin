@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from sending_emojis_plugin.forwards.request.source.history import ViewToolObservation
-from sending_emojis_plugin.forwards.request.source.models import (
+from repeater_plugin.forwards.request.source.history import ViewToolObservation
+from repeater_plugin.forwards.request.source.models import (
     ViewEligibilityStatus,
     ViewObservationKind,
 )
-from sending_emojis_plugin.forwards.request.source.view_policy import (
+from repeater_plugin.forwards.request.source.view_policy import (
     needs_additional_view,
 )
-from sending_emojis_plugin.forwards.request.source.view_state import (
+from repeater_plugin.forwards.request.source.view_state import (
     ViewEligibilityStore,
 )
 

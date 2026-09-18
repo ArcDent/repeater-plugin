@@ -6,11 +6,11 @@ import asyncio
 from copy import deepcopy
 from pathlib import Path
 
-from sending_emojis_plugin.forwards.request.source.authorization import (
+from repeater_plugin.forwards.request.source.authorization import (
     FORWARD_CONTEXT_TOKEN_ARGUMENT,
     FORWARD_TOOL_NAME,
 )
-from sending_emojis_plugin.forwards.request.source.history import VIEW_FORWARD_TOOL_NAME
+from repeater_plugin.forwards.request.source.history import VIEW_FORWARD_TOOL_NAME
 
 from tests.forwards.request.source.support import (
     build_output_item_assistant,

@@ -10,7 +10,7 @@
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://github.com/arcdent/sending-emojis-plugin"
+    "repository": "https://github.com/arcdent/repeater-plugin"
   },
   "host_application": {
     "min_version": "1.0.0",

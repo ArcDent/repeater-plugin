@@ -9,7 +9,7 @@ from pathlib import Path
 from time import time
 
 import pytest
-from sending_emojis_plugin.forwards.state import GroupAvailabilityCache
+from repeater_plugin.forwards.state import GroupAvailabilityCache
 
 from tests.forwards.request.support import (
     BlockingSendCapability,

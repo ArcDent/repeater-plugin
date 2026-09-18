@@ -1,9 +1,9 @@
 """导入身份回归：`forwards` 的两种名字必须指向同一批模块对象。
 
-`conftest.py` 把仓库根注册为合成包 `sending_emojis_plugin`，并把 `forwards`
+`conftest.py` 把仓库根注册为合成包 `repeater_plugin`，并把 `forwards`
 子树的顶层别名一并注册（`sys.modules["forwards"]`、`sys.modules["forwards.request"]` 等）。
 本用例防止后续改动删掉别名后，`import forwards.request` 与
-`sending_emojis_plugin.forwards.*` 各自加载出第二份模块——双身份会让
+`repeater_plugin.forwards.*` 各自加载出第二份模块——双身份会让
 isinstance、单例状态与 monkeypatch 全部失效。
 """
 
@@ -12,9 +12,9 @@ from __future__ import annotations
 import importlib
 import sys
 
-from sending_emojis_plugin.forwards.request.core.messages import ForwardMessageParser
+from repeater_plugin.forwards.request.core.messages import ForwardMessageParser
 
-CANONICAL_PREFIX = "sending_emojis_plugin.forwards"
+CANONICAL_PREFIX = "repeater_plugin.forwards"
 
 
 def test_top_level_forwards_alias_is_the_synthetic_package_member() -> None:

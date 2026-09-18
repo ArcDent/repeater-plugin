@@ -19,16 +19,16 @@ from time import time
 from types import SimpleNamespace
 from typing import Any
 
-from sending_emojis_plugin.forwards.request import (
+from repeater_plugin.forwards.request import (
     FORWARD_AUTHORIZATION_ROUND_KWARG,
     FORWARD_TOOL_NAME,
     ForwardingRuntime,
     append_user_reminder,
     build_delivered_key,
 )
-from sending_emojis_plugin.forwards.request.source.history import ViewToolObservation
-from sending_emojis_plugin.forwards.request.source.models import ViewObservationKind
-from sending_emojis_plugin.forwards.state import (
+from repeater_plugin.forwards.request.source.history import ViewToolObservation
+from repeater_plugin.forwards.request.source.models import ViewObservationKind
+from repeater_plugin.forwards.state import (
     DeliveredRegistry,
     GroupAvailabilityCache,
 )
