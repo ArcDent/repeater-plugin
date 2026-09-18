@@ -1,11 +1,12 @@
 # 复读插件（repeater-plugin）
 
-MaiBot 插件，聚合两个群聊行为：
+MaiBot 插件，聚合三个群聊行为：
 
 1. **复读**：群内**复读链**（滚动时间窗口内同一**复读文本**被累积达阈值）达标后，麦麦掷一次骰按**出口权重**选中恰好一个出口——**复读**（把链内最后一条的**复读文本**原样发出）、**打断**（发一条**打断文本**唱反调）或沉默，三出口互斥。
 2. **表情回应跟风**：有人给某条消息贴了**表情回应**（消息气泡下方那排小表情）后，麦麦按概率**跟风**贴同款，或按概率贴语义相反的**反义回应**。
+3. **跨群转发**：**源群**里出现**合并转发**后，麦麦或按**转发权重**对每个**目标群**独立掷骰**自动转发**，或响应群友的对话请求执行**请求转发**（默认关闭，配置见下方「跨群转发」章节）。
 
-不涉及表情包发送——那是 `ctx.send.emoji` 的事，本插件只碰表情回应。术语定义见 [CONTEXT.md](CONTEXT.md)。
+不涉及表情包发送——那是 `ctx.send.emoji` 的事，本插件只碰表情回应；转发域也只处理**合并转发**，不转发普通单条消息。术语定义见 [CONTEXT.md](CONTEXT.md)。
 
 ## 复读
 
@@ -53,6 +54,61 @@ extra_pairs = ["🎉=😢", "76=78"]
 disabled_emojis = ["👍"]   # 把 👍 从反义映射里摘掉，让它回落到跟风
 ```
 
+## 跨群转发（默认关闭）
+
+第三个行为域，与复读、表情回应并列。`forward.enabled` 开启后，**源群**（`forward.source_groups`）里出现**合并转发**时触发两条路径：
+
+1. **自动转发**：对**目标群**（`forward.target_groups`）逐个独立掷骰，按**转发权重**（`weight_send` / `weight_silence`，默认 30 / 70）选中「转发」或「沉默」。命中后经协议端直发 `send_group_forward_msg` 把合并转发投递到该目标群（不走主程序发送链，与聊天流/Platform IO 路由解耦），随后向目标群注入转发内容（`source_kind=forward`），并按 `trigger_target_planner` 触发一次要求麦麦针对这条转发说一句话的 Planner 主动任务（软约束：麦麦仍可能沉默，插件不检测也不补发）；至少一个目标群投递成功后，向源群注入一条行为留痕（`source_kind=forward_action`，只列实际成功的群）。
+2. **请求转发**：群友在对话里让麦麦分享某条合并转发时，麦麦走 `request_cross_group_forward` Tool 的完整链路——**查看资格**（已完整查看内容，或连续可重试故障达 `view_failure_fallback_threshold` 后降级用摘要）、一次性会话授权、按 `target_groups` 顺序投递、目标群 Planner 自主决定是否发言。这条路径不掷骰、不受**转发权重**影响，**强制发言**只适用于自动路径。
+
+防护与校验：
+
+- **转发防重**：同一条**转发源消息**在 `dedup_ttl_seconds`（默认 1800 秒）内只掷一次骰
+- **源群冷却**：`cooldown_seconds`（默认 60 秒）内该源群新到的合并转发不掷骰；至少一个目标群命中转发才写冷却，掷骰全沉默不写
+- **目标群冷却**：`target_cooldown_seconds`（默认 60 秒）内该目标群不参与掷骰，只压制该群，与其他目标群无关
+- **已投递状态**：自动路径投递成功的目标群会被请求转发跳过；候选目标群全部已投递时，请求转发直接返回「已转发过」。自动路径沉默不登记，请求转发仍可执行
+- **目标群可用性校验**：两条路径投递前都用协议端 `get_group_list` 校验目标群仍在机器人所在群列表（缓存 300 秒），不在列表的群被跳过并在日志/Tool 返回值里给出群号与明确原因；查询失败按未知放行并记 warning（不静默；失败后 30 秒内不重查、窗口外重试，即失败退避）
+
+自动路径投递的日志带「自动转发」前缀与目标群号，请求路径沿用原插件的中文文案（无统一字面前缀），共享群列表刷新等待方的成败另以「请求转发」前缀记录，排查时先分清是哪条路径。转发域**不复用** `[scope]` 白黑名单（源群过滤只认 `forward.source_groups`），也**不复用** `[behavior]` 的延迟字段；`plugin.enabled` 仍是总开关。
+
+### 配置：`[forward]` 节
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `false` | 转发域独立开关；关闭时自动转发、请求转发、源群触发与两类注入全部停用 |
+| `source_groups` | `[]` | **源群**白名单：只处理这些 QQ 群里的合并转发；留空则没有源群，转发域不工作 |
+| `target_groups` | `[]` | **目标群**列表：自动转发的候选群，也是请求转发的投递顺序；与源群相同的项被跳过，留空则无目标群 |
+| `weight_send` | `30` | **转发权重**：每个目标群独立掷骰的两个权重之一，命中则转发。只有比例意义，同比例放大等价 |
+| `weight_silence` | `70` | 沉默权重：命中则不向该目标群转发。单个目标群两权重全为 0 时视为沉默、不掷骰 |
+| `dedup_ttl_seconds` | `1800` | **转发防重**窗口：同一**转发源消息**在此窗口内只参与一次掷骰。0 = 不防重 |
+| `cooldown_seconds` | `60` | **源群冷却**：至少一个目标群命中转发后写入，冷却期内该群新到的合并转发不掷骰。0 = 不限 |
+| `target_cooldown_seconds` | `60` | **目标群冷却**：该群命中转发后写入，冷却期内不再参与掷骰；与源群冷却分开计时。0 = 不限 |
+| `delay_min_seconds` | `0.5` | 命中转发后发送前的最短等待（秒），与复读、表情回应两域的延迟互相独立 |
+| `delay_max_seconds` | `2.0` | 发送前等待的上限（秒），实际在区间内随机取；小于下限时按下限处理 |
+| `trigger_source_planner` | `true` | 源群收到合并转发时是否安排一次本群 Planner 触发（**请求转发**路径的入口提示） |
+| `trigger_target_planner` | `true` | 自动转发投递成功后是否触发目标群 Planner 针对该转发发言（软约束，麦麦仍可沉默） |
+| `view_failure_fallback_threshold` | `2` | 请求转发校验**查看资格**时，连续可重试故障达到该次数后降级用摘要投递 |
+| `inject_max_chars` | `800` | 转发内容注入文本的长度上限，超长按上限截断并带省略标记 |
+
+调参提示：`weight_send` / `weight_silence` 只有比例意义——「三成转发」是 30 / 70，「偶尔转发」可改 5 / 95；两权重全 0 表示该目标群永远沉默、不掷骰。目标群列表里的失效群不会变成「未知错误」，但每次投递前都会被跳过并记 warning，建议配置里及时清理。
+
+```toml
+[forward]
+enabled = true
+source_groups = ["<源群号>"]
+target_groups = ["<目标群号A>", "<目标群号B>"]
+weight_send = 30
+weight_silence = 70
+```
+
+### 从旧插件迁移
+
+原先部署 `papaya0481/maibot-ForwardMessagesAuto-plugin` 的，启用本插件转发域前**必须停用旧插件**（配置 `enabled = false` 或移出 plugins 目录）：两个插件都会在源群触发 Planner 并处理转发 Tool，同时启用会对同一批合并转发重复处理。原插件的 `[routing]` / `[behavior]` 配置不自动迁移，请按上表重填 `[forward]` 段。
+
+- **失效目标群**：目标群必须仍在机器人所在群列表（协议端 `get_group_list`）。旧配置里已退群/失效的群号请直接删除——保留时投递会被跳过，日志给出群号与「不在机器人群列表」原因（不再出现「未知错误」）
+- **版本升级**：`config_version` 1.1.0 → 1.2.0，主程序会重建 `config.toml` 骨架（保留已填的旧字段值、补默认 `[forward]` 段）。升级后请填写 `forward.source_groups` 与 `forward.target_groups`，并显式把 `forward.enabled` 置为 `true`
+- **回滚**：禁用 `forward.enabled` 并恢复旧插件目录与配置即可；自动转发的直发消息不写主程序消息库，回滚不涉及数据清理
+
 ## 上下文注入（实验性，默认关闭）
 
 `context.enabled` 默认 `false`，只管**表情回应域**的注入，整块功能试验性地开、试验性地关。复读域的拦截与注入跟随 `repeat.enabled`，不受这个开关约束（见 [ADR 0006](docs/adr/0006-repeat-direct-send-with-injection-and-intercept.md)）。开启后：
@@ -85,7 +141,7 @@ self_display_name = ""
 
 1. 目录整个放进 MaiBot 的 `plugins/`（目录名用插件 id `arcdent.repeater-plugin`，从旧版本迁移见下方迁移段落），无需打包
 2. 装依赖：`pip install aiohttp`
-3. 复读功能需要配 `[protocol]`：检测与拦截走主程序 hook（blocking 模式），发送走协议端直调（`send_group_msg`），不依赖 webhook 上报目标
+3. 复读与跨群转发的发送需要配 `[protocol]`：复读检测与拦截走主程序 hook（blocking 模式），复读/打断与自动转发的发送走协议端直调（`send_group_msg` / `send_group_forward_msg`），不依赖 webhook 上报目标
 4. 表情回应跟风需要两步：
    - 填 `config.toml` 的 `[protocol]`：协议端 OneBot HTTP 地址与 token
    - **给协议端新增一个 HTTP 上报目标**，URL 指向 `http://<插件所在容器>:18081/maibot/emoji_reaction`
@@ -188,6 +244,8 @@ ssh arclinux 'rm -rf /home/arc/maimai/MaiBot/data/MaiMBot/plugins/arcdent.sendin
 上报体形态与动作参数已对照 SnowLuma 源码核实（`packages/onebot/src/event-converter/to-notice.ts`、`actions/extended.ts`、`actions/message.ts`），字段布局与本插件一致；复读检测的消息形态取自主程序 hook 侧（`src/plugin_runtime/host/message_utils.py`）。装好后分两条链路验证：
 
 - 出现 `复读链达标` / `已直发复读文本` → 复读链路通了（三人接龙一次即可验证）
+- 出现 `自动转发命中` → 自动转发掷骰命中；随后出现 `自动转发已投递` → 目标群直发成功
+- 出现 `跨群转发群列表已刷新` → 目标群可用性校验拿到了可信群列表；出现 `跳过不可用目标群` → 配置里有失效群，按日志群号清理
 - 出现 `表情回应上报已监听` → webhook 端点起来了
 - 出现 `表情回应触发` / `已跟风贴表情` → 表情回应链路通了
 - 出现 `表情回应上报形态不认识，已忽略: {...}` → 协议端版本或实现变了，把日志里那段原始 JSON 贴出来，按实测补 `reactions.py` 的解析分支
@@ -208,7 +266,7 @@ ssh arclinux 'rm -rf /home/arc/maimai/MaiBot/data/MaiMBot/plugins/arcdent.sendin
 uv run --with pytest --with aiohttp pytest tests/ -q
 ```
 
-`reactions.py`（表情回应域）与 `repeats.py`（复读域）都是纯逻辑层，不依赖 `maibot_sdk`，全部可单测；`plugin.py` 只做编排与 I/O。新增可测逻辑按领域写进对应纯逻辑层。
+`reactions.py`（表情回应域）、`repeats.py`（复读域）与 `forwards/`（转发域子包）都是纯逻辑层，不依赖 `maibot_sdk`，全部可单测；`plugin.py` 只做编排与 I/O。新增可测逻辑按领域写进对应纯逻辑层。
 
 ## 更名说明
 

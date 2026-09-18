@@ -1,17 +1,20 @@
 # AGENTS.md
 
-MaiBot 插件：聚合两个群聊行为——群内复读链达标后，麦麦掷一次骰按**出口权重**选中复读（把复读文本原样发出）、打断（发打断文本唱反调）或沉默之一；有人给某条消息贴了表情回应后，麦麦按概率跟风贴同款，或按概率贴反义回应。
+MaiBot 插件：聚合三个群聊行为——群内复读链达标后，麦麦掷一次骰按**出口权重**选中复读（把复读文本原样发出）、打断（发打断文本唱反调）或沉默之一；有人给某条消息贴了表情回应后，麦麦按概率跟风贴同款，或按概率贴反义回应；源群出现**合并转发**后，麦麦或按**转发权重**对每个目标群独立掷骰**自动转发**，或响应对话请求执行**请求转发**。
 
 ## 结构
 
-- `plugin.py` — 插件主类：上报监听、门禁与掷骰编排、协议端直发、复读拦截与直发、上下文注入、启动自检
+- `plugin.py` — 插件主类：上报监听、门禁与掷骰编排、协议端直发、复读拦截与直发、上下文注入、转发域自动路径 Hook 与请求路径 Tool 编排、启动自检
 - `reactions.py` — 表情回应域纯逻辑层（上报解析、表情 ID 归一、反义映射、跟风/反义决策、表情槽与冷却），不依赖 SDK，可单测
 - `repeats.py` — 复读域纯逻辑层（复读文本宽松归一、消息资格判定、复读链状态机、三出口决策、注入文案构造），不依赖 SDK，可单测
-- `config.py` — 配置模型（plugin/webhook/protocol/bandwagon/opposite/repeat/behavior/context/scope）
+- `forwards/` — 转发域子包（纯逻辑层，不依赖 SDK，可单测）：`source.py`（转发源消息资格解析）、`nodes.py`（转发节点解析与 OneBot 转换）、`auto.py`（逐目标群掷骰）、`state.py`（转发防重 / 冷却 / 已投递状态 / 群可用性缓存）、`texts.py`（内容注入、留痕与强制发言 intent 文案）
+- `forwards/forward_segments.py` — 转发段解析核心叶子模块：Hook 侧与请求侧共用「段类型判定 + 首个 `forward` 段定位 + 节点级校验」；不依赖 `repeats.py`，保住 `import forwards.request` 的独立导入
+- `forwards/request/` — 请求转发链路（原 `papaya0481/maibot-ForwardMessagesAuto-plugin` v0.2.12 整包移植）：源群 Planner 触发、查看资格、一次性授权、顺序投递与持久化状态
+- `config.py` — 配置模型（plugin/webhook/protocol/bandwagon/opposite/repeat/behavior/context/scope/forward）
 - `config.toml` — 默认配置，值必须与 `config.py` 的 default 一致
 - `tests/` — pytest（fake maibot_sdk 注入，`uv run --with pytest --with aiohttp pytest tests/ -q`）
 - `docs/emoji-id-reference.md` — 表情 ID 两套编号体系（QQ 小黄脸编号 / Unicode 码点）查表与边界
-- `docs/adr/` — 0001 走 webhook 不走 SDK 事件链；0002 分支严格互斥 + 内存态；0003 防御式拦截通知 + 插件自建注入；0004 定时 flush 兜底 + 失败回滚；0005 复读检测走 before_process hook（检测层仍有效，observe 模式与 `ctx.send.text` 发送决策被 0006 取代）；0006 复读/打断出口协议端直发 + planner 拦截 + 上下文注入（决策 3 的延迟沿用与串行编舞被 0008 取代）；0007 复读三出口改归一化出口权重（取代双概率配置口径）；0008 复读域独立延迟 + 触发消息注入与延迟并发
+- `docs/adr/` — 0001 走 webhook 不走 SDK 事件链；0002 分支严格互斥 + 内存态；0003 防御式拦截通知 + 插件自建注入；0004 定时 flush 兜底 + 失败回滚；0005 复读检测走 before_process hook（检测层仍有效，observe 模式与 `ctx.send.text` 发送决策被 0006 取代）；0006 复读/打断出口协议端直发 + planner 拦截 + 上下文注入（决策 3 的延迟沿用与串行编舞被 0008 取代）；0007 复读三出口改归一化出口权重（取代双概率配置口径）；0008 复读域独立延迟 + 触发消息注入与延迟并发；0009 转发域双路径并存（自动掷骰 + 请求转发，共享已投递状态）；0010 自动转发协议端直发 + 投递前目标群可用性校验（陈旧 stream 路由故障背景）
 - `CONTEXT.md` — 领域术语表
 
 ## 关键规则
@@ -41,13 +44,26 @@ MaiBot 插件：聚合两个群聊行为——群内复读链达标后，麦麦�
 - 表情 ID 归一一律走 `normalize_emoji_id`（纯数字原样，emoji 字符取首码点）。**这不是美化，删不得**：协议端上报 Unicode 表情给的是字符本身（`'⭐'`），而发送时按 `code.length > 3` 判类型（≤3 位当 QQ 小黄脸、更长当 Unicode 码点），归一正好抹平这个不对称。依据见 `REFERENCE/snowluma` 的 `msg-push/decoders/event-0x2dc.ts` 与 `oidb-services/reaction/set-reaction.ts`
 - 内置反义映射只用 Unicode emoji，不臆造 QQ 私有编号的语义
 
+### 转发域
+
+- 双路径并存（ADR 0009）：**自动转发**挂在 `chat.receive.before_process` 的 **observe 模式** handler（`forward_detector`，`order="late"`），同步段纯内存完成形态门禁 → **源群**门禁 → 防重/冷却 → 逐**目标群**掷骰，命中后先写冷却再 spawn 后台任务；转发域**不拦截**源消息。**请求转发**是原插件完整链路（源群 Planner 触发、**查看资格**、一次性授权、顺序投递）整包移植在 `forwards/request/`，不掷骰、不受**转发权重**影响；**强制发言**只适用于自动路径
+- 自动路径的**投递编舞**（change integrate-cross-group-forward design D7）：每个命中目标群一个独立后台任务，任务内串行「延迟（`forward.delay_*`，与 `repeat` / `behavior` 两域延迟互不牵扯）→ 目标群可用性校验 → 协议端直发 `send_group_forward_msg` → 目标群**转发内容注入**（`source_kind=forward`）→ **强制发言**触发」；至少一个目标群投递成功后由收尾任务向源群注入一次**转发留痕**（`source_kind=forward_action`，只列成功群）；任一步失败按 spec 口径记 warning 止步，不重试、不熔断其它目标群与后续消息
+- 自动路径**协议端直发**不走主程序发送链（ADR 0010）：只依赖群号，与 Host 聊天流 / Platform IO 路由解耦，陈旧 stream 不可能把投递引向 legacy 后备驱动；目标群消息库只有请求转发路径会写入，目标群上下文靠**转发内容注入**补偿
+- 投递前**目标群可用性校验**（ADR 0010）：协议端 `get_group_list` + TTL 300s 内存缓存（`_FORWARD_GROUP_LIST_TTL_SECONDS`），缓存未命中或过期时刷新、失败按未知放行并记 warning（失败后 30s 退避，不每条投递都吃协议端超时）；不在列表的目标群跳过并记含群号与原因的 warning，绝不出现「未知错误」
+- 两条路径共用**已投递状态**（change integrate-cross-group-forward design D5）：自动路径投递成功后按「源聊天流 + **转发源消息** ID」登记，请求转发的 Tool 入口据此跳过已投递目标群；候选目标群全部已投递时返回「已转发过」。自动路径沉默不登记，请求转发仍可执行。自动路径不读请求路径的持久化 store
+- 三层防护：同一**转发源消息**按消息 ID 在 `dedup_ttl_seconds` 内只掷一次骰；**源群**冷却（`cooldown_seconds`，至少一个目标群命中才写）；**目标群**冷却（`target_cooldown_seconds`，只压制该群）。沉默出口不写任何冷却；冷却写入在 spawn 之前，投递成败不影响已进入的冷却
+- `get_components()` 覆写是**承载性 hack**：Runner 只读组件声明**顶层**的 `chat_scope`，`@Tool(chat_scope=…)` 经 SDK 只落进 `metadata`——不覆写这一层，转发 Tool 在私聊会话里同样可见（可见性过滤失效）。改 Tool 声明面时不得删掉这层覆写
+- **转发节点**转换在 `forwards/nodes.py`：段映射 text→text、at→at、image/emoji→image（`binary_data_base64` 优先转 `base64://`，缺失时退回段内引用，再无则文本占位），嵌套 forward 递归转 node；无有效节点不投递
+- 日志口径：自动路径的**投递**日志一律带「自动转发」前缀与目标群号（检测层与沉默出口的日志不带目标群号）；请求路径沿用原插件的中文文案、无统一字面前缀，共享群列表刷新等待方的刷新成败由 `plugin.py` 另以「请求转发」前缀记录；刷新任务本身只用稳定域 tag「跨群转发」（按路径的成败由各等待方在 `await` 处自行记录）
+- 转发域不复用 `scope` 白黑名单与 `behavior.delay_*`，源群过滤只认 `forward.source_groups`；整域跟随 `forward.enabled`，`plugin.enabled` 为总开关
+
 ### 公共
 
 - 协议端行为有疑问先读源码：SnowLuma 已 clone 在 `/Users/arcdent/github/REFERENCE/snowluma`，表情回应相关在 `packages/onebot/src/event-converter/to-notice.ts`（上报）、`packages/onebot/src/actions/extended.ts`（`set_msg_emoji_like`）、`packages/onebot/src/actions/message.ts`（`get_msg`）；主程序 hook 消息形态看 `REFERENCE/MaiBot/src/plugin_runtime/host/message_utils.py`
 - 表情回应域的上下文注入默认关闭（`context.enabled`），整块试、整块关（复读域注入跟随 `repeat.enabled`，不受此开关约束）；注入路径复用 `scope` 白黑名单，但麦麦自己贴的回应不受 `ignore_reactors` 影响
 - 注入限流里**去重 ≠ 聚合**：去重（`dedup_ttl_seconds`）管「同一回应者+被回应消息+表情只注入一次」，聚合（`merge_window_seconds`）管「同一被回应消息同一表情的多条回应汇入一条注入消息」，`max_reactions_per_message` 兜住单条消息的注入条数
 - 注入文本显示名来源链：`context.self_display_name` → 主程序 `bot.nickname` → 空（不写名字）
-- 新增纯逻辑按领域写进对应纯逻辑层并加单测（表情回应域进 `reactions.py`，复读域进 `repeats.py`，两域并列、不混装）；不往 `plugin.py` 里塞可测逻辑
+- 新增纯逻辑按领域写进对应纯逻辑层并加单测（表情回应域进 `reactions.py`，复读域进 `repeats.py`，转发域进 `forwards/`，三域并列、不混装）；不往 `plugin.py` 里塞可测逻辑
 
 ## 验证
 
@@ -56,14 +72,16 @@ uv run --with pytest --with aiohttp pytest tests/ -q       # 全部通过
 uv run --with pyright --with aiohttp pyright              # 生产代码零错误
 ```
 
-`pyrightconfig.json` 只检查四个生产文件（config/plugin/reactions/repeats），且关掉 `reportMissingImports`：真实 `maibot_sdk` 只存在于 MaiBot 容器内，本机永远解析不到；测试目录里的替身（`FakeRequest`、故意传非法概率或权重值）也会产生大量与正确性无关的类型噪声。
+`pyrightconfig.json` 只检查生产代码（`config.py` / `plugin.py` / `reactions.py` / `repeats.py` 与 `forwards/**`），且关掉 `reportMissingImports`：真实 `maibot_sdk` 只存在于 MaiBot 容器内，本机永远解析不到；测试目录里的替身（`FakeRequest`、故意传非法概率或权重值）也会产生大量与正确性无关的类型噪声。
 
-`ruff check` 下有四类有意偏离，改代码时不要「顺手修掉」：
+`ruff check` 下有六类有意偏离，改代码时不要「顺手修掉」：
 
-- `BLE001`（宽捕获 `Exception`）— webhook 回调与后台任务里任何未捕获异常都会拖垮监听或产生孤儿任务，必须兜住并记日志
-- `N999`（模块名含连字符）— MaiBot 插件目录命名约定，改名会破坏插件加载
-- `SIM103`（`group_allowed` 未直接返回条件）— 早返回结构与前面的黑名单检查对称，改成 `not (white and ...)` 是双重否定，可读性更差
+- `BLE001`（宽捕获 `Exception`）— 宿主回调（webhook / Hook handler）与后台任务里任何未捕获异常都会拖垮监听或产生孤儿任务，必须兜住并记日志
+- `N999`（模块名含连字符）— MaiBot 插件目录命名约定，改名会破坏插件加载；除仓库根目录外，也覆盖 `forwards/**/__init__.py`（目录名含连字符的插件包结构）与 `tests/__init__.py`（测试包挂在同一插件目录下）
+- `SIM103`（guard 链末尾 `return True` 的早返回结构）— 早返回结构与前面的门禁检查逐条对称，改成直返条件是否定式表达，可读性更差；现存 `reactions.group_allowed` 与 `forwards/request/request.py` 两处
 - `SIM117`（`aiohttp` 嵌套 `async with`）— 与同机 `friend-request-handler` 的 `_call_protocol` 写法保持一致，便于对读
+- `DTZ005`（`datetime.now()` 未带时区）— 仅限 `forwards/request/source/output_items.py`：Host Context Item 的 timestamp 以 Host schema 口径为准（naive datetime），不是本地时间偏好
+- `TRY004`（类型不符时抛 `ValueError` 而非 `TypeError`）— 仅限 `forwards/request/debug_stats.py`：持久化 JSON 统计文件的 schema 校验路径统一抛 `ValueError`
 
 ## 测试注意
 
