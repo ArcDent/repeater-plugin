@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 
-from config import RepeaterConfig
+from config import ForwardSection, RepeaterConfig
 
 try:
     import tomllib
@@ -62,7 +63,18 @@ def test_list_fields_are_independent_per_instance():
 
 def test_all_sections_present():
     config = RepeaterConfig()
-    for section in ("plugin", "webhook", "protocol", "bandwagon", "opposite", "repeat", "behavior", "context", "scope"):
+    for section in (
+        "plugin",
+        "webhook",
+        "protocol",
+        "bandwagon",
+        "opposite",
+        "repeat",
+        "behavior",
+        "context",
+        "scope",
+        "forward",
+    ):
         assert getattr(config, section) is not None
 
 
@@ -87,10 +99,10 @@ def test_context_section_accepts_overrides():
     assert cfg.context.self_display_name == "麦麦"
 
 
-def test_config_version_updated_to_1_1_0():
-    """config_version 是配置结构版本：出口权重 + 复读自有延迟引入时从 1.0.0 升到 1.1.0。"""
+def test_config_version_updated_to_1_2_0():
+    """config_version 是配置结构版本：新增跨群转发 [forward] 段时从 1.1.0 升到 1.2.0。"""
     cfg = RepeaterConfig()
-    assert cfg.plugin.config_version == "1.1.0"
+    assert cfg.plugin.config_version == "1.2.0"
 
 
 def test_repeat_section_defaults():
@@ -131,6 +143,64 @@ def test_scope_ignore_senders_defaults_empty():
     assert cfg.scope.ignore_senders == []
 
 
+# ---- 跨群转发域配置（design D6）----
+
+def test_forward_section_defaults():
+    """[forward] 节默认值与 design D6 表逐项一致（独立字面量，不引自实现）。
+
+    转发域默认关闭（enabled=False）：升级后不配置即是「装了但不动」。
+    """
+    cfg = RepeaterConfig()
+    assert cfg.forward.enabled is False
+    assert cfg.forward.source_groups == []
+    assert cfg.forward.target_groups == []
+    assert cfg.forward.weight_send == 30
+    assert cfg.forward.weight_silence == 70
+    assert cfg.forward.dedup_ttl_seconds == 1800
+    assert cfg.forward.cooldown_seconds == 60
+    assert cfg.forward.target_cooldown_seconds == 60
+    assert cfg.forward.delay_min_seconds == 0.5
+    assert cfg.forward.delay_max_seconds == 2.0
+    assert cfg.forward.trigger_source_planner is True
+    assert cfg.forward.trigger_target_planner is True
+    assert cfg.forward.view_failure_fallback_threshold == 2
+    assert cfg.forward.inject_max_chars == 800
+
+
+def test_forward_section_is_exported():
+    """seam：`config.ForwardSection` 是模块导出类，根配置挂载的是同一个类。"""
+    assert isinstance(RepeaterConfig().forward, ForwardSection)
+
+
+def test_forward_list_fields_are_independent_per_instance():
+    """source/target 群列表是可变列表，两个实例不得共享同一份默认值。"""
+    first, second = RepeaterConfig(), RepeaterConfig()
+    first.forward.source_groups.append("10001")
+    first.forward.target_groups.append("20002")
+    assert second.forward.source_groups == []
+    assert second.forward.target_groups == []
+
+
+def test_forward_delay_window_is_ordered():
+    """转发延迟区间语义与其余延迟字段一致：最小不超过最大。"""
+    cfg = RepeaterConfig()
+    assert cfg.forward.delay_min_seconds <= cfg.forward.delay_max_seconds
+
+
+def test_forward_config_rejects_negative_numbers():
+    """负权重 / 负数冷却不得生效：数值字段以 ge 下界声明非负，真实 SDK 的 pydantic
+    校验层直接拒绝（本机对真实 maibot_sdk 实测为 ValidationError，ValidationError
+    是 ValueError 子类）；fake SDK 对齐这条校验，防止「负值悄悄按负值生效」在本地
+    测试里被放行。运行时另有非负 clamp 兜底（forwards.auto，第 2 组）。
+    """
+    with pytest.raises(ValueError):
+        RepeaterConfig(forward={"weight_send": -5})
+    with pytest.raises(ValueError):
+        RepeaterConfig(forward={"cooldown_seconds": -1})
+    with pytest.raises(ValueError):
+        RepeaterConfig(forward={"delay_min_seconds": -0.5})
+
+
 @pytest.mark.skipif(tomllib is None, reason="需要 Python 3.11+ 的 tomllib")
 def test_config_toml_repeat_defaults_match_design():
     """[repeat] 节与 [plugin].config_version 的 toml 默认值与 design D2 表逐项一致（独立字面量）；scope.ignore_senders 的默认空列表一并在此钉死（与 config.py 默认同口径，防 toml 侧漂移）。"""
@@ -138,7 +208,7 @@ def test_config_toml_repeat_defaults_match_design():
         raw = tomllib.load(fp)
     repeat = raw.get("repeat")
     assert isinstance(repeat, dict), "config.toml 缺少 [repeat] 节"
-    assert raw["plugin"]["config_version"] == "1.1.0"
+    assert raw["plugin"]["config_version"] == "1.2.0"
     assert repeat["enabled"] is True
     assert repeat["window_seconds"] == 120
     assert repeat["threshold"] == 3
@@ -157,6 +227,48 @@ def test_config_toml_repeat_defaults_match_design():
 
 
 @pytest.mark.skipif(tomllib is None, reason="需要 Python 3.11+ 的 tomllib")
+def test_config_toml_forward_defaults_match_design():
+    """[forward] 节的 toml 默认值与 design D6 表逐项一致（独立字面量，防 toml 侧漂移）。
+
+    字段全集一并在此钉死：config.toml 多写废弃键或漏写新键都会红。
+    """
+    with CONFIG_TOML.open("rb") as fp:
+        raw = tomllib.load(fp)
+    forward = raw.get("forward")
+    assert isinstance(forward, dict), "config.toml 缺少 [forward] 节"
+    assert set(forward) == {
+        "enabled",
+        "source_groups",
+        "target_groups",
+        "weight_send",
+        "weight_silence",
+        "dedup_ttl_seconds",
+        "cooldown_seconds",
+        "target_cooldown_seconds",
+        "delay_min_seconds",
+        "delay_max_seconds",
+        "trigger_source_planner",
+        "trigger_target_planner",
+        "view_failure_fallback_threshold",
+        "inject_max_chars",
+    }
+    assert forward["enabled"] is False
+    assert forward["source_groups"] == []
+    assert forward["target_groups"] == []
+    assert forward["weight_send"] == 30
+    assert forward["weight_silence"] == 70
+    assert forward["dedup_ttl_seconds"] == 1800
+    assert forward["cooldown_seconds"] == 60
+    assert forward["target_cooldown_seconds"] == 60
+    assert forward["delay_min_seconds"] == 0.5
+    assert forward["delay_max_seconds"] == 2.0
+    assert forward["trigger_source_planner"] is True
+    assert forward["trigger_target_planner"] is True
+    assert forward["view_failure_fallback_threshold"] == 2
+    assert forward["inject_max_chars"] == 800
+
+
+@pytest.mark.skipif(tomllib is None, reason="需要 Python 3.11+ 的 tomllib")
 def test_config_toml_matches_model_defaults():
     assert tomllib is not None
     with CONFIG_TOML.open("rb") as fp:
@@ -172,6 +284,21 @@ def test_config_toml_matches_model_defaults():
             assert model_value == toml_value, (
                 f"{section_name}.{key} 默认值漂移: config.py={model_value!r} config.toml={toml_value!r}"
             )
+
+
+def test_manifest_version_matches_changelog_head():
+    """manifest version 与最新 CHANGELOG 条目标题一致（0.6.0：新增 [forward] 配置段）。
+
+    仓库没有独立的插件版本常量，manifest 的 version 与 CHANGELOG 首条标题是
+    两个独立来源，互为校验；写错任一侧都会红。
+    """
+    with MANIFEST_JSON.open("r", encoding="utf-8") as fp:
+        manifest = json.load(fp)
+    assert manifest["version"] == "0.6.0"
+    changelog = (MANIFEST_JSON.parent / "CHANGELOG.md").read_text(encoding="utf-8")
+    head = re.search(r"^## \[([^\]]+)\]", changelog, flags=re.MULTILINE)
+    assert head is not None, "CHANGELOG.md 缺少 '## [x.y.z]' 形式的版本条目"
+    assert head.group(1) == manifest["version"]
 
 
 def test_manifest_declares_injection_capabilities():

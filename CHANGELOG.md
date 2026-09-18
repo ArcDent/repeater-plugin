@@ -2,6 +2,21 @@
 
 本项目变更记录，格式遵循 Keep a Changelog，语义化版本见 `_manifest.json`。
 
+## [0.6.0] - 2026-09-18
+
+### Added
+
+- **跨群转发域**（第三行为域，与复读、表情回应并列）：新增 `[forward]` 配置段与 `forwards/` 子包。源群（`forward.source_groups`）出现**合并转发**后，对每个目标群（`forward.target_groups`）独立按**转发权重**（`weight_send` / `weight_silence`，默认 30 / 70）掷骰决定是否自动转发；投递走协议端直发 `send_group_forward_msg`（不走主程序发送链），投递前校验目标群仍在机器人群列表，成功后向目标群注入转发内容（`source_kind=forward`）、按需触发一次要求针对该转发发言的 Planner 主动任务，并向源群注入只列成功群的行为留痕（`source_kind=forward_action`）。三层防护：源消息防重（`dedup_ttl_seconds`）、源群冷却（`cooldown_seconds`，至少一个目标群命中才写）、目标群冷却（`target_cooldown_seconds`）。
+- **请求转发路径**：源群 Planner 触发提示（`trigger_source_planner`）、`request_cross_group_forward` Tool 与 `maisaka.planner.*` 编排由原 `papaya0481/maibot-ForwardMessagesAuto-plugin`（v0.2.12）链路整包移植到 `forwards/request/`；保留查看资格与一次性授权语义，投递前统一校验目标群可用性并把不可用原因返回 Planner（不再出现「未知错误」）。两条路径共用**已投递状态**：自动转发登记过的源消息，请求转发拒绝重复投递。
+- **日志与失败口径**：自动路径投递日志带「自动转发」前缀与目标群号，请求路径沿用原插件前缀，排查时先分路径；共享的群列表刷新失败按未知放行并记 warning、失败后 30 秒退避不重查；`forward.enabled=true` 但 `protocol.base_url` 未配置时启动自检给出提示，命中转发记 warning 并放弃投递（不静默失败）。
+- `plugin.config_version` 1.1.0 → 1.2.0（新增配置段，主程序自动重建 `config.toml` 骨架，已填的旧字段值保留）。
+
+### 部署注意
+
+- **`forward.enabled` 默认 false**：升级后转发域不工作，需显式开启并填写 `source_groups` / `target_groups`；转发域不复用 `[scope]` 白黑名单与 `[behavior]` 延迟，源群过滤只认 `forward.source_groups`。
+- **开启前请停用旧插件** `papaya0481.forward-messages-auto`（配置 `enabled=false` 或移出 plugins 目录）：两条链路同时启用会对同一批合并转发重复处理。
+- 目标群收到的自动转发消息**不写主程序消息库**（协议端直发，与复读/打断出口同属性），目标群上下文由转发内容注入补偿；目标群消息库只有请求转发路径会写入。
+
 ## [0.5.0] - 2026-09-05
 
 ### BREAKING

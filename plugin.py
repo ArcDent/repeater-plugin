@@ -18,9 +18,27 @@ from typing import Any
 
 import aiohttp
 from aiohttp import web
-from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, HookHandler, MaiBotPlugin
+from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, HookHandler, MaiBotPlugin, Tool
 
 from .config import RepeaterConfig
+from .forwards.auto import decide_forward_targets
+from .forwards.nodes import nodes_to_onebot_messages
+from .forwards.request import (
+    FORWARD_AUTHORIZATION_ROUND_KWARG,
+    FORWARD_TOOL_NAME,
+    ForwardingRuntime,
+    GroupIdList,
+    append_user_reminder,
+    build_delivered_key,
+    read_plugin_version,
+)
+from .forwards.source import ForwardSource, parse_forward_source
+from .forwards.state import DeliveredRegistry, ForwardState, GroupAvailabilityCache
+from .forwards.texts import (
+    build_forced_comment_intent,
+    build_forward_content_text,
+    build_forward_trace_text,
+)
 from .reactions import (
     OPPOSITE,
     Decision,
@@ -60,6 +78,23 @@ _PROTOCOL_TIMEOUT_SECONDS = 10
 # Resident flush-loop tick (design.md D2): hardcoded on purpose — far below
 # the default 30s merge window, so worst-case injection lag is window + tick.
 _INJECTION_FLUSH_TICK_SECONDS = 5
+# **群可用性缓存** TTL（change design D4）：硬编码而非配置项——刷新频率是校验
+# 语义的一部分，不是部署偏好；过期后由下一次投递前校验触发重查。
+_FORWARD_GROUP_LIST_TTL_SECONDS = 300.0
+# 群列表刷新失败后的退避窗口：协议端不可达时，每条投递消息都重查会让批量延迟
+# 被每次协议端超时放大；窗口内跳过重查、保持「未知放行」，窗口外再试。
+_FORWARD_GROUP_LIST_FAILURE_BACKOFF_SECONDS = 30.0
+
+
+def _consume_task_exception(task: asyncio.Task) -> None:
+    """取走任务异常，避免无人等待时 asyncio 打「Task exception was never retrieved」。
+
+    只消费不记录：有等待者时异常由 `await` 处的 warning 负责记录（带路径
+    前缀），全部等待者提前取消时也没有可归因的路径上下文可记；取消不是异常。
+    """
+    if task.cancelled():
+        return
+    task.exception()
 
 
 class RepeaterPlugin(MaiBotPlugin):
@@ -78,16 +113,42 @@ class RepeaterPlugin(MaiBotPlugin):
     _bot_display_name_resolved: bool
     _stream_ids: dict[str, str]
     _flush_loop_task: asyncio.Task | None
+    _forward_state: ForwardState
+    _forward_delivered: DeliveredRegistry
+    _forward_availability: GroupAvailabilityCache
+    _forward_group_list_task: asyncio.Task | None
+    _forward_group_list_failed_at: float | None
+    _forward_runtime: ForwardingRuntime | None
+    _forward_tasks: set[asyncio.Task]
+
+    def get_components(self) -> list[dict[str, Any]]:
+        """在 SDK 收集的组件声明上把转发 Tool 的 `chat_scope` 提到**顶层**。
+
+        Runner 只读组件声明**顶层**的 `chat_scope`（缺省回落 `"all"`），
+        `@Tool(chat_scope=…)` 经 SDK 只会落进组件 `metadata`，到不了注册表——
+        不覆写这一层，转发 Tool 在私聊会话里同样可见（可见性过滤失效）。因此
+        这里对转发 Tool 设置顶层 `chat_scope="group"` 并移除 metadata 中重复的
+        同名键，其余组件原样返回。
+        """
+        components = super().get_components()
+        for component in components:
+            if str(component.get("name") or "") != FORWARD_TOOL_NAME:
+                continue
+            component["chat_scope"] = "group"
+            metadata = component.get("metadata")
+            if isinstance(metadata, dict):
+                metadata.pop("chat_scope", None)
+        return components
 
     async def on_load(self) -> None:
         self._runner = None
         self._site = None
         self._tasks = set()
+        self._forward_tasks = set()
         self._flush_loop_task = None
         self._self_qq = ""
         self._emoji_action_supported = True
         self._rebuild_runtime()
-
         if self._injection_state is not None:
             self._bot_display_name = await self._fetch_bot_display_name()
             self._ensure_flush_loop()
@@ -95,26 +156,36 @@ class RepeaterPlugin(MaiBotPlugin):
                 f"上下文注入已启用，麦麦显示名: {self._bot_display_name or '（无，注入时不写名字）'}"
             )
 
+        await self._start_forward_runtime()
         if self.config.plugin.enabled:
             await self._start_webhook()
         try:
             await self._startup_checks()
         except Exception as exc:
             self.ctx.logger.warning(f"启动自检失败: {exc}")
-        self.ctx.logger.info("复读插件已加载（复读与表情回应双行为）")
+        self.ctx.logger.info("复读插件已加载（复读 / 表情回应 / 跨群转发三域）")
 
     async def on_unload(self) -> None:
-        for task in list(self._tasks):
+        pending = list(self._tasks)
+        for task in pending:
             task.cancel()
         self._tasks.clear()
+        await self._stop_forward_runtime()
         await self._stop_webhook()
+        if pending:
+            # 等取消真正落地：卸载返回后不得再有存活的后台任务（含转发投递）。
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             return
         del config_data, version
+        # 先停旧运行时再重建：旧配置的投递任务与请求授权不得跨越配置边界，
+        # 新配置的状态容器（防重/冷却/已投递）随 _rebuild_runtime 换新实例。
+        await self._stop_forward_runtime()
         self._rebuild_runtime()
         self._ensure_flush_loop()
+        await self._start_forward_runtime()
         await self._stop_webhook()
         if self.config.plugin.enabled:
             await self._start_webhook()
@@ -162,6 +233,85 @@ class RepeaterPlugin(MaiBotPlugin):
             if context.enabled and self.config.plugin.enabled
             else None
         )
+        # 转发域状态随每次重建换新实例：配置热更新后旧的防重/冷却/已投递记录
+        # 立即作废，不给新旧配置混用一份过期状态的机会（change task 4.5）。
+        forward = self.config.forward
+        self._forward_state = ForwardState()
+        self._forward_delivered = DeliveredRegistry(
+            ttl_seconds=float(forward.dedup_ttl_seconds)
+        )
+        self._forward_availability = GroupAvailabilityCache(_FORWARD_GROUP_LIST_TTL_SECONDS)
+        # 在途的群列表刷新任务（in-flight 标记，task 5.2）：同一批并发的目标群
+        # 共用一个查询任务，不各查一次协议端；随重建置空（旧任务跑完也只会写
+        # 旧缓存实例，不影响新配置）。
+        self._forward_group_list_task = None
+        # 最近一次群列表刷新失败时刻（None = 尚无失败记录）：失败退避窗口的
+        # 起点，随重建清零，新配置下的首次投递不被旧配置的失败牵连。
+        self._forward_group_list_failed_at = None
+        self._forward_runtime = (
+            ForwardingRuntime(
+                self.ctx,
+                lambda: self.config,
+                # 两条路径共用同一份已投递状态与群可用性缓存（design D5，task 3.4）：
+                # 请求链路据此拒绝自动路径已投递过的重复转发。
+                delivered_registry=self._forward_delivered,
+                availability_cache=self._forward_availability,
+                # 本插件的适配注入：请求路径投递每个目标群前复用自动路径同款
+                # 刷新语义（TTL 判断 + in-flight 合并）；不注入的话，缓存过期后
+                # 请求路径只读过期快照、会静默放行到已失效的群（design D4）。
+                group_list_refresher=lambda: self._ensure_group_availability("请求转发"),
+                plugin_version=read_plugin_version(),
+            )
+            if self._forward_enabled()
+            else None
+        )
+
+    def _forward_enabled(self) -> bool:
+        """转发域总闸：`plugin.enabled` 与 `forward.enabled` 的合取（spec 转发域开关）。"""
+        return bool(self.config.plugin.enabled and self.config.forward.enabled)
+
+    # ---- 转发域：生命周期 ----
+
+    async def _start_forward_runtime(self) -> None:
+        """启动转发域运行时；转发域关闭或启动失败时不保留运行时（整域停用）。"""
+        runtime = self._forward_runtime
+        if runtime is None:
+            return
+        try:
+            await runtime.start()
+        except Exception as exc:
+            self._forward_runtime = None
+            self.ctx.logger.warning(f"跨群转发运行时启动失败，转发域已停用: {exc}")
+            return
+        forward = self.config.forward
+        self.ctx.logger.info(
+            f"跨群转发已启用：源群 {len(forward.source_groups)} 个 / 目标群 {len(forward.target_groups)} 个"
+        )
+
+    async def _stop_forward_runtime(self) -> None:
+        """取消未开始的转发任务并落盘请求转发状态（卸载与配置更新共用）。"""
+        self._cancel_forward_tasks()
+        runtime = self._forward_runtime
+        self._forward_runtime = None
+        if runtime is None:
+            return
+        try:
+            await runtime.stop()
+        except Exception as exc:
+            self.ctx.logger.warning(f"停止跨群转发运行时失败: {exc}")
+
+    def _cancel_forward_tasks(self) -> None:
+        """取消转发域后台任务（配置更新后旧配置的投递不再继续）。"""
+        for task in list(self._forward_tasks):
+            task.cancel()
+        self._forward_tasks.clear()
+
+    def _spawn_forward(self, coro: Any) -> asyncio.Task:
+        """转发域后台任务：同时进入总任务集（卸载统一取消）与转发任务集（配置更新取消）。"""
+        task = self._spawn(coro)
+        self._forward_tasks.add(task)
+        task.add_done_callback(self._forward_tasks.discard)
+        return task
 
     # ---- Webhook 服务 ----
 
@@ -624,7 +774,7 @@ class RepeaterPlugin(MaiBotPlugin):
             #    return_exceptions 兜住任何未预期异常——否则异常会落到外层
             #    except、把直发一并丢掉（design D4，return_exceptions 必需）。
             outcomes = await asyncio.gather(
-                self._append_repeat_context(
+                self._append_context(
                     group_id,
                     build_trigger_visible_text(candidate),
                     "repeat_trigger",
@@ -671,24 +821,34 @@ class RepeaterPlugin(MaiBotPlugin):
         #    区分行为类型（design D3），message_id 附直发响应 data.message_id。
         data = response.get("data")
         sent_message_id = data.get("message_id") if isinstance(data, dict) else None
-        await self._append_repeat_context(
+        await self._append_context(
             group_id, build_behavior_visible_text(decision), decision.kind, sent_message_id
         )
 
-    async def _append_repeat_context(
-        self, group_id: str, text: str, source_kind: str, message_id: Any
+    async def _append_context(
+        self,
+        group_id: str,
+        text: str,
+        source_kind: str,
+        message_id: Any,
+        log_prefix: str = "",
     ) -> None:
-        """把一条复读域上下文消息写入麦麦聊天历史（change design D3）。
+        """把一条域内上下文消息写入麦麦聊天历史（change design D3）。
 
-        复读注入是 planner 拦截的即时一次性补偿，无幂等键需求，不复用
-        表情回应域的 InjectionState（去重/聚合/回滚是外部事件流聚合的
-        需求）。失败（stream 查不到 / append 异常或失败）记 warning 即返：
-        不重试、不回滚，调用方照常走后续步骤——注入与直发成败解耦。
+        复读与转发两域共用：注入都是 planner 拦截 / 协议端直发的即时一次性补偿，
+        无幂等键需求，不复用表情回应域的 InjectionState（去重/聚合/回滚是外部
+        事件流聚合的需求）。失败（stream 查不到 / append 异常或失败）记 warning
+        即返：不重试、不回滚，调用方照常走后续步骤——注入与直发成败解耦。
+
+        `log_prefix` 只影响 warning 文案：转发域的注入日志带「自动转发」前缀
+        （design D8 的路径前缀口径，便于按路径 grep），复读域不传、沿用
+        `source_kind` 自带语境。
         """
+        prefix = f"{log_prefix} " if log_prefix else ""
         stream_id = await self._get_stream_id(group_id)
         if not stream_id:
             self.ctx.logger.warning(
-                f"取不到群 {group_id} 的 stream，跳过注入 source_kind={source_kind}"
+                f"{prefix}取不到群 {group_id} 的 stream，跳过注入 source_kind={source_kind}"
             )
             return
         try:
@@ -701,14 +861,391 @@ class RepeaterPlugin(MaiBotPlugin):
             )
         except Exception as exc:
             # 宽捕获是有意的：注入失败不得拖垮编舞的后续步骤（BLE001 口径）。
-            self.ctx.logger.warning(f"注入复读域上下文异常 source_kind={source_kind}: {exc}")
+            self.ctx.logger.warning(
+                f"{prefix}注入上下文异常 group={group_id} source_kind={source_kind}: {exc}"
+            )
             return
         if not (isinstance(response, dict) and response.get("success")):
-            self.ctx.logger.warning(f"注入复读域上下文失败 source_kind={source_kind}: {response}")
+            self.ctx.logger.warning(
+                f"{prefix}注入上下文失败 group={group_id} source_kind={source_kind}: {response}"
+            )
             return
         self.ctx.logger.info(
-            f"已注入复读域上下文 group={group_id} source_kind={source_kind} message_id={message_id}"
+            f"已注入上下文 group={group_id} source_kind={source_kind} message_id={message_id}"
         )
+
+    # ---- 转发域：自动路径（chat.receive.before_process observe Hook）----
+
+    @HookHandler(
+        "chat.receive.before_process",
+        name="forward_detector",
+        mode="observe",
+        order="late",
+        description="观察源群合并转发：门禁、防重与冷却后逐目标群掷骰，命中转后台投递（ADR 0009/0010）。",
+    )
+    async def handle_forward_message(self, **kwargs: Any) -> None:
+        """**自动转发**入口（observe 模式：不参与主链 abort 决策）。
+
+        转发域**不拦截**源消息——源消息照常进主程序处理链与麦麦上下文。同步段
+        只做纯内存工作（形态校验 → **源群**门禁 → 防重/冷却 → 逐**目标群**掷骰），
+        命中后先写冷却再 spawn 后台投递（design D2）。observe 模式的返回值不改写
+        kwargs、不请求 abort，因此返回 None；未捕获异常记 warning 后放行——
+        挂在每条群消息的主链上，宁可漏一次转发也不干扰主程序消息处理。
+        """
+        try:
+            self._process_forward_message(kwargs.get("message"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ctx.logger.warning(f"自动转发检测处理消息失败: {exc}")
+
+    def _process_forward_message(self, message: Any) -> None:
+        """门禁 → 防重/冷却 → 掷骰 → spawn；全程无 await 点（design D2）。
+
+        从解析到写冷却、spawn 为止没有任何 await：同一事件循环上并发调度的
+        handler 不会对同一条**转发源消息**重复掷骰。非候选、**源群**不在白名单、
+        沉默出口、冷却期内一律不产生任何副作用（不写冷却、不登记、不起任务）。
+        """
+        forward = self.config.forward
+        if not self._forward_enabled():
+            return
+        source = parse_forward_source(message, self._self_qq)
+        if source is None:
+            self.ctx.logger.debug(f"自动转发跳过非候选消息: {str(message)[:120]}")
+            return
+        if source.group_id not in qq_set(forward.source_groups):
+            return
+        if self._forward_runtime is not None:
+            # 请求转发链路的入口提示（spec 请求转发链路）：源群 Planner 触发由
+            # 运行时按 trigger_source_planner / 永久防重自行判定，冷却与防重
+            # 只约束自动路径，不压制这条提示。
+            self._forward_runtime.observe_source_message(message)
+        now = time.time()
+        if self._forward_state.is_duplicate(
+            source.message_id, float(forward.dedup_ttl_seconds), now
+        ):
+            return
+        if self._forward_state.is_group_cooling(
+            source.group_id, float(forward.cooldown_seconds), now
+        ):
+            return
+        self._forward_state.mark_message(source.message_id, now)
+        # **目标群**冷却只压制该群：先按请求路径同款口径归一（去空、去重、去
+        # 首尾空白），再剔除冷却中的群，最后对剩余群逐个独立掷骰。
+        candidates = [
+            group_id
+            for group_id in GroupIdList.normalize(forward.target_groups)
+            if not self._forward_state.is_target_cooling(
+                group_id, float(forward.target_cooldown_seconds), now
+            )
+        ]
+        hits = decide_forward_targets(
+            candidates,
+            source.group_id,
+            forward.weight_send,
+            forward.weight_silence,
+            random.random,
+        )
+        if not hits:
+            # 沉默出口：不写任何冷却，后续消息仍可正常参与掷骰。
+            self.ctx.logger.info(
+                f"自动转发掷骰全部沉默 group={source.group_id} msg={source.message_id}"
+            )
+            return
+        # 先写冷却再 spawn：投递成败不影响已进入的冷却（与复读域同款顺序）。
+        self._forward_state.mark_group(source.group_id, now)
+        self._forward_state.mark_targets(hits, now)
+        self.ctx.logger.info(
+            f"自动转发命中 group={source.group_id} msg={source.message_id} targets={hits}"
+        )
+        tasks = [self._spawn_forward(self._deliver_forward_to_target(source, target)) for target in hits]
+        self._spawn_forward(self._finalize_forward_delivery(source, hits, tasks))
+
+    async def _deliver_forward_to_target(
+        self, source: ForwardSource, target_group_id: str
+    ) -> bool:
+        """单个**目标群**的投递编舞（design D7）：延迟 → 可用性校验 → 直发 → 注入 → 强制发言。
+
+        返回该目标群是否投递成功（供**转发留痕**汇总）。任一步失败记 warning
+        后返回 False：不重试、不熔断其它目标群与后续消息。内容注入先于
+        **强制发言**（spec 转发内容注入），且只在直发成功后发生（spec 自动转发
+        的投递）。
+        """
+        forward = self.config.forward
+        try:
+            await self._delay(forward.delay_min_seconds, forward.delay_max_seconds)
+            if not (self.config.protocol.base_url or "").strip():
+                # 协议端未配置：明确放弃投递（spec 转发域开关，不静默失败）。
+                self.ctx.logger.warning(
+                    f"自动转发放弃投递：protocol.base_url 未配置 target={target_group_id}"
+                )
+                return False
+            # 可用性校验（design D4）：缓存新鲜时直接查表，未命中或过期时先补
+            # 一次群列表查询；查询失败按未知放行——校验是减少无效投递的优化，
+            # 不允许变成新的静默失败源（task 5.2）。
+            await self._ensure_group_availability("自动转发")
+            if not self._forward_availability.is_available(target_group_id, time.time()):
+                self.ctx.logger.warning(
+                    f"自动转发跳过不可用目标群 target={target_group_id}（不在机器人群列表）"
+                )
+                return False
+            messages = nodes_to_onebot_messages(source.nodes)
+            if not messages:
+                self.ctx.logger.warning(
+                    f"自动转发放弃投递：转发节点重建为空 target={target_group_id}"
+                )
+                return False
+            # 协议端直发：只依赖群号，与 Host 聊天流/Platform IO 路由解耦（ADR 0010）。
+            if await self._send_group_forward(target_group_id, messages) is None:
+                return False
+            self.ctx.logger.info(
+                f"自动转发已投递 target={target_group_id} msg={source.message_id}"
+            )
+            await self._register_forward_delivered(source, target_group_id)
+            await self._append_forward_content(source, target_group_id)
+            if forward.trigger_target_planner:
+                await self._trigger_forward_comment(source, target_group_id)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ctx.logger.warning(f"自动转发投递异常: target={target_group_id} 原因={exc}")
+            return False
+
+    async def _send_group_forward(
+        self, target_group_id: str, messages: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """**协议端直发**一条合并转发（`send_group_forward_msg`，ADR 0010，task 5.1）。
+
+        成功返回协议端完整响应体：`data` 只保证兼容 `message_id` / `res_id` /
+        `forward_id` 三种键（不同协议端实现给的不一样），调用方不得依赖其中某
+        一个。失败返回 None：不可达与 HTTP 200 + `status != ok` 沿用既有成功
+        判定口径，带「自动转发」前缀与目标群号记 warning，不重试、不熔断后续
+        目标群与后续消息（design D8）。
+        """
+        response = await self._call_protocol(
+            "send_group_forward_msg",
+            {
+                # 群号按协议端惯例：纯数字转 int（与复读直发同款归一）。
+                "group_id": coerce_message_id(target_group_id),
+                "messages": messages,
+            },
+        )
+        if response is None:
+            self.ctx.logger.warning(
+                f"自动转发投递失败（协议端不可达）: target={target_group_id}"
+            )
+            return None
+        if protocol_call_failed(response):
+            detail = protocol_failure_detail(response)
+            self.ctx.logger.warning(
+                f"自动转发投递失败: target={target_group_id} 原因={detail}"
+            )
+            return None
+        return response
+
+    async def _finalize_forward_delivery(
+        self,
+        source: ForwardSource,
+        targets: list[str],
+        tasks: list[asyncio.Task],
+    ) -> None:
+        """等齐本次命中的投递任务，成功后向**源群**注入**转发留痕**（design D7）。
+
+        成功集合按 `target_groups` 顺序取（与配置顺序一致，文案稳定）；全部失败
+        不注入（spec 转发留痕注入）。任务取消或异常一律按未成功处理，不阻断
+        其它目标群。
+        """
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        delivered = [target for target, result in zip(targets, results) if result is True]
+        if not delivered:
+            self.ctx.logger.info(f"自动转发本次无成功目标群 msg={source.message_id}")
+            return
+        await self._append_forward_trace(source, delivered)
+
+    async def _append_forward_trace(
+        self, source: ForwardSource, delivered_targets: list[str]
+    ) -> None:
+        """**转发留痕注入**：向**源群**注入实际投递成功的目标群清单。
+
+        `source_kind=forward_action`（spec 转发留痕注入）；文案只列成功群，
+        空清单不注入。注入失败由 `_append_context` 记 warning，不回滚已完成的投递。
+        """
+        text = build_forward_trace_text(delivered_targets)
+        if not text:
+            return
+        await self._append_context(
+            source.group_id, text, "forward_action", source.message_id, log_prefix="自动转发"
+        )
+
+    async def _register_forward_delivered(
+        self, source: ForwardSource, target_group_id: str
+    ) -> None:
+        """登记**已投递状态**：键为源聊天流 + **转发源消息** ID（design D5）。
+
+        **请求转发**按同一个键拒绝重复投递。源群 stream 查不到时跳过登记
+        （键不完整就无从与请求路径对齐），只记 warning。
+        """
+        stream_id = await self._get_stream_id(source.group_id)
+        if not stream_id:
+            self.ctx.logger.warning(
+                f"自动转发无法登记已投递状态：取不到源群 {source.group_id} 的 stream "
+                f"target={target_group_id}"
+            )
+            return
+        self._forward_delivered.register(
+            build_delivered_key(stream_id, source.message_id),
+            [target_group_id],
+            time.time(),
+        )
+
+    async def _append_forward_content(
+        self, source: ForwardSource, target_group_id: str
+    ) -> None:
+        """**转发内容注入**：把这条合并转发的可读文本注入**目标群**聊天历史。
+
+        `source_kind=forward`（spec 转发内容注入）。注入失败只记 warning，
+        不重试、不阻断后续的**强制发言**。
+        """
+        text = build_forward_content_text(
+            source, max_chars=int(self.config.forward.inject_max_chars)
+        )
+        await self._append_context(
+            target_group_id, text, "forward", source.message_id, log_prefix="自动转发"
+        )
+
+    async def _trigger_forward_comment(
+        self, source: ForwardSource, target_group_id: str
+    ) -> None:
+        """**强制发言**：向**目标群**触发一次要求针对这条转发发言的 Planner 主动任务。
+
+        软约束（spec 强制发言）：Planner 仍可能沉默，插件不检测也不补发。触发
+        失败只记 warning，不影响已完成的投递与注入。
+        """
+        stream_id = await self._get_stream_id(target_group_id)
+        if not stream_id:
+            self.ctx.logger.warning(
+                f"自动转发跳过强制发言触发：取不到群 {target_group_id} 的 stream"
+            )
+            return
+        intent = build_forced_comment_intent(source)
+        try:
+            response = await self.ctx.maisaka.proactive.trigger(
+                stream_id,
+                intent=intent,
+                reason="自动转发投递成功",
+                priority="normal",
+                metadata={
+                    "trigger_kind": "auto_forward",
+                    "source_message_id": source.message_id,
+                },
+            )
+        except Exception as exc:
+            self.ctx.logger.warning(f"自动转发强制发言触发异常: target={target_group_id} 原因={exc}")
+            return
+        if not (isinstance(response, dict) and response.get("success")):
+            self.ctx.logger.warning(
+                f"自动转发强制发言触发失败: target={target_group_id} 响应={response}"
+            )
+            return
+        self.ctx.logger.info(f"自动转发已触发目标群发言 target={target_group_id}")
+
+    async def _refresh_group_list(self) -> bool:
+        """协议端 `get_group_list` → **群可用性缓存**（design D4，task 5.2）。
+
+        返回本次是否拿到可信群列表。查询失败（不可达 / 协议端失败 / 返回体不
+        认识）时按未知处理：不建立可信快照，`is_available` 未知放行并只记
+        warning——校验是「减少无效投递」的优化，不允许变成新的静默失败源。
+        失败同时登记时刻，退避语义见 `_ensure_group_availability`。
+
+        日志一律用稳定域 tag「跨群转发」：本任务可能被自动 / 请求两条路径
+        共享等待，不能携带任何单一调用方的路径前缀（按路径的成败由各等待方
+        在 `await` 处自行记录）。
+        """
+        response = await self._call_protocol("get_group_list", {})
+        if response is None:
+            self._mark_forward_group_list_failure()
+            self.ctx.logger.warning(
+                "跨群转发取群列表失败（协议端不可达），目标群可用性校验按未知放行"
+            )
+            return False
+        if protocol_call_failed(response):
+            detail = protocol_failure_detail(response)
+            self._mark_forward_group_list_failure()
+            self.ctx.logger.warning(f"跨群转发取群列表失败: 原因={detail}")
+            return False
+        data = response.get("data")
+        groups = [
+            str(item.get("group_id") or "").strip()
+            for item in (data if isinstance(data, list) else [])
+            if isinstance(item, dict)
+        ]
+        self._forward_availability.update(groups, time.time())
+        if not groups:
+            self._mark_forward_group_list_failure()
+            self.ctx.logger.warning(
+                "跨群转发群列表返回体不认识（没有可用群号），可用性校验按未知放行"
+            )
+            return False
+        self._forward_group_list_failed_at = None
+        self.ctx.logger.info(f"跨群转发群列表已刷新: {len(groups)} 个群")
+        return True
+
+    async def _ensure_group_availability(self, log_prefix: str) -> None:
+        """确保**群可用性缓存**新鲜（design D4，task 5.2）。
+
+        缓存新鲜（TTL 300s 内）直接返回，不触碰协议端；未命中或过期时查一次
+        群列表。并发投递共用一个在途刷新任务（in-flight 标记）：第一个到达者
+        发起查询，其余等待同一结果，不会每个目标群各查一次。查询失败只记
+        warning，缓存保持未知——调用方的 `is_available` 按未知放行。
+
+        刷新失败后 `_FORWARD_GROUP_LIST_FAILURE_BACKOFF_SECONDS` 内不再发起
+        新查询：首次失败由刷新任务记 warning，退避窗口内跳过且不刷 warning，
+        窗口外再试——协议端不可达时不至于每条投递都吃一次协议端超时。
+
+        `log_prefix` 是**等待方**的路径前缀（自动投递传「自动转发」、请求转发
+        传「请求转发」），无默认值：本次刷新的成败由各等待方在 `await` 处按
+        自己的前缀记录，刷新任务本身只用稳定域 tag（见 `_refresh_group_list`）。
+        """
+        now = time.time()
+        if self._forward_availability.has_fresh_data(now):
+            return
+        task = self._forward_group_list_task
+        if task is None or task.done():
+            if self._forward_group_list_backoff_active(now):
+                # 退避窗口内：不发起新查询、不重复刷 warning（失败已记录）。
+                return
+            task = self._spawn_forward(self._refresh_group_list())
+            self._forward_group_list_task = task
+            # 刷新任务可能先失去全部等待者（等待方被取消）再抛非取消异常：
+            # 创建处消费一次异常，避免 asyncio 打「Task exception was never
+            # retrieved」；有等待者时 await 照常把异常抛给等待方记录。
+            task.add_done_callback(_consume_task_exception)
+        try:
+            refreshed = await task
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # 宽捕获是有意的（BLE001 口径）：刷新任务失败不得拖垮投递，未知放行。
+            self._mark_forward_group_list_failure()
+            self.ctx.logger.warning(f"{log_prefix}群列表刷新任务异常: {exc}")
+            return
+        if refreshed:
+            # 成功细节由刷新任务按域 tag 记 info，这里只补路径归属的调试记录。
+            self.ctx.logger.debug(f"{log_prefix}群列表刷新成功，可用性校验按最新列表判定")
+        else:
+            self.ctx.logger.warning(f"{log_prefix}群列表刷新失败，目标群可用性校验按未知放行")
+
+    def _mark_forward_group_list_failure(self) -> None:
+        """登记最近一次群列表刷新失败时刻，作为退避窗口起点。"""
+        self._forward_group_list_failed_at = time.time()
+
+    def _forward_group_list_backoff_active(self, now: float) -> bool:
+        """距最近一次刷新失败是否仍在退避窗口内（无失败记录即不在窗口内）。"""
+        failed_at = self._forward_group_list_failed_at
+        if failed_at is None:
+            return False
+        return now - failed_at < _FORWARD_GROUP_LIST_FAILURE_BACKOFF_SECONDS
 
     async def _is_self_message(self, message_id: str, now: float) -> bool:
         """被回应消息的原作者是否是麦麦自己。查不到时按他人消息处理。"""
@@ -810,10 +1347,17 @@ class RepeaterPlugin(MaiBotPlugin):
         """探活协议端并补齐麦麦自己的 QQ 号。失败只告警，不阻断加载。
 
         不探测 set_msg_emoji_like：该动作没有无副作用的探测方式，
-        真实支持情况在首次贴表情时按 retcode 判定。
+        真实支持情况在首次贴表情时按 retcode 判定。转发域开启时额外校验
+        协议端 HTTP 通道与群列表可用性（spec 转发域开关：协议端未配置时必须
+        在启动自检里可见，自动转发命中时放弃投递且不静默）。
         """
-        if not (self.config.protocol.base_url or "").strip():
+        base_url = (self.config.protocol.base_url or "").strip()
+        if not base_url:
             self.ctx.logger.warning("protocol.base_url 未配置，插件不会贴任何表情")
+            if self._forward_enabled():
+                self.ctx.logger.warning(
+                    "跨群转发已启用但 protocol.base_url 未配置，自动转发命中时将放弃投递"
+                )
             return
 
         response = await self._call_protocol("get_login_info", {})
@@ -834,6 +1378,158 @@ class RepeaterPlugin(MaiBotPlugin):
                 "取不到麦麦自己的 QQ 号，「有人给麦麦自己消息贴表情」将按他人消息的概率处理；"
                 "可在配置里手填 protocol.self_qq"
             )
+        if self._forward_enabled():
+            await self._refresh_group_list()
+
+    # ---- 转发域：请求路径（Planner Hook / Tool，全部委托 ForwardingRuntime）----
+
+    @HookHandler(
+        "maisaka.planner.before_request",
+        name="forward_view_result_capture",
+        mode="blocking",
+        order="late",
+        description="同步源群查看资格，并在待判断时向 Planner 请求追加一次续轮提醒（请求转发链路）。",
+    )
+    async def capture_view_forward_result(self, **kwargs: Any) -> dict[str, Any]:
+        """源群 Planner 请求前：同步查看资格 + 续轮判断提醒（原插件链路契约）。
+
+        kwargs 改写（追加提醒）只在 blocking 模式下生效，因此本 handler 与
+        after_response 两个 handler 都用 blocking（allow_abort=false，返回
+        continue 即放行）。委托失败记 warning 后放行——转发域不得拖垮主链。
+        """
+        runtime = self._forward_runtime
+        session_id = str(kwargs.get("session_id") or "").strip()
+        if runtime is None or not session_id:
+            return {"action": "continue", "modified_kwargs": kwargs}
+        try:
+            history_items = kwargs.get("items") if "items" in kwargs else kwargs.get("messages")
+            runtime.capture_view_results(session_id, history_items)
+            reminder = runtime.build_view_judgment_reminder(session_id)
+            if reminder:
+                if isinstance(kwargs.get("items"), list):
+                    kwargs["items"] = append_user_reminder(kwargs["items"], reminder)
+                elif isinstance(kwargs.get("messages"), list):
+                    kwargs["messages"].append({"role": "user", "content": reminder})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ctx.logger.warning(f"转发域查看资格同步失败: {exc}")
+        return {"action": "continue", "modified_kwargs": kwargs}
+
+    @HookHandler(
+        "maisaka.planner.after_response",
+        name="forward_request_authorize",
+        mode="blocking",
+        order="early",
+        description="清洗转发 Tool 参数并签发一次性会话凭据（请求转发链路，EARLY）。",
+    )
+    async def authorize_forward_request_context(self, **kwargs: Any) -> dict[str, Any]:
+        """模型响应后（EARLY）：清洗参数、签发一次性凭据并标记本轮。
+
+        只接受本 Hook 签发的凭据，正式 Tool handler 不信任模型可写的
+        platform / group_id / stream_id 字段（spec 请求转发链路）。
+        """
+        runtime = self._forward_runtime
+        if runtime is None:
+            return {"action": "continue", "modified_kwargs": kwargs}
+        session_id = str(kwargs.get("session_id") or "").strip()
+        try:
+            if "output_items" in kwargs:
+                output_items, authorization_round = runtime.authorize_forward_output_items(
+                    session_id, kwargs.get("output_items")
+                )
+                kwargs["output_items"] = output_items
+            else:
+                tool_calls, authorization_round = runtime.authorize_forward_calls(
+                    session_id, kwargs.get("tool_calls")
+                )
+                kwargs["tool_calls"] = tool_calls
+            kwargs[FORWARD_AUTHORIZATION_ROUND_KWARG] = authorization_round
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ctx.logger.warning(f"转发域请求授权失败: {exc}")
+        return {"action": "continue", "modified_kwargs": kwargs}
+
+    @HookHandler(
+        "maisaka.planner.after_response",
+        name="forward_auto_view_orchestrator",
+        mode="blocking",
+        order="late",
+        description="按当前查看资格编排自动查看续接，替换/清洗本轮输出（请求转发链路，LATE）。",
+    )
+    async def orchestrate_view_before_forward(self, **kwargs: Any) -> dict[str, Any]:
+        """模型响应后（LATE）：编排自动查看续接（路径 B 替换本轮输出）。
+
+        本轮标记由 EARLY handler 写入、LATE handler 消费（消费即弹出，避免
+        标记泄漏到 Host 的 kwargs）。
+        """
+        runtime = self._forward_runtime
+        authorization_round = str(kwargs.pop(FORWARD_AUTHORIZATION_ROUND_KWARG, "") or "")
+        session_id = str(kwargs.get("session_id") or "").strip()
+        if runtime is None or not session_id:
+            return {"action": "continue", "modified_kwargs": kwargs}
+        try:
+            if "output_items" in kwargs:
+                kwargs["output_items"] = await runtime.transform_after_output_items(
+                    session_id, kwargs.get("output_items"), authorization_round
+                )
+            else:
+                response, tool_calls = await runtime.transform_after_response(
+                    session_id,
+                    kwargs.get("response"),
+                    kwargs.get("tool_calls"),
+                    authorization_round,
+                )
+                kwargs["response"] = response
+                kwargs["tool_calls"] = tool_calls
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ctx.logger.warning(f"转发域响应编排失败: {exc}")
+        return {"action": "continue", "modified_kwargs": kwargs}
+
+    @Tool(
+        FORWARD_TOOL_NAME,
+        description=(
+            "把本群的一条合并转发消息分享到其它群聊。只在 QQ 群聊可用；"
+            "调用前必须已经完整查看该转发内容，msg_id 取自查看结果。"
+        ),
+        parameters={
+            "msg_id": {
+                "type": "string",
+                "description": "要分享的合并转发消息 ID（msg_id）",
+                "required": True,
+            },
+            "sharing_reason": {
+                "type": "string",
+                "description": "为什么值得分享（一句话，可空）",
+            },
+            "content_summary": {
+                "type": "string",
+                "description": "查看连续失败达到降级阈值后使用的忠实内容摘要（可空）",
+            },
+        },
+        chat_scope="group",
+        # 请求路径要等真实顺序投递，Host 默认 60s 可能不够（对齐原插件声明）。
+        timeout_ms=120000,
+    )
+    async def request_cross_group_forward(
+        self,
+        msg_id: str,
+        sharing_reason: str = "",
+        content_summary: str = "",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """转发 Tool（`chat_scope="group"`）：整段委托请求转发运行时。
+
+        运行时不读模型可写的平台/群号/聊天流字段，只消费 EARLY Hook 签发的
+        一次性凭据（在 kwargs 里）；因此这里把 Host 注入的完整上下文字典原样透传。
+        """
+        runtime = self._forward_runtime
+        if runtime is None:
+            return {"success": False, "content": "跨群转发未启用，无法执行转发请求。"}
+        return await runtime.request_forward(msg_id, sharing_reason, content_summary, kwargs)
 
 
 def create_plugin() -> RepeaterPlugin:

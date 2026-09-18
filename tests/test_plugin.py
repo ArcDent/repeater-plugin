@@ -139,6 +139,7 @@ def make_plugin(protocol_responses: dict[str, Any] | None = None) -> RepeaterPlu
     plugin._runner = None
     plugin._site = None
     plugin._tasks = set()
+    plugin._forward_tasks = set()
     plugin._flush_loop_task = None
     plugin._self_qq = ""
     plugin._emoji_action_supported = True
@@ -1114,12 +1115,12 @@ def test_injection_coroutine_exception_keeps_direct_send(monkeypatch):
     """触发消息注入协程抛未预期异常（gather return_exceptions 兜底，
     design D4）：异常项记 warning 后继续，直发照常发生。
 
-    _append_repeat_context 自身吞掉常规异常；这里直接替换成抛异常的注入
+    _append_context 自身吞掉常规异常；这里直接替换成抛异常的注入
     协程，专打 gather 的异常兜底——没有 return_exceptions 时异常会上抛、
     外层 except 会把直发一并丢掉。
     """
     plugin = make_plugin()
-    original_append_context = plugin._append_repeat_context
+    original_append_context = plugin._append_context
 
     async def flaky_injection(
         group_id: str, text: str, source_kind: str, message_id: Any
@@ -1128,7 +1129,7 @@ def test_injection_coroutine_exception_keeps_direct_send(monkeypatch):
             raise RuntimeError("注入协程炸了")
         await original_append_context(group_id, text, source_kind, message_id)
 
-    plugin._append_repeat_context = flaky_injection  # type: ignore[assignment]
+    plugin._append_context = flaky_injection  # type: ignore[assignment]
 
     async def scenario() -> list[str]:
         for sender in ("20002", "20003", "20004"):
@@ -1196,7 +1197,7 @@ def test_append_failure_does_not_block_direct_send_or_intercept():
     assert texts == ["草"]  # 注入失败不阻断直发
     calls = plugin.ctx.maisaka.context.calls
     assert [c["source_kind"] for c in calls] == ["repeat_trigger", "repeat"]
-    failed = [t for t in plugin.ctx.logger.texts("warning") if "注入复读域上下文失败" in t]
+    failed = [t for t in plugin.ctx.logger.texts("warning") if "注入上下文失败" in t]
     assert len(failed) == 2  # 两路注入各失败一次，无重试
 
 
@@ -1222,7 +1223,7 @@ def test_append_exception_does_not_block_direct_send_or_intercept():
     assert trigger_result["action"] == "abort"
     assert texts == ["草"]
     assert attempted == ["repeat_trigger", "repeat"]  # 各试一次，次数定格
-    failed = [t for t in plugin.ctx.logger.texts("warning") if "注入复读域上下文异常" in t]
+    failed = [t for t in plugin.ctx.logger.texts("warning") if "注入上下文异常" in t]
     assert len(failed) == 2
 
 
@@ -1287,16 +1288,20 @@ def test_interrupt_outlet_injection_payloads():
 
 MANIFEST_JSON = Path(__file__).resolve().parent.parent / "_manifest.json"
 PLUGIN_PY = Path(__file__).resolve().parent.parent / "plugin.py"
-
-# Hook subscriptions are consumed via decorators, not self.ctx.* calls.
-HOOK_CAPABILITIES = {"chat.receive.before_process"}
+PLUGIN_ROOT = PLUGIN_PY.parent
+# 能力消费面按整包统计：请求转发链路（forwards/**）直接用 `self._ctx.*` 调
+# capability，只扫 plugin.py 会漏掉 send.forward / chat.open_session 这类声明，
+# 而 Host 授权层缺声明一律拒绝（2026-09-05 事故的同类漂移）。
+PLUGIN_SOURCES = [PLUGIN_PY, *sorted((PLUGIN_ROOT / "forwards").rglob("*.py"))]
 
 # ctx.logger rides the logging channel, not the capability authorization layer.
 _NON_CAPABILITY_PROXIES = {"logger"}
+# plugin.py 用 self.ctx；forwards/request 的运行时用 self._ctx。
+_CTX_ACCESSORS = {"ctx", "_ctx"}
 
 
 def _ctx_call_capabilities(source: str) -> set[str]:
-    """Collect `self.ctx.<proxy>...<method>()` call sites as capability names."""
+    """Collect `self.<ctx|_ctx>...<method>()` call sites as capability names."""
     tree = ast.parse(source)
     used: set[str] = set()
 
@@ -1313,12 +1318,39 @@ def _ctx_call_capabilities(source: str) -> set[str]:
         if not isinstance(node, ast.Call):
             continue
         parts = dotted(node.func)
-        if parts is None or len(parts) < 4 or parts[0] != "self" or parts[1] != "ctx":
+        if parts is None or len(parts) < 4 or parts[0] != "self":
             continue
-        if parts[2] in _NON_CAPABILITY_PROXIES:
+        if parts[1] not in _CTX_ACCESSORS or parts[2] in _NON_CAPABILITY_PROXIES:
             continue
         used.add(".".join(parts[2:]))
     return used
+
+
+def _hook_capabilities(source: str) -> set[str]:
+    """Collect `@HookHandler("<hook>", ...)` subscriptions as capability names."""
+    tree = ast.parse(source)
+    used: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in node.decorator_list:
+            if not isinstance(decorator, ast.Call) or not decorator.args:
+                continue
+            if not (isinstance(decorator.func, ast.Name) and decorator.func.id == "HookHandler"):
+                continue
+            hook = decorator.args[0]
+            if isinstance(hook, ast.Constant) and isinstance(hook.value, str):
+                used.add(hook.value)
+    return used
+
+
+def _plugin_capabilities() -> set[str]:
+    """整包消费的 capability 调用与 Hook 订阅集合。"""
+    consumed: set[str] = set()
+    for path in PLUGIN_SOURCES:
+        source = path.read_text(encoding="utf-8")
+        consumed |= _ctx_call_capabilities(source) | _hook_capabilities(source)
+    return consumed
 
 
 def test_manifest_identity():
@@ -1338,14 +1370,12 @@ def test_manifest_declares_every_consumed_capability():
 
     2026-09-05 线上事故：复读发送走 ctx.send.text 但 manifest 未声明，
     Host 授权层逐次以 E_CAPABILITY_DENIED 拒绝；当时本文件用硬编码等值
-    断言，清单跟着代码一起漏。改为从 plugin.py 源码派生消费集合再比对，
-    漏声明与死声明双向都拦。
+    断言，清单跟着代码一起漏。改为从整包源码（plugin.py + forwards/**）
+    派生消费集合再比对，漏声明与死声明双向都拦。
     """
     with MANIFEST_JSON.open("r", encoding="utf-8") as fp:
         manifest = json.load(fp)
-    with PLUGIN_PY.open("r", encoding="utf-8") as fp:
-        source = fp.read()
-    consumed = _ctx_call_capabilities(source) | HOOK_CAPABILITIES
+    consumed = _plugin_capabilities()
     declared = set(manifest["capabilities"])
     assert declared == consumed, (
         f"manifest capabilities 与代码消费漂移: 缺 {sorted(consumed - declared)},"

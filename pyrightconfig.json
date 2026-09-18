@@ -1,5 +1,5 @@
 {
-  "include": ["config.py", "plugin.py", "reactions.py", "repeats.py"],
+  "include": ["config.py", "plugin.py", "reactions.py", "repeats.py", "forwards"],
   "pythonVersion": "3.10",
   "typeCheckingMode": "standard",
   "reportMissingImports": "none"
