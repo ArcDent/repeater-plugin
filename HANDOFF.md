@@ -8,16 +8,16 @@
 - **已部署 arclinux 并群内实测通过**：插件 v0.6.0 上线、旧插件 `papaya0481_forward-messages-auto` 置 `enabled=false`（原配置备份 `config.toml.bak-before-repeater-migration`）、`[forward]` 段填 源群 3 个（新生群/柴犬新窝/蹲饼群，去掉失效的 `747839793`）目标群 2 个（新生群/柴犬新窝）；容器内实测 `get_group_list` 返回 ok/6 群，目标群均在列表
 - 已归档至 `openspec/changes/archive/2026-09-18-integrate-cross-group-forward/`（29/29 任务全勾选），delta 已 sync 为新建主 spec `openspec/specs/cross-group-forward/spec.md`（10 需求 / 30 场景）
 - 验证基线：pytest **604 passed** / pyright **0 errors** / ruff 51 项（全部为 AGENTS.md 声明的六类有意偏离）
+- 远端仓库：`gh repo create ArcDent/repeater-plugin --private` 创建并推送 `main`（此前该插件从未推送过任何远端）；manifest `urls.repository` 同步指向新地址，测试合成包名 `sending_emojis_plugin` → `repeater_plugin` 一并清理
 
 ## 进行中
 
-- 无活跃 openspec change；改动已提交（本次提交含代码 + 测试 + 文档 + openspec 工件）
+- 无活跃 openspec change；改动已提交并推送至 `ArcDent/repeater-plugin`（**私有**仓库，`origin` 已配置，`main` 跟踪 `origin/main`）
 
 ## 下一步（用户手动）
 
 1. 观测自动转发的线上表现：`[forward]` 默认 `weight_send=30 / weight_silence=70`、源群与目标群冷却各 60s——按实际刷屏情况调权重与冷却；日志按「自动转发」前缀与目标群号过滤
-2. 决定是否 push `main` 至远端
-3. GitHub 仓库改名 `repeater-plugin`（`git remote set-url` 同步，README 迁移段有完整清单）；改名后同步 manifest 的 `urls.repository`（当前仍指旧名）
+2. 若计划提交 MaiBot 插件中心（其要求**公开**仓库），需把 `ArcDent/repeater-plugin` 在 Settings 里改为 public；manifest 的 `urls.repository` 已指向该仓库
 
 ## 关键发现
 
