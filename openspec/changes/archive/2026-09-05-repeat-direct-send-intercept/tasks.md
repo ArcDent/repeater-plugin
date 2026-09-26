@@ -2,7 +2,7 @@
 
 ## 1. 事实查证与决策层准备
 
-- [x] 1.1 查 `REFERENCE/MaiBot/src/plugin_runtime/host/message_utils.py` 确认 hook 消息 dict 的 sender 昵称字段可得性，按 design D3 定触发消息注入的发送者显示名策略
+- [x] 1.1 查 `arcwsl:~/github/REFERENCE/MaiBot/src/plugin_runtime/host/message_utils.py` 确认 hook 消息 dict 的 sender 昵称字段可得性，按 design D3 定触发消息注入的发送者显示名策略
   - seam：design.md 的 Open Questions 段（结论回写处，非代码任务）
   - 验收：Open Questions 更新为结论（昵称可得 → 注入显示名用昵称；不可得 → 用 QQ 号），附源码文件:行号依据
 

@@ -25,7 +25,7 @@
 - `chat_scope` 只在 Runner 读取的**组件声明顶层**生效：SDK 的 `@Tool(chat_scope=…)` 只落进 `metadata`，Host 顶层优先 → 必须靠 `get_components()` 覆写补齐，否则 Tool 在私聊可见（ADR 0009 相关的承载性 hack）
 - SDK 的 `HookHandler.error_policy` 默认 `ErrorPolicy.SKIP`、系统级 Hook 超时兜底 60s（`plugin_runtime.hook_blocking_timeout_sec`）——不声明也不会中断主链，比原插件显式声明的 3~6s 更宽松
 - `forwards/request/` 必须保持「不 import `forwards/nodes.py`」：后者依赖 `repeats.py`，会让 `import forwards.request` 在裸目录下失败；共享解析核心走无依赖的叶子模块 `forwards/forward_segments.py`
-- 主程序 `EventType.ON_MESSAGE` 事件分发代码被注释（`REFERENCE/MaiBot/src/chat/message_receive/bot.py:846`），是死事件；普通消息观测的活口是 `chat.receive.before_process` hook
+- 主程序 `EventType.ON_MESSAGE` 事件分发代码被注释（`arcwsl:~/github/REFERENCE/MaiBot/src/chat/message_receive/bot.py:846`），是死事件；普通消息观测的活口是 `chat.receive.before_process` hook
 - hook 消息解析失败打 debug、webhook 上报形态不认识打 warning——两个口径相反且各有理由，详见 AGENTS.md 复读域条目
 - 改配置语义必须四源同改（config.py hint、config.toml 注释、README、AGENTS.md）；改版本号必须与 `_manifest.json` 同源
 - openspec delta 的 MODIFIED 块不能改名 Scenario 标题（`validate --strict` 判漏抄）；sync 到主 spec 时新建 capability 要保留 delta 的 `## Purpose`
