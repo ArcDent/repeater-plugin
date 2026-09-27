@@ -23,10 +23,14 @@ from .forward_segments import (
     normalize_forward_nodes,
 )
 
-# 段类型 → 文本占位文案的唯一来源：image / emoji 都按 OneBot image 段重建，
-# 取不到媒体来源时降级为本映射里的占位文本；键集同时是「按图片重建的段类型」
-# 判定集。forwards/texts.py 的段摘要直接引用本映射，不另起副本。
+# 段类型 → 注入摘要占位文案的唯一来源（forwards/texts.py 直接引用，不另起
+# 副本）；键集同时是「按图片重建的段类型」判定集。发送转换里媒体段取不到
+# 字节与可用引用时不再降级为占位文本，而是整段不产出（design D5）。
 SEGMENT_PLACEHOLDERS: dict[str, str] = {"image": "[图片]", "emoji": "[表情]"}
+
+# 段内 data 视为文件引用的形态：协议端可解析的 URI 前缀，或含路径分隔符的
+# 本地路径；其余（如主程序处理后写入的中文描述文本）不是引用，不得当 file 发出。
+_MEDIA_REFERENCE_PREFIXES = ("http://", "https://", "base64://", "file://")
 
 
 @dataclass(frozen=True)
@@ -101,19 +105,21 @@ def _text_segment(text: str) -> dict[str, Any]:
     return {"type": "text", "data": {"text": text}}
 
 
-def _media_segment(segment_type: str, segment: dict[str, Any]) -> dict[str, Any]:
-    """image / emoji 段 → OneBot image 段。
+def _media_segment(segment: dict[str, Any]) -> dict[str, Any] | None:
+    """image / emoji 段 → OneBot image 段；三分支（design D5）。
 
-    优先用 `binary_data_base64` 转 `base64://`，其次用段内引用（`data` 字段），
-    两者皆无时降级为文本占位。
+    优先用 `binary_data_base64` 转 `base64://`；其次段内 `data` 为协议端可解析
+    的引用形态（URI 前缀或含路径分隔符）时按该引用重建；两者皆无时返回 None，
+    该段不产出——非引用形态的段内数据（如主程序写入的中文描述文本）绝不当
+    file 引用发出，所在节点可能因此变空并被整条丢弃。
     """
     binary = str(segment.get("binary_data_base64") or "").strip()
     if binary:
         return {"type": "image", "data": {"file": f"base64://{binary}"}}
     reference = str(segment.get("data") or "").strip()
-    if reference:
+    if reference.startswith(_MEDIA_REFERENCE_PREFIXES) or "/" in reference or "\\" in reference:
         return {"type": "image", "data": {"file": reference}}
-    return _text_segment(SEGMENT_PLACEHOLDERS[segment_type])
+    return None
 
 
 def extract_at_qq(segment: dict[str, Any]) -> str:
@@ -146,7 +152,8 @@ def _segment_to_onebot(segment: dict[str, Any]) -> list[dict[str, Any]]:
         at = _at_segment(segment)
         return [at] if at is not None else []
     if segment_type in SEGMENT_PLACEHOLDERS:
-        return [_media_segment(segment_type, segment)]
+        media = _media_segment(segment)
+        return [media] if media is not None else []
     if is_forward_segment(segment):
         return nodes_to_onebot_messages(
             _to_forward_nodes(normalize_forward_nodes(segment.get("data")))

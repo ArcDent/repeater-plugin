@@ -3,7 +3,7 @@
 
 [plugin]
 enabled = true
-config_version = "1.2.0"
+config_version = "1.3.0"
 
 # 协议端 HTTP 上报的接收端点。协议端需要新增一个 HTTP 上报目标指向这里
 # （好友申请插件已占 18080，本插件默认 18081）。
@@ -128,3 +128,12 @@ trigger_target_planner = true
 view_failure_fallback_threshold = 2
 # 转发内容注入文本的长度上限，超长按上限截断并带省略标记
 inject_max_chars = 800
+# 转发模式：direct = 掷骰命中即直发目标群（默认，升级后行为不变）；
+# planner = 命中后把富摘要交给目标群 Planner 决策是否转发，经决策 Tool 回路执行
+mode = "direct"
+# 自动转发路径开关：关闭后源群合并转发不再掷骰、不投递，请求转发路径不受影响
+auto_enabled = true
+# 请求转发路径开关：关闭后转发 Tool 与源群 Planner 入口提示不再生效，自动转发路径不受影响
+request_enabled = true
+# 等待转发卡片摘要就绪的上限（秒）：超时仍未就绪则记 warning 并放弃本次，不掷骰、不写冷却、不投递
+summary_timeout_seconds = 10

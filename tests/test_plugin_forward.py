@@ -1,19 +1,23 @@
 """plugin.py 转发域测试：编排层 + 端到端集成 + manifest 能力面。
 
-覆盖自动路径 Hook（门禁 / 防重 / 冷却 / 逐目标群掷骰）、投递编舞（延迟 →
-可用性校验 → 协议端直发 → 内容注入 → 强制发言）、源群留痕、请求链路委托与
-生命周期接线。纯逻辑（掷骰、状态、节点、文案）的单测在 tests/test_forwards_*.py。
+覆盖自动路径 Hook（门禁 / 防重）、**摘要就绪**后的掷骰与冷却写入、直发 / 决策
+两种模式与转发决策 Tool、投递编舞（延迟 → 可用性校验 → 协议端直发 → 富摘要
+注入 → 强制发言）、源群留痕、请求链路委托与生命周期接线。纯逻辑（掷骰、状态、
+节点、文案、决策票）的单测在 tests/test_forwards_*.py。
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import random
 import time
 from pathlib import Path
 from typing import Any
 
+import pytest
+import repeater_plugin.plugin as plugin_module
 from repeater_plugin.forwards.request import (
     FORWARD_AUTHORIZATION_ROUND_KWARG,
     FORWARD_CONTEXT_TOKEN_ARGUMENT,
@@ -31,7 +35,11 @@ from repeater_plugin.forwards.texts import (
 )
 
 from config import RepeaterConfig
-from plugin import _FORWARD_GROUP_LIST_FAILURE_BACKOFF_SECONDS, RepeaterPlugin
+from plugin import (
+    _FORWARD_GROUP_LIST_FAILURE_BACKOFF_SECONDS,
+    DECIDE_FORWARD_TOOL_NAME,
+    RepeaterPlugin,
+)
 from tests.fake_maibot_sdk import FakePluginContext
 
 BOT_QQ = "40004"
@@ -41,6 +49,10 @@ TARGET_B = "20002"
 SOURCE_STREAM = "stream-10001"
 
 _DEFAULT_PROTOCOL_RESPONSE: dict[str, Any] = {"status": "ok", "retcode": 0, "data": {}}
+
+# 消息就绪替身：真实时序里 `processed_plain_text` 在消息入库后才出现（ADR 0011），
+# 工厂默认首次查询即就绪；需要观察轮询 / 超时的用例自行覆盖 `ctx.message`。
+DEFAULT_RICH_SUMMARY = "【合并转发消息（测试）】群友甲：有趣的消息"
 
 
 def make_forward_plugin(
@@ -82,6 +94,8 @@ def make_forward_plugin(
     plugin._self_qq = BOT_QQ
     plugin._emoji_action_supported = True
     plugin._rebuild_runtime()
+    # 消息替身默认就绪：编排任务第一次查询即可拿到富摘要（轮询用例再覆盖）。
+    plugin.ctx.message.default_result = {"processed_plain_text": DEFAULT_RICH_SUMMARY}
 
     plugin.ctx.chat.group_streams = [
         {
@@ -135,6 +149,23 @@ def make_forward_plugin(
     return plugin
 
 
+def hook_text_message(
+    *, group: str, message_id: str, session_id: str, group_name: str = "某群"
+) -> dict[str, Any]:
+    """hook 载荷形态的普通文本消息（携带主程序算好的 `session_id`）。"""
+    return {
+        "message_id": message_id,
+        "platform": "qq",
+        "session_id": session_id,
+        "is_notify": False,
+        "message_info": {
+            "group_info": {"group_id": group, "group_name": group_name},
+            "user_info": {"user_id": "30003", "user_nickname": "群友甲", "user_cardname": ""},
+        },
+        "raw_message": [{"type": "text", "data": "随便聊聊"}],
+    }
+
+
 def forward_node(text: str = "有趣的消息", *, nickname: str = "群友甲") -> dict[str, Any]:
     """一个 `forward` 段内的原始节点（与主程序 hook 侧字段同形）。"""
     return {
@@ -159,7 +190,7 @@ def forward_message(
     return {
         "message_id": message_id,
         "platform": "qq",
-        "session_id": f"session-{group}",
+        "session_id": f"stream-{group}",  # 与 fake chat 能力的流 ID 口径一致（生产里两者同值）
         "is_notify": False,
         "message_info": {
             "group_info": {"group_id": group, "group_name": group_name},
@@ -181,7 +212,7 @@ def coro_name(task: asyncio.Task) -> str:
 
 
 def pending_delivery_tasks(plugin: RepeaterPlugin) -> list[asyncio.Task]:
-    """handler 同步段 spawn 出、尚未执行的按目标群投递任务。"""
+    """编排任务 spawn 出、尚未执行的按目标群投递任务。"""
     return [
         task
         for task in plugin._tasks
@@ -189,12 +220,22 @@ def pending_delivery_tasks(plugin: RepeaterPlugin) -> list[asyncio.Task]:
     ]
 
 
-def pending_finalizers(plugin: RepeaterPlugin) -> list[asyncio.Task]:
+def pending_orchestrators(plugin: RepeaterPlugin) -> list[asyncio.Task]:
+    """同步段 spawn 出、尚未完成的自动路径编排任务。"""
     return [
         task
         for task in plugin._tasks
-        if not task.done() and "_finalize_forward_delivery" in coro_name(task)
+        if not task.done() and "_orchestrate_forward_delivery" in coro_name(task)
     ]
+
+
+async def pump_until(predicate: Any, turns: int = 200) -> None:
+    """让事件循环空转若干轮，直到条件成立（用于等待后台任务的中间状态）。"""
+    for _ in range(turns):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("等待条件未在给定轮次内满足")
 
 
 async def drain_forward_tasks(plugin: RepeaterPlugin) -> None:
@@ -214,6 +255,64 @@ def injections(plugin: RepeaterPlugin, source_kind: str) -> list[dict[str, Any]]
         for call in plugin.ctx.maisaka.context.calls
         if call.get("source_kind") == source_kind
     ]
+
+
+def observe_cooling_at_send(plugin: RepeaterPlugin) -> list[tuple[bool, bool]]:
+    """包一层协议端 spy，观测每次直发时 (源群冷却, 目标群冷却) 是否已写入。
+
+    直发是投递编舞里第一个可断言的公共事件，观测序列按直发调用顺序排列；冷却
+    TTL 取当前配置，调用方需已把相应冷却窗口设为正值（否则观测恒为未冷却）。
+    """
+    observed: list[tuple[bool, bool]] = []
+    raw_call_protocol = plugin._call_protocol
+
+    async def spy_call_protocol(action_name: str, params: dict[str, Any]) -> Any:
+        if action_name == "send_group_forward_msg":
+            now = time.time()
+            observed.append(
+                (
+                    plugin._forward_state.is_group_cooling(
+                        SOURCE_GROUP, float(plugin.config.forward.cooldown_seconds), now
+                    ),
+                    plugin._forward_state.is_target_cooling(
+                        str(params["group_id"]),
+                        float(plugin.config.forward.target_cooldown_seconds),
+                        now,
+                    ),
+                )
+            )
+        return await raw_call_protocol(action_name, params)
+
+    plugin._call_protocol = spy_call_protocol  # type: ignore[assignment]
+    return observed
+
+
+def mark_forward_timeline(
+    plugin: RepeaterPlugin, monkeypatch: pytest.MonkeyPatch, events: list[str]
+) -> list[float]:
+    """装配「轮询 → 掷骰 → 延迟」时间线标记，返回每次 `asyncio.sleep` 的秒数。
+
+    `ctx.message.get_by_id` spy 追加 `get_by_id`；`random.random` 固定 0.0 并
+    先追加 `roll`；`asyncio.sleep` 记录秒数、追加 `delay` 且不真正等待（延迟
+    取值已受控），因此本辅助只适用于不需要真实等待的用例。
+    """
+    raw_get_by_id = plugin.ctx.message.get_by_id
+
+    async def spy_get_by_id(message_id: str, **kwargs: Any) -> Any:
+        events.append("get_by_id")
+        return await raw_get_by_id(message_id, **kwargs)
+
+    monkeypatch.setattr(plugin.ctx.message, "get_by_id", spy_get_by_id)
+    monkeypatch.setattr(random, "random", lambda: events.append("roll") or 0.0)
+    monkeypatch.setattr(random, "uniform", lambda low, high: low)
+    sleeps: list[float] = []
+
+    async def spy_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        events.append("delay")
+
+    monkeypatch.setattr(asyncio, "sleep", spy_sleep)
+    return sleeps
 
 
 class FakeForwardRuntime:
@@ -292,21 +391,24 @@ class FakeForwardRuntime:
 # ---- 4.1 自动路径 Hook：门禁、防重、冷却与掷骰 ----
 
 
-def test_forward_hit_spawns_delivery_tasks_and_writes_cooldowns(tmp_path: Path):
-    """命中转发：每个目标群一个投递任务 + 留痕收尾任务，冷却与防重同步写入。"""
+def test_forward_ready_hit_writes_cooldown_before_delivering(tmp_path: Path):
+    """就绪后命中：先写冷却再 spawn 投递，任务按 target_groups 顺序执行。
+
+    冷却是否先于投递写入，通过每次直发调用时的源群/目标群冷却状态观测
+    （`observe_cooling_at_send`）——协议端直发是编舞里第一个可断言的公共事件。
+    """
     plugin = make_forward_plugin(tmp_path)
     plugin.config.forward.cooldown_seconds = 60
     plugin.config.forward.target_cooldown_seconds = 60
+    cooling_at_send = observe_cooling_at_send(plugin)
 
     async def scenario() -> None:
         await plugin.handle_forward_message(message=forward_message())
-        # handler 必须在同步段完成编排：任务尚未执行，但已经建立
-        assert len(pending_delivery_tasks(plugin)) == 2
-        assert len(pending_finalizers(plugin)) == 1
         await drain_forward_tasks(plugin)
 
     asyncio.run(scenario())
 
+    assert cooling_at_send == [(True, True), (True, True)]  # 两次直发都在冷却写入之后
     now = time.time()
     assert plugin._forward_state.is_duplicate("90001", 1800, now) is True
     assert plugin._forward_state.is_group_cooling(SOURCE_GROUP, 60, now) is True
@@ -316,17 +418,22 @@ def test_forward_hit_spawns_delivery_tasks_and_writes_cooldowns(tmp_path: Path):
         int(TARGET_A),
         int(TARGET_B),
     ]
+    assert [call["visible_text"] for call in injections(plugin, "forward_action")] == [
+        build_forward_trace_text([TARGET_A, TARGET_B])
+    ]
 
 
 def test_forward_non_source_group_has_no_side_effects(tmp_path: Path):
-    """非白名单源群：不掷骰、不起任务、不写冷却。"""
+    """非白名单源群：不掷骰、不起任务、不写冷却、不写防重。"""
     plugin = make_forward_plugin(tmp_path)
 
     asyncio.run(plugin.handle_forward_message(message=forward_message(group="99999")))
 
     assert plugin._tasks == set()
     assert plugin.protocol_calls == []  # type: ignore[attr-defined]
-    assert plugin._forward_state.is_group_cooling(SOURCE_GROUP, 60, time.time()) is False
+    now = time.time()
+    assert plugin._forward_state.is_duplicate("90001", 1800, now) is False
+    assert plugin._forward_state.is_group_cooling(SOURCE_GROUP, 60, now) is False
 
 
 def test_forward_own_message_has_no_side_effects(tmp_path: Path):
@@ -337,7 +444,9 @@ def test_forward_own_message_has_no_side_effects(tmp_path: Path):
 
     assert plugin._tasks == set()
     assert plugin.protocol_calls == []  # type: ignore[attr-defined]
-    assert plugin._forward_state.is_group_cooling(SOURCE_GROUP, 60, time.time()) is False
+    now = time.time()
+    assert plugin._forward_state.is_duplicate("90001", 1800, now) is False
+    assert plugin._forward_state.is_group_cooling(SOURCE_GROUP, 60, now) is False
 
 
 def test_forward_domain_disabled_has_no_side_effects(tmp_path: Path):
@@ -351,6 +460,7 @@ def test_forward_domain_disabled_has_no_side_effects(tmp_path: Path):
     assert plugin._tasks == set()
     assert plugin.protocol_calls == []  # type: ignore[attr-defined]
     now = time.time()
+    assert plugin._forward_state.is_duplicate("90001", 1800, now) is False
     assert plugin._forward_state.is_group_cooling(SOURCE_GROUP, 60, now) is False
     assert plugin._forward_state.is_target_cooling(TARGET_A, 60, now) is False
 
@@ -366,6 +476,7 @@ def test_forward_plugin_disabled_has_no_side_effects(tmp_path: Path):
     assert plugin._tasks == set()
     assert plugin.protocol_calls == []  # type: ignore[attr-defined]
     now = time.time()
+    assert plugin._forward_state.is_duplicate("90001", 1800, now) is False
     assert plugin._forward_state.is_group_cooling(SOURCE_GROUP, 60, now) is False
     assert plugin._forward_state.is_target_cooling(TARGET_A, 60, now) is False
 
@@ -378,6 +489,7 @@ def test_forward_message_without_valid_nodes_has_no_side_effects(tmp_path: Path)
 
     assert plugin._tasks == set()
     assert plugin.protocol_calls == []  # type: ignore[attr-defined]
+    assert plugin._forward_state.is_duplicate("90001", 1800, time.time()) is False
 
 
 def test_forward_silence_outlet_writes_no_cooldown(tmp_path: Path):
@@ -387,9 +499,13 @@ def test_forward_silence_outlet_writes_no_cooldown(tmp_path: Path):
     plugin.config.forward.weight_silence = 1000
     plugin.config.forward.cooldown_seconds = 60
 
-    asyncio.run(plugin.handle_forward_message(message=forward_message()))
+    async def scenario() -> None:
+        await plugin.handle_forward_message(message=forward_message())
+        await drain_forward_tasks(plugin)
+        assert plugin._tasks == set()
 
-    assert plugin._tasks == set()
+    asyncio.run(scenario())
+
     assert plugin.protocol_calls == []  # type: ignore[attr-defined]
     now = time.time()
     assert plugin._forward_state.is_group_cooling(SOURCE_GROUP, 60, now) is False
@@ -702,22 +818,36 @@ def test_forward_trace_injection_failure_does_not_rollback(tmp_path: Path):
 
 
 def test_forward_tool_declared_with_group_chat_scope(tmp_path: Path):
-    """Tool 声明面：名字、处理器、**顶层** `chat_scope="group"` 与超时。
+    """Tool 声明面：两个转发 Tool 都有**顶层** `chat_scope="group"`、处理器名与超时。
 
     Runner 只读组件声明**顶层**字段（缺省按 `"all"`），metadata 里的同名键到
-    不了注册表，因此群聊可见性必须断言在顶层；原插件正为此外加覆写
-    `get_components()`。`timeout_ms=120000` 对齐原插件：请求路径要等真实顺序
-    投递，Host 默认 60s 可能不够。
+    不了注册表，因此群聊可见性必须断言在顶层；少了这层覆写，两个转发 Tool 在
+    私聊会话里同样可见（可见性过滤失效）。`timeout_ms=120000` 对齐原插件：
+    两条路径都要等真实顺序投递 / 投递编舞完成，Host 默认 60s 可能不够。
     """
     plugin = make_forward_plugin(tmp_path)
 
     tools = [component for component in plugin.get_components() if component["type"] == "TOOL"]
 
-    assert [component["name"] for component in tools] == [FORWARD_TOOL_NAME]
-    assert tools[0]["chat_scope"] == "group"
-    assert "chat_scope" not in tools[0]["metadata"]
-    assert tools[0]["metadata"]["timeout_ms"] == 120000
-    assert tools[0]["metadata"]["handler_name"] == "request_cross_group_forward"
+    assert sorted(component["name"] for component in tools) == sorted(
+        [FORWARD_TOOL_NAME, DECIDE_FORWARD_TOOL_NAME]
+    )
+    assert all(component["chat_scope"] == "group" for component in tools)
+    assert all("chat_scope" not in component["metadata"] for component in tools)
+    assert all(component["metadata"]["timeout_ms"] == 120000 for component in tools)
+    request_tool = next(
+        component for component in tools if component["name"] == FORWARD_TOOL_NAME
+    )
+    assert request_tool["metadata"]["handler_name"] == "request_cross_group_forward"
+    decision_tool = next(
+        component for component in tools if component["name"] == DECIDE_FORWARD_TOOL_NAME
+    )
+    assert decision_tool["metadata"]["handler_name"] == "decide_forward_delivery"
+    parameters = decision_tool["metadata"]["parameters_raw"]
+    assert parameters["message_id"]["type"] == "string"
+    assert parameters["message_id"]["required"] is True
+    assert parameters["deliver"]["type"] == "boolean"
+    assert parameters["deliver"]["required"] is True
 
 
 def test_forward_hooks_declared_on_planner_chain(tmp_path: Path):
@@ -961,17 +1091,19 @@ def test_on_load_wires_forward_runtime_and_unload_stops_it(tmp_path: Path, monke
     assert [name for name, _ in plugin.protocol_calls] == ["get_login_info", "get_group_list"]  # type: ignore[attr-defined]
 
 
-def test_on_unload_cancels_inflight_forward_deliveries(tmp_path: Path):
-    """卸载取消在途投递：卸载返回后不残留转发域后台任务。"""
+def test_on_unload_cancels_inflight_orchestration_and_deliveries(tmp_path: Path):
+    """卸载取消在途编排与投递：卸载返回后不残留任何转发域后台任务。"""
     plugin = make_forward_plugin(tmp_path)
     plugin.config.forward.delay_min_seconds = 30.0
     plugin.config.forward.delay_max_seconds = 30.0
 
     async def scenario() -> tuple[bool, set[asyncio.Task]]:
         await plugin.handle_forward_message(message=forward_message())
+        orchestrators = pending_orchestrators(plugin)
+        assert len(orchestrators) == 1
+        # 编排任务先轮询到就绪、掷骰后再 spawn 两个投递任务，随后停在延迟里。
+        await pump_until(lambda: len(pending_delivery_tasks(plugin)) == 2)
         deliveries = pending_delivery_tasks(plugin)
-        assert len(deliveries) == 2
-        await asyncio.sleep(0)  # 让任务进入延迟
         assert not deliveries[0].done()
         await plugin.on_unload()
         await asyncio.sleep(0)
@@ -979,9 +1111,9 @@ def test_on_unload_cancels_inflight_forward_deliveries(tmp_path: Path):
             task
             for task in asyncio.all_tasks()
             if "_deliver_forward_to_target" in coro_name(task)
-            or "_finalize_forward_delivery" in coro_name(task)
+            or "_orchestrate_forward_delivery" in coro_name(task)
         ]
-        return deliveries[0].cancelled(), plugin._forward_tasks | set(live)
+        return orchestrators[0].cancelled(), plugin._forward_tasks | set(live)
 
     cancelled, leftovers = asyncio.run(scenario())
 
@@ -1000,8 +1132,8 @@ def test_config_update_rebuilds_forward_state_and_cancels_old_tasks(tmp_path: Pa
     async def scenario() -> tuple[ForwardState, asyncio.Task]:
         await plugin.handle_forward_message(message=forward_message())
         old_state = plugin._forward_state
+        await pump_until(lambda: bool(pending_delivery_tasks(plugin)))
         old_task = pending_delivery_tasks(plugin)[0]
-        await asyncio.sleep(0)
         await plugin.on_config_update("self", {}, "2")
         await asyncio.sleep(0)
         return old_state, old_task
@@ -1305,10 +1437,15 @@ def expire_availability_snapshot(plugin: RepeaterPlugin, groups: list[str]) -> N
 
 
 def wire_request_source_message(plugin: RepeaterPlugin, message_id: str = "90001") -> None:
-    """把 hook 形态的合并转发挂到消息 capability，供请求路径读取。"""
+    """把 hook 形态的合并转发挂到消息 capability，供请求路径读取。
+
+    替身同时带上 `processed_plain_text`：真实入库形态本就有该字段，自动路径的
+    就绪轮询与请求路径的读取共用这一份替身。
+    """
     plugin.ctx.message.results[message_id] = {
         **forward_message(message_id=message_id),
         "session_id": SOURCE_STREAM,
+        "processed_plain_text": DEFAULT_RICH_SUMMARY,
     }
 
 
@@ -1664,6 +1801,7 @@ def test_silence_keeps_request_forward_tool_available(tmp_path: Path):
 
     async def scenario() -> dict[str, Any]:
         await plugin.handle_forward_message(message=forward_message())
+        await drain_forward_tasks(plugin)
         assert plugin._tasks == set()  # 沉默：无任何后台任务
         return await invoke_request_forward_via_hooks(plugin)
 
@@ -1779,6 +1917,918 @@ def test_merged_forward_does_not_accumulate_repeat_chain(tmp_path: Path):
     assert result["action"] == "continue"  # 复读域不拦截，也不产生任何复读出口
     assert plugin._repeat_state._chains == {}
     assert len(send_group_forward_calls(plugin)) == 2  # 转发域照常完成两群投递
+
+
+# ---- 组 3：同步段收敛、摘要就绪编排、模式与决策 Tool ----
+
+
+def test_forward_sync_section_spawns_orchestration_without_rolling(tmp_path: Path, monkeypatch):
+    """同步段只门禁 + 写防重 + spawn 一个编排任务，不掷骰不写冷却（spec 触发时机）。
+
+    断言在 handler 返回后立即发生——此时编排任务还没获得事件循环，掷骰与冷却
+    写入都没有机会发生；`random.random` 换成计数哨兵，掷骰若留在同步段立刻暴露。
+    """
+    plugin = make_forward_plugin(tmp_path)
+    plugin.config.forward.cooldown_seconds = 60
+    plugin.config.forward.target_cooldown_seconds = 60
+    rolls: list[float] = []
+    monkeypatch.setattr(random, "random", lambda: rolls.append(0.0) or 0.0)
+
+    async def scenario() -> tuple[list[str], dict[str, Any]]:
+        await plugin.handle_forward_message(message=forward_message())
+        now = time.time()
+        observations = {
+            "spawned": [coro_name(task) for task in plugin._tasks if not task.done()],
+            "rolls": list(rolls),
+            "polls": list(plugin.ctx.message.calls),
+            "protocol": list(plugin.protocol_calls),  # type: ignore[attr-defined]
+            "duplicate": plugin._forward_state.is_duplicate("90001", 1800, now),
+            "group_cooling": plugin._forward_state.is_group_cooling(SOURCE_GROUP, 60, now),
+            "target_cooling": plugin._forward_state.is_target_cooling(TARGET_A, 60, now),
+        }
+        await drain_forward_tasks(plugin)
+        return observations.pop("spawned"), observations
+
+    spawned, observations = asyncio.run(scenario())
+
+    assert spawned == ["RepeaterPlugin._orchestrate_forward_delivery"]
+    assert observations["rolls"] == []
+    assert observations["polls"] == []
+    assert observations["protocol"] == []
+    assert observations["duplicate"] is True  # 防重标记先于等待写入
+    assert observations["group_cooling"] is False
+    assert observations["target_cooling"] is False
+
+
+def test_orchestration_waits_for_summary_before_rolling(tmp_path: Path, monkeypatch):
+    """摘要就绪前不掷骰 / 不写冷却 / 不投递；轮询全程只在编排任务内（spec 触发时机）。
+
+    三次 `get_by_id` 依次返回「未落库、未落库、就绪」；哨兵在每次查询前记录
+    当时的掷骰计数、协议端与注入调用、存活任务集合——前两次查询时也没有任何
+    副作用，就绪轮询不是另起的轮询任务。
+    """
+    plugin = make_forward_plugin(tmp_path)
+    plugin.config.forward.cooldown_seconds = 60
+    plugin.ctx.message.sequences["90001"] = [
+        None,
+        None,
+        {"processed_plain_text": DEFAULT_RICH_SUMMARY},
+    ]
+    monkeypatch.setattr(plugin_module, "next_poll_interval", lambda attempt: 0.0)
+    rolls: list[float] = []
+    monkeypatch.setattr(random, "random", lambda: rolls.append(0.0) or 0.0)
+    observations: list[dict[str, Any]] = []
+    raw_get_by_id = plugin.ctx.message.get_by_id
+
+    async def spy_get_by_id(message_id: str, **kwargs: Any) -> Any:
+        observations.append(
+            {
+                "rolls": len(rolls),
+                "protocol": list(plugin.protocol_calls),  # type: ignore[attr-defined]
+                "injections": list(plugin.ctx.maisaka.context.calls),
+                "live_tasks": [coro_name(task) for task in plugin._tasks if not task.done()],
+                "group_cooling": plugin._forward_state.is_group_cooling(
+                    SOURCE_GROUP, 60, time.time()
+                ),
+            }
+        )
+        return await raw_get_by_id(message_id, **kwargs)
+
+    monkeypatch.setattr(plugin.ctx.message, "get_by_id", spy_get_by_id)
+
+    async def scenario() -> None:
+        # 走真实同步段 spawn 路径：轮询期间存活的后台任务就是编排任务本身。
+        await plugin.handle_forward_message(message=forward_message())
+        await drain_forward_tasks(plugin)
+
+    asyncio.run(scenario())
+
+    assert len(observations) == 3
+    assert all(observed["rolls"] == 0 for observed in observations)
+    assert all(observed["protocol"] == [] for observed in observations)
+    assert all(observed["injections"] == [] for observed in observations)
+    assert all(observed["group_cooling"] is False for observed in observations)
+    assert all(
+        observed["live_tasks"] == ["RepeaterPlugin._orchestrate_forward_delivery"]
+        for observed in observations
+    )
+    polls = plugin.ctx.message.calls
+    assert [poll["message_id"] for poll in polls] == ["90001"] * 3
+    # 就绪轮询按消息 ID 单独查，不带 stream_id（陈旧 stream 永远查不到）。
+    assert all(poll["stream_id"] == "" for poll in polls)
+    assert all(poll["include_binary_data"] is False for poll in polls)
+    assert plugin.ctx.logger.texts("warning") == []
+
+
+def test_orchestration_gives_up_after_summary_timeout(tmp_path: Path, monkeypatch):
+    """超时未就绪：warning 含 msg 与源群号，放弃且不掷骰 / 不写冷却 / 不投递。"""
+    plugin = make_forward_plugin(tmp_path)
+    plugin.config.forward.summary_timeout_seconds = 1
+    plugin.config.forward.cooldown_seconds = 60
+    plugin.ctx.message.default_result = None
+    monkeypatch.setattr(plugin_module, "next_poll_interval", lambda attempt: 0.05)
+    rolls: list[float] = []
+    monkeypatch.setattr(random, "random", lambda: rolls.append(0.0) or 0.0)
+
+    asyncio.run(plugin._orchestrate_forward_delivery(parse_source()))
+
+    assert rolls == []
+    assert send_group_forward_calls(plugin) == []
+    assert plugin.ctx.maisaka.context.calls == []
+    now = time.time()
+    assert plugin._forward_state.is_group_cooling(SOURCE_GROUP, 60, now) is False
+    assert plugin._forward_state.is_target_cooling(TARGET_A, 60, now) is False
+    warnings = plugin.ctx.logger.texts("warning")
+    assert len(warnings) == 1
+    assert "摘要就绪超时" in warnings[0]
+    assert "90001" in warnings[0] and SOURCE_GROUP in warnings[0]
+
+
+def test_orchestration_keeps_polling_after_query_exception(tmp_path: Path, monkeypatch):
+    """get_by_id 抛异常按未就绪续等（debug 不刷 warning），不放弃候选（design D2）。"""
+    plugin = make_forward_plugin(tmp_path)
+    attempts: list[dict[str, Any]] = []
+    raw_get_by_id = plugin.ctx.message.get_by_id
+
+    async def flaky_get_by_id(message_id: str, **kwargs: Any) -> Any:
+        attempts.append(kwargs)
+        if len(attempts) == 1:
+            raise RuntimeError("模拟查询失败")
+        return await raw_get_by_id(message_id, **kwargs)
+
+    monkeypatch.setattr(plugin.ctx.message, "get_by_id", flaky_get_by_id)
+
+    asyncio.run(plugin._orchestrate_forward_delivery(parse_source()))
+
+    assert len(attempts) == 2  # 异常后继续轮询，第二次拿到就绪结果
+    assert plugin.ctx.logger.texts("warning") == []
+    assert any("未就绪续等" in text for text in plugin.ctx.logger.texts("debug"))
+
+
+def test_orchestration_polls_by_message_id_without_stream(tmp_path: Path, monkeypatch):
+    """就绪轮询不带 `stream_id`（消息 ID 在平台内唯一，带陈旧 stream 会永远查不到）。"""
+    plugin = make_forward_plugin(tmp_path)
+    plugin._stream_ids.clear()
+    plugin.ctx.chat.group_streams = [
+        stream for stream in plugin.ctx.chat.group_streams if stream["group_id"] != SOURCE_GROUP
+    ]
+    seen: list[dict[str, Any]] = []
+    raw_get_by_id = plugin.ctx.message.get_by_id
+
+    async def spy_get_by_id(message_id: str, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return await raw_get_by_id(message_id, **kwargs)
+
+    monkeypatch.setattr(plugin.ctx.message, "get_by_id", spy_get_by_id)
+
+    asyncio.run(plugin._orchestrate_forward_delivery(parse_source()))
+
+    assert seen == [{"include_binary_data": False}]
+
+
+def test_orchestration_survives_stale_stream_cache(tmp_path: Path, monkeypatch):
+    """群 stream 缓存陈旧（平滑迁移会话后的旧 stream 查不到消息）仍能就绪投递。
+
+    回归用例：就绪轮询若带上按群解析出的**陈旧** stream_id，主机侧按
+    「stream + message_id」过滤会返回空，插件会 11 轮全空、超时放弃——2026-09-27
+    线上实测即此形态（同一群在 chat_sessions 里有多个 session）。
+    """
+    plugin = make_forward_plugin(tmp_path)
+    rich = "【合并转发消息】陈旧 stream 也要能取到富摘要"
+    plugin._stream_ids[SOURCE_GROUP] = "stale-stream-id"
+    calls: list[dict[str, Any]] = []
+
+    async def stale_stream_get_by_id(message_id: str, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        if kwargs.get("stream_id"):
+            return None  # 陈旧 stream 过滤下主机侧查不到
+        return {"processed_plain_text": rich}
+
+    monkeypatch.setattr(plugin.ctx.message, "get_by_id", stale_stream_get_by_id)
+
+    asyncio.run(plugin._orchestrate_forward_delivery(parse_source()))
+
+    assert calls == [{"include_binary_data": False}]
+    assert all("stream_id" not in kwargs for kwargs in calls)
+    assert [call["visible_text"] for call in injections(plugin, "forward")]  # 真的投递并注入
+    sends = send_group_forward_calls(plugin)
+    assert len(sends) == 2
+    assert all(call["group_id"] in (int(TARGET_A), int(TARGET_B)) for call in sends)
+
+
+
+def test_forward_delivery_prefers_hook_observed_session(tmp_path: Path):
+    """群 → 活跃聊天流优先取 hook 上报的 session，能力首匹配只作兜底。
+
+    回归：同一群在 `chat_sessions` 里有新旧多个 session 时，`get_stream_by_group_id`
+    返回列表首匹配（可能是**陈旧**会话）。若**转发内容注入**、**强制发言**触发与
+    **已投递状态**登记落在陈旧会话，麦麦会在死会话里生成回复、发送必然失败
+    （2026-09-27 线上实测：`未找到目标平台: qq` → `legacy.send.qq` 失败），注入的
+    转发内容也不会出现在麦麦真正在读的会话里。
+    """
+    plugin = make_forward_plugin(tmp_path)
+    # 主机侧能力查询返回「陈旧」首匹配（同群多 session 时的真实行为）
+    for stream in plugin.ctx.chat.group_streams:
+        stream["stream_id"] = f"stale-{stream['group_id']}"
+        stream["session_id"] = f"stale-{stream['group_id']}"
+    plugin._stream_ids.clear()
+
+    # 三个群各来一条普通消息：hook 载荷带主程序算好的活跃 session
+    observations = {
+        SOURCE_GROUP: "live-source",
+        TARGET_A: "live-target-a",
+        TARGET_B: "live-target-b",
+    }
+
+    async def scenario() -> None:
+        for index, (group, observed_session) in enumerate(observations.items()):
+            await plugin.handle_forward_message(
+                message=hook_text_message(
+                    group=group, message_id=f"7000{index}", session_id=observed_session
+                )
+            )
+        await plugin._orchestrate_forward_delivery(parse_source())
+
+    asyncio.run(scenario())
+
+    injected = sorted(call["stream_id"] for call in injections(plugin, "forward"))
+    assert injected == ["live-target-a", "live-target-b"]
+    triggered = sorted(call["stream_id"] for call in plugin.ctx.maisaka.proactive.calls)
+    assert triggered == ["live-target-a", "live-target-b"]
+    assert [call["stream_id"] for call in injections(plugin, "forward_action")] == ["live-source"]
+    assert not any("stale" in str(call["stream_id"]) for call in plugin.ctx.maisaka.context.calls)
+    delivered = plugin._forward_delivered.targets_for(
+        build_delivered_key("live-source", "90001"), time.time()
+    )
+    assert sorted(delivered) == [TARGET_A, TARGET_B]
+    # 观察到的群根本不需要再问能力：解析器不该被调用
+    assert [call for call in plugin.ctx.chat.calls if call["method"] == "get_stream_by_group_id"] == []
+
+
+def test_orchestration_injects_rich_summary_and_intent(tmp_path: Path):
+    """富摘要贯通：就绪时取到的富摘要成为注入与 intent 的材料，不走节点摘要兜底。"""
+    plugin = make_forward_plugin(tmp_path)
+    rich = "【合并转发消息（共 2 条）】小明：今晚打牌吗？小红：好啊"
+    plugin.ctx.message.default_result = {"processed_plain_text": rich}
+    source = parse_source()
+
+    asyncio.run(plugin._orchestrate_forward_delivery(source))
+
+    contents = [call["visible_text"] for call in injections(plugin, "forward")]
+    assert len(contents) == 2
+    assert all(rich in text for text in contents)
+    # 节点摘要（`1. 群友甲：有趣的消息`）是富摘要缺失时的兜底，本次不得出现。
+    assert all("有趣的消息" not in text for text in contents)
+    intents = [call["intent"] for call in plugin.ctx.maisaka.proactive.calls]
+    assert len(intents) == 2
+    assert all(rich in intent for intent in intents)
+    assert all("有趣的消息" not in intent for intent in intents)
+
+
+def test_orchestration_sanitizes_control_chars_in_display_text(tmp_path: Path):
+    """来源群名含控制字符：注入与 intent 输出都已清洗（design D3）。"""
+    plugin = make_forward_plugin(tmp_path)
+    source = parse_source(forward_message(group_name="<\x11\x10>柴犬的新窝"))
+
+    asyncio.run(plugin._orchestrate_forward_delivery(source))
+
+    text = injections(plugin, "forward")[0]["visible_text"]
+    assert "\x11" not in text and "\x10" not in text
+    assert "柴犬的新窝" in text
+    intent = plugin.ctx.maisaka.proactive.calls[0]["intent"]
+    assert "\x11" not in intent and "\x10" not in intent
+    assert "柴犬的新窝" in intent
+
+
+@pytest.mark.parametrize(
+    ("auto_enabled", "request_enabled", "expect_orchestration", "expect_hint"),
+    [
+        (True, True, True, True),
+        (False, True, False, False),
+        (True, False, True, False),
+        (False, False, False, False),
+    ],
+)
+def test_forward_path_switch_matrix(
+    tmp_path: Path,
+    auto_enabled: bool,
+    request_enabled: bool,
+    expect_orchestration: bool,
+    expect_hint: bool,
+):
+    """路径开关矩阵：auto_enabled 只停自动编排与自动 Hook 入口提示，request_enabled 只停请求入口。
+
+    自动 Hook 同步段是自动路径的入口（含源群 Planner 入口提示），整体短路；
+    请求转发 Tool 单独跟随 `request_enabled`，两种开关互不牵扯（spec 转发路径开关）。
+    """
+    plugin = make_forward_plugin(tmp_path)
+    plugin.config.forward.auto_enabled = auto_enabled
+    plugin.config.forward.request_enabled = request_enabled
+    runtime = FakeForwardRuntime()
+    plugin._forward_runtime = runtime  # type: ignore[assignment]
+    message = forward_message()
+
+    async def scenario() -> tuple[int, dict[str, Any]]:
+        await plugin.handle_forward_message(message=message)
+        spawned = len([task for task in plugin._tasks if not task.done()])
+        result = await plugin.request_cross_group_forward(msg_id="90001")
+        await drain_forward_tasks(plugin)
+        return spawned, result
+
+    spawned, result = asyncio.run(scenario())
+
+    assert spawned == (1 if expect_orchestration else 0)
+    assert runtime.observed == ([message] if expect_hint else [])
+    if expect_orchestration:
+        assert [params["group_id"] for params in send_group_forward_calls(plugin)] == [
+            int(TARGET_A),
+            int(TARGET_B),
+        ]
+    else:
+        assert send_group_forward_calls(plugin) == []
+    if request_enabled:
+        assert result == {"success": True, "content": "已投递"}
+        assert len(runtime.requests) == 1
+    else:
+        assert result["success"] is False
+        assert result["content"]
+        assert runtime.requests == []
+
+
+def test_planner_mode_triggers_decision_without_delivering(tmp_path: Path):
+    """决策模式命中：不直发不注入，逐命中目标群签发决策票并触发 Planner 决策（spec 转发模式）。
+
+    票里同时登记**转发源消息快照**与**富摘要**：模型决策回来时快照即发送字节的
+    唯一来源（ADR 0011）。intent 必须写明 message_id 与目标群号供模型回传。
+    """
+    plugin = make_forward_plugin(tmp_path)
+    plugin.config.forward.mode = "planner"
+    plugin.config.forward.cooldown_seconds = 60
+    plugin.config.forward.target_cooldown_seconds = 60
+    rich = "【合并转发消息】小明：今晚打牌吗？"
+    plugin.ctx.message.default_result = {"processed_plain_text": rich}
+    source = parse_source()
+
+    asyncio.run(plugin._orchestrate_forward_delivery(source))
+
+    assert send_group_forward_calls(plugin) == []
+    assert plugin.ctx.maisaka.context.calls == []
+    triggers = plugin.ctx.maisaka.proactive.calls
+    assert [call["stream_id"] for call in triggers] == ["stream-20001", "stream-20002"]
+    assert [call["metadata"]["trigger_kind"] for call in triggers] == [
+        "forward_decision",
+        "forward_decision",
+    ]
+    assert [call["metadata"]["source_message_id"] for call in triggers] == ["90001", "90001"]
+    assert [call["metadata"]["target_group_id"] for call in triggers] == [TARGET_A, TARGET_B]
+    intent = triggers[0]["intent"]
+    assert "90001" in intent and TARGET_A in intent and rich in intent
+    assert DECIDE_FORWARD_TOOL_NAME in intent and "deliver" in intent
+    infos = plugin.ctx.logger.texts("info")
+    assert any(
+        "决策模式" in text and TARGET_A in text for text in infos
+    )
+    # 触发成功日志带内部票号（便于对账），但票号不得出现在 intent 里（design D4）。
+    ticket_logs = [text for text in infos if "ticket=" in text]
+    assert len(ticket_logs) == 2
+    assert any(TARGET_A in text for text in ticket_logs)
+    assert any(TARGET_B in text for text in ticket_logs)
+    tickets = [text.rsplit("ticket=", 1)[1] for text in ticket_logs]
+    assert all(ticket and ticket not in intent for ticket in tickets)
+    # 掷骰先行：命中即写冷却，与 direct 模式同一口径（决策结果不影响冷却写入）。
+    now = time.time()
+    assert plugin._forward_state.is_group_cooling(SOURCE_GROUP, 60, now) is True
+    assert plugin._forward_state.is_target_cooling(TARGET_A, 60, now) is True
+    # 票已签发并携带快照 + 富摘要。
+    payload = plugin._forward_tickets.consume("90001", TARGET_A, now=now)
+    assert payload is not None
+    issued_source, issued_summary = payload
+    assert issued_source == source
+    assert issued_summary == rich
+
+
+def test_planner_mode_trigger_failure_warns_and_does_not_deliver(tmp_path: Path):
+    """决策触发失败：按「不转发」收尾——记 warning、焚票、不投递不注入（spec 转发模式）。"""
+    plugin = make_forward_plugin(tmp_path)
+    plugin.config.forward.mode = "planner"
+    plugin.ctx.maisaka.proactive.fail_next = True
+
+    asyncio.run(plugin._orchestrate_forward_delivery(parse_source()))
+
+    assert send_group_forward_calls(plugin) == []
+    assert plugin.ctx.maisaka.context.calls == []
+    warnings = plugin.ctx.logger.texts("warning")
+    assert any("决策" in text and TARGET_A in text for text in warnings)
+    assert plugin._forward_tickets.consume("90001", TARGET_A, now=time.time()) is None
+
+
+def test_planner_mode_warns_when_decision_tickets_expire_unconsumed(tmp_path: Path):
+    """决策票 TTL 到期仍未消费：下一轮决策编排逐票记 warning，含 msg 与目标群号。
+
+    模型始终不调用决策 Tool 时，票由 TTL 清理；清理必须留下可归因的 warning
+    并按「不转发」处理（spec 转发模式：决策结果不可用 MUST 记 warning），不得
+    静默丢弃。
+    """
+    plugin = make_forward_plugin(tmp_path)
+    plugin.config.forward.mode = "planner"
+    plugin._forward_tickets.ttl_seconds = 0.05
+
+    async def scenario() -> None:
+        await plugin._orchestrate_forward_delivery(parse_source())
+        await asyncio.sleep(0.08)  # 首轮票过期且未被消费
+        await plugin._orchestrate_forward_delivery(
+            parse_source(forward_message(message_id="90002"))
+        )
+
+    asyncio.run(scenario())
+
+    timeout_warnings = [
+        text for text in plugin.ctx.logger.texts("warning") if "决策票超时未消费" in text
+    ]
+    assert len(timeout_warnings) == 2
+    assert any("90001" in text and TARGET_A in text for text in timeout_warnings)
+    assert any("90001" in text and TARGET_B in text for text in timeout_warnings)
+    # 超时票不投递：两轮编排都只触发决策，没有任何直发与注入。
+    assert send_group_forward_calls(plugin) == []
+    assert plugin.ctx.maisaka.context.calls == []
+
+
+def test_direct_mode_has_no_decision_tickets_or_triggers(tmp_path: Path):
+    """直发模式：命中即投递，无决策票、无决策触发（spec 转发模式）。"""
+    plugin = make_forward_plugin(tmp_path)
+
+    async def scenario() -> None:
+        await plugin.handle_forward_message(message=forward_message())
+        await drain_forward_tasks(plugin)
+
+    asyncio.run(scenario())
+
+    assert len(send_group_forward_calls(plugin)) == 2
+    assert plugin._forward_tickets.consume("90001", TARGET_A, now=time.time()) is None
+    assert [call["metadata"]["trigger_kind"] for call in plugin.ctx.maisaka.proactive.calls] == [
+        "auto_forward",
+        "auto_forward",
+    ]
+
+
+def test_invalid_forward_mode_warns_and_falls_back_to_direct(tmp_path: Path):
+    """非法 mode：记 warning 并按 direct 处理（spec 转发模式 / design D6）。"""
+    plugin = make_forward_plugin(tmp_path)
+    plugin.config.forward.mode = "smart"
+
+    asyncio.run(plugin._orchestrate_forward_delivery(parse_source()))
+
+    assert len(send_group_forward_calls(plugin)) == 2
+    assert plugin._forward_tickets.consume("90001", TARGET_A, now=time.time()) is None
+    assert [call["metadata"]["trigger_kind"] for call in plugin.ctx.maisaka.proactive.calls] == [
+        "auto_forward",
+        "auto_forward",
+    ]
+    warnings = plugin.ctx.logger.texts("warning")
+    assert any("smart" in text and "direct" in text for text in warnings)
+
+
+def test_decision_tool_delivers_with_valid_ticket_and_burns_it(tmp_path: Path):
+    """决策 Tool 持票转发：走同一套投递编舞（直发 → 富摘要注入 → 强制发言 → 登记留痕），票被焚。"""
+    plugin = make_forward_plugin(tmp_path)
+    plugin.config.forward.mode = "planner"
+    rich = "【合并转发消息】小明：今晚打牌吗？"
+    plugin.ctx.message.default_result = {"processed_plain_text": rich}
+
+    async def scenario() -> tuple[dict[str, Any], dict[str, Any]]:
+        await plugin._orchestrate_forward_delivery(parse_source())
+        first = await plugin.decide_forward_delivery(
+            message_id="90001", deliver=True, group_id=TARGET_A, stream_id="stream-20001"
+        )
+        second = await plugin.decide_forward_delivery(
+            message_id="90001", deliver=True, group_id=TARGET_A, stream_id="stream-20001"
+        )
+        await drain_forward_tasks(plugin)
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first["success"] is True
+    assert second["success"] is False  # 同票二次调用被拒
+    assert second["content"]
+    assert [params["group_id"] for params in send_group_forward_calls(plugin)] == [int(TARGET_A)]
+    content = injections(plugin, "forward")
+    assert [call["stream_id"] for call in content] == ["stream-20001"]
+    assert rich in content[0]["visible_text"]
+    # 决策后的投递照常登记**已投递状态**并注入源群**转发留痕**（决策模式不留痕盲区）。
+    key = build_delivered_key(SOURCE_STREAM, "90001")
+    assert plugin._forward_delivered.is_delivered(key, TARGET_A, time.time()) is True
+    assert [call["visible_text"] for call in injections(plugin, "forward_action")] == [
+        build_forward_trace_text([TARGET_A])
+    ]
+    # 两个目标群的决策触发在前，投递成功后的**强制发言**触发在后。
+    assert [call["metadata"]["trigger_kind"] for call in plugin.ctx.maisaka.proactive.calls] == [
+        "forward_decision",
+        "forward_decision",
+        "auto_forward",
+    ]
+    # 决策消费与无票拒绝都有可 grep 的 info 文案（含目标群号与消息 ID）。
+    infos = plugin.ctx.logger.texts("info")
+    assert any(
+        "目标群选择转发" in text and TARGET_A in text and "90001" in text for text in infos
+    )
+    assert any("拒绝无票调用" in text and TARGET_A in text for text in infos)
+
+
+def test_decision_tool_deliver_true_but_delivery_fails(tmp_path: Path):
+    """决策 Tool 选择转发但投递失败：返回失败，不注入、不触发强制发言（spec 转发模式）。
+
+    票已在决策时消费（决策本身生效），投递失败只影响本次结果：不重试、不写
+    **转发内容注入**、不触发**强制发言**，也不产生源群**转发留痕**。
+    """
+    plugin = make_forward_plugin(
+        tmp_path,
+        protocol_responses={
+            "send_group_forward_msg": {"status": "failed", "retcode": 1200, "wording": "禁言中"}
+        },
+    )
+    plugin.config.forward.mode = "planner"
+
+    async def scenario() -> dict[str, Any]:
+        await plugin._orchestrate_forward_delivery(parse_source())
+        result = await plugin.decide_forward_delivery(
+            message_id="90001", deliver=True, group_id=TARGET_A, stream_id="stream-20001"
+        )
+        await drain_forward_tasks(plugin)
+        return result
+
+    result = asyncio.run(scenario())
+
+    assert result["success"] is False
+    assert result["content"]
+    assert len(send_group_forward_calls(plugin)) == 1  # 只尝试一次，不重试
+    assert injections(plugin, "forward") == []
+    assert injections(plugin, "forward_action") == []
+    # 只留下决策触发的 trigger_kind：投递失败不得触发**强制发言**。
+    assert [call["metadata"]["trigger_kind"] for call in plugin.ctx.maisaka.proactive.calls] == [
+        "forward_decision",
+        "forward_decision",
+    ]
+    assert any(
+        TARGET_A in text and "投递失败" in text for text in plugin.ctx.logger.texts("warning")
+    )
+
+
+def test_decision_tool_decline_logs_and_does_not_deliver(tmp_path: Path):
+    """决策 Tool 持票不转发：只记 info 收尾，不投递不注入，票已焚（spec 转发模式）。"""
+    plugin = make_forward_plugin(tmp_path)
+    plugin.config.forward.mode = "planner"
+
+    async def scenario() -> dict[str, Any]:
+        await plugin._orchestrate_forward_delivery(parse_source())
+        result = await plugin.decide_forward_delivery(
+            message_id="90001", deliver=False, group_id=TARGET_A
+        )
+        await drain_forward_tasks(plugin)
+        return result
+
+    result = asyncio.run(scenario())
+
+    assert result["success"] is True
+    assert send_group_forward_calls(plugin) == []
+    assert plugin.ctx.maisaka.context.calls == []
+    assert any(
+        "不转发" in text and TARGET_A in text for text in plugin.ctx.logger.texts("info")
+    )
+    assert plugin._forward_tickets.consume("90001", TARGET_A, now=time.time()) is None
+
+
+def test_decision_tool_rejects_unknown_and_unrelated_group_calls(tmp_path: Path):
+    """决策 Tool 无票 / 无关群调用被拒且不投递；无关群不焚掉合法目标群的票。
+
+    与命中无关的群（未签发任何票）拿同一条 message_id 调用也匹配不到票——
+    每个**目标群**的票是独立的，互不代偿。
+    """
+    plugin = make_forward_plugin(tmp_path)
+    plugin.config.forward.mode = "planner"
+    other_group = "20003"
+
+    async def scenario() -> tuple[dict[str, Any], dict[str, Any]]:
+        await plugin._orchestrate_forward_delivery(parse_source())
+        unknown = await plugin.decide_forward_delivery(
+            message_id="99999", deliver=True, group_id=TARGET_A
+        )
+        unrelated_group = await plugin.decide_forward_delivery(
+            message_id="90001", deliver=True, group_id=other_group
+        )
+        await drain_forward_tasks(plugin)
+        return unknown, unrelated_group
+
+    unknown, unrelated_group = asyncio.run(scenario())
+
+    assert unknown["success"] is False and unknown["content"]
+    assert unrelated_group["success"] is False and unrelated_group["content"]
+    assert send_group_forward_calls(plugin) == []
+    assert plugin.ctx.maisaka.context.calls == []
+    now = time.time()
+    assert plugin._forward_tickets.consume("90001", TARGET_A, now=now) is not None
+    assert plugin._forward_tickets.consume("90001", TARGET_B, now=now) is not None
+
+
+def test_decision_tool_rejects_calls_without_group_context(tmp_path: Path):
+    """决策 Tool 缺群上下文：按无票拒绝并记 warning，不投递。"""
+    plugin = make_forward_plugin(tmp_path)
+    plugin.config.forward.mode = "planner"
+
+    async def scenario() -> dict[str, Any]:
+        await plugin._orchestrate_forward_delivery(parse_source())
+        return await plugin.decide_forward_delivery(message_id="90001", deliver=True)
+
+    result = asyncio.run(scenario())
+
+    assert result["success"] is False and result["content"]
+    assert send_group_forward_calls(plugin) == []
+    assert any(
+        "群上下文" in text for text in plugin.ctx.logger.texts("warning")
+    )
+
+
+# ---- 组 4：集成测试（全链路 / 图片保全 / 决策三路径 / 冷却新语义 / 两路共用回归） ----
+
+
+def test_direct_mode_full_chain_order_from_poll_to_trace(tmp_path: Path, monkeypatch):
+    """直发模式全链路（4.1）：轮询 → 掷骰 → 延迟 → 冷却写入 → 直发（hook 载荷图片字节）。
+
+    编舞尾段（共享群列表刷新 → 逐群「直发 → 注入 → 触发」→ 源群留痕）由
+    `test_auto_path_end_to_end_hook_to_trace` 覆盖，本用例只断言独有增量：
+    就绪轮询先于两次掷骰与两次延迟、冷却在每次直发时已写入，以及图片段的
+    `base64://` 快照字节（入库形态不含二进制，字节只能来自 hook 载荷）。
+    """
+    plugin = make_forward_plugin(tmp_path)
+    plugin.config.forward.delay_min_seconds = 0.01
+    plugin.config.forward.delay_max_seconds = 0.01
+    plugin.config.forward.cooldown_seconds = 60
+    plugin.config.forward.target_cooldown_seconds = 60
+    image_b64 = base64.b64encode(b"snapshot-image-bytes").decode("ascii")
+    nodes = [
+        {
+            "user_id": "30003",
+            "user_nickname": "群友甲",
+            "user_cardname": "",
+            "message_id": "80001",
+            "content": [
+                {"type": "text", "data": "看图"},
+                {"type": "image", "data": "[图片：一只猫]", "binary_data_base64": image_b64},
+            ],
+        }
+    ]
+    # 入库形态沿用工厂默认（只含 `DEFAULT_RICH_SUMMARY`）：图片字节不在其中
+    # （真实入库形态不回填内存二进制），直发参数只能取自 hook 载荷快照。
+    sleeps = mark_forward_timeline(plugin, monkeypatch, plugin.ctx.events)
+    cooling_at_send = observe_cooling_at_send(plugin)
+
+    async def scenario() -> None:
+        await plugin.handle_forward_message(message=forward_message(nodes=nodes))
+        await drain_forward_tasks(plugin)
+
+    asyncio.run(scenario())
+
+    # 本用例独有前缀：轮询就绪 → 两个目标群掷骰 → 各自延迟，都在投递之前。
+    assert plugin.ctx.events[:5] == ["get_by_id", "roll", "roll", "delay", "delay"]
+    assert sleeps == [0.01, 0.01]
+    assert cooling_at_send == [(True, True), (True, True)]  # 冷却先于每次直发写入
+    # 富摘要注入/intent 的完整口径（两条注入与两条 intent、兜底摘要不出现）由
+    # `test_orchestration_injects_rich_summary_and_intent` 覆盖；这里只钉一句
+    # 「注入文本取自轮询到的入库形态」。
+    assert DEFAULT_RICH_SUMMARY in injections(plugin, "forward")[0]["visible_text"]
+    # 图片字节来自 hook 载荷快照：`base64://` 数据与快照逐字节一致。
+    assert send_group_forward_calls(plugin)[0]["messages"] == [
+        {
+            "type": "node",
+            "data": {
+                "user_id": "30003",
+                "nickname": "群友甲",
+                "content": [
+                    {"type": "text", "data": {"text": "看图"}},
+                    {"type": "image", "data": {"file": f"base64://{image_b64}"}},
+                ],
+            },
+        }
+    ]
+
+
+def test_delivery_uses_snapshot_image_bytes_when_stored_form_lacks_binary(tmp_path: Path):
+    """图片保全（4.2）：入库形态不含二进制（模拟 2.8% 恢复失败）时，直发仍带 hook 载荷字节。
+
+    图片段的 `data` 是主程序写入的中文描述文本（不是文件引用），内存字节只在
+    hook 载荷里；fake `get_by_id` 的入库形态照此构造，`binary_data_base64` 缺失。
+    发送字节必须来自**转发源消息快照**：直发参数里 `base64://` 解码后与 hook
+    载荷字节逐字节一致，且入库形态确实无可恢复的字节。
+    """
+    plugin = make_forward_plugin(tmp_path)
+    image_bytes = b"snapshot-image-payload"
+    hook_segment = {
+        "type": "image",
+        "data": "[图片：一只猫]",
+        "binary_data_base64": base64.b64encode(image_bytes).decode("ascii"),
+    }
+    nodes = [
+        {
+            "user_id": "30003",
+            "user_nickname": "群友甲",
+            "user_cardname": "",
+            "message_id": "80001",
+            "content": [hook_segment],
+        }
+    ]
+    stored_segment = {"type": "image", "data": "[图片：一只猫]"}  # 入库形态：无二进制
+    plugin.ctx.message.default_result = {
+        "processed_plain_text": DEFAULT_RICH_SUMMARY,
+        "raw_message": [{"type": "forward", "data": [{"content": [stored_segment]}]}],
+    }
+
+    async def scenario() -> None:
+        await plugin.handle_forward_message(message=forward_message(nodes=nodes))
+        await drain_forward_tasks(plugin)
+
+    asyncio.run(scenario())
+
+    # 入库形态构造上就没有二进制字段（恢复失败语义）：直发参数仍必须带 hook
+    # 载荷快照的字节，逐字节相等即证明字节来源是快照而非入库形态。
+    sends = send_group_forward_calls(plugin)
+    assert len(sends) == 2
+    for params in sends:
+        content = params["messages"][0]["data"]["content"]
+        assert content == [
+            {"type": "image", "data": {"file": f"base64://{hook_segment['binary_data_base64']}"}}
+        ]
+        sent_bytes = base64.b64decode(content[0]["data"]["file"].removeprefix("base64://"))
+        assert sent_bytes == image_bytes  # 字节与 hook 载荷一致
+
+
+def test_decision_mode_three_paths_in_one_flow(tmp_path: Path):
+    """决策模式三路径（4.3）：命中发票 →（a）Tool 转发（b）Tool 不转发（c）重放 / 无票被拒。
+
+    三条路径各自的单路径行为由聚焦用例覆盖；本用例的增量只在一次流程里并存：
+    四条 Tool 调用走完仍只有 A 的一次直发、一次内容注入、一条源群留痕；B 的
+    不转发只焚票、不登记**已投递状态**，重放与无票调用同样不直发不注入。
+    """
+    plugin = make_forward_plugin(tmp_path)
+    plugin.config.forward.mode = "planner"
+    # **富摘要**沿用工厂默认的 `DEFAULT_RICH_SUMMARY`（入库形态首查即就绪）。
+
+    async def scenario() -> tuple[
+        dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]
+    ]:
+        await plugin.handle_forward_message(message=forward_message())
+        await drain_forward_tasks(plugin)
+        forwarded = await plugin.decide_forward_delivery(
+            message_id="90001", deliver=True, group_id=TARGET_A, stream_id="stream-20001"
+        )
+        declined = await plugin.decide_forward_delivery(
+            message_id="90001", deliver=False, group_id=TARGET_B, stream_id="stream-20002"
+        )
+        repeated = await plugin.decide_forward_delivery(
+            message_id="90001", deliver=True, group_id=TARGET_B, stream_id="stream-20002"
+        )
+        no_ticket = await plugin.decide_forward_delivery(
+            message_id="99999", deliver=True, group_id=TARGET_A, stream_id="stream-20001"
+        )
+        await drain_forward_tasks(plugin)
+        return forwarded, declined, repeated, no_ticket
+
+    forwarded, declined, repeated, no_ticket = asyncio.run(scenario())
+
+    # 四条调用的返回结果：转发成功、不转发成功，重放与无票被拒（各自带说明文案）。
+    assert forwarded["success"] is True
+    assert declined["success"] is True
+    assert declined["content"]
+    assert repeated["success"] is False and repeated["content"]
+    assert no_ticket["success"] is False and no_ticket["content"]
+    # 三路径互不干扰：仍只有 A 的一次直发、一次内容注入、一条源群留痕；B 的
+    # 不转发不登记**已投递状态**（`repeated` 被拒即是 B 的票已焚的证据）。
+    key = build_delivered_key(SOURCE_STREAM, "90001")
+    assert plugin._forward_delivered.targets_for(key, time.time()) == [TARGET_A]
+    assert len(send_group_forward_calls(plugin)) == 1
+    assert len(injections(plugin, "forward")) == 1
+    assert len(injections(plugin, "forward_action")) == 1
+    assert plugin.ctx.send.forward_calls == []
+
+
+def test_second_forward_during_ready_wait_rolls_independently(tmp_path: Path, monkeypatch):
+    """冷却新语义（4.4）：就绪等待窗口内到达的第二条合并转发独立掷骰，不被第一条冷却压制。
+
+    第一条消息就绪慢（首次查询未就绪、退避后再查）；第二条在它的就绪等待窗口
+    内进门——冷却尚未写入（写入时机已后移到就绪之后），第二条必须独立掷骰并
+    投递。退避等待换成事件闸门：第一条停在闸门上、第二条投递完成前，冷却不可能
+    被第一条写入，进门时机不再依赖真实调度时序。为证明这不是「冷却失效」：
+    源群冷却窗口设为正值，事后第三条消息必须被已写入的冷却压制、零轮询。
+    """
+    plugin = make_forward_plugin(tmp_path)
+    plugin.config.forward.cooldown_seconds = 60
+    plugin.config.forward.target_cooldown_seconds = 0
+    plugin.ctx.message.sequences["90001"] = [None, {"processed_plain_text": "第一条"}]
+    plugin.ctx.message.results["90002"] = {"processed_plain_text": "第二条"}
+    # 退避间隔替换成事件闸门：第一条首次查询未就绪后停在闸门上，第二条进门的
+    # 时机由用例显式放行，不再依赖「必须快于 0.01s 退避窗口」的抢跑。
+    poll_gate = asyncio.Event()
+    gate_seconds = 3600.0
+    real_sleep = asyncio.sleep
+
+    async def gated_sleep(seconds: float) -> None:
+        if seconds == gate_seconds:
+            await poll_gate.wait()
+            return
+        await real_sleep(seconds)
+
+    monkeypatch.setattr(plugin_module, "next_poll_interval", lambda attempt: gate_seconds)
+    monkeypatch.setattr(asyncio, "sleep", gated_sleep)
+
+    async def scenario() -> bool:
+        await plugin.handle_forward_message(message=forward_message(message_id="90001"))
+        # 第一条完成首次查询（未就绪），现在停在闸门上：冷却必然尚未写入。
+        await pump_until(lambda: len(plugin.ctx.message.calls) == 1)
+        assert plugin._forward_state.is_group_cooling(SOURCE_GROUP, 60, time.time()) is False
+        await plugin.handle_forward_message(message=forward_message(message_id="90002"))
+        admitted_without_cooldown = not plugin._forward_state.is_group_cooling(
+            SOURCE_GROUP, 60, time.time()
+        )
+        # 第二条立即就绪并完成两个目标群的直发，全程不等第一条的退避。
+        await pump_until(lambda: len(send_group_forward_calls(plugin)) == 2)
+        poll_gate.set()  # 放行第一条：第二次查询就绪 → 掷骰 → 冷却 → 投递
+        await drain_forward_tasks(plugin)
+        return admitted_without_cooldown
+
+    admitted_without_cooldown = asyncio.run(scenario())
+
+    assert admitted_without_cooldown is True  # 第二条进门时冷却尚未写入
+    assert [call["message_id"] for call in plugin.ctx.message.calls] == ["90001", "90002", "90001"]
+    # 两条消息各自独立掷骰并投递两个目标群（后方的是等待窗口内进门的那条）。
+    assert [params["group_id"] for params in send_group_forward_calls(plugin)] == [
+        int(TARGET_A),
+        int(TARGET_B),
+        int(TARGET_A),
+        int(TARGET_B),
+    ]
+    assert [call["message_id"] for call in injections(plugin, "forward")] == [
+        "90002",
+        "90002",
+        "90001",
+        "90001",
+    ]
+    assert sorted(call["message_id"] for call in injections(plugin, "forward_action")) == [
+        "90001",
+        "90002",
+    ]
+    assert plugin._forward_state.is_group_cooling(SOURCE_GROUP, 60, time.time()) is True
+
+    # 冷却窗口有效：冷却写入后的第三条消息在同步段被压制，不产生任何轮询与投递。
+    asyncio.run(plugin.handle_forward_message(message=forward_message(message_id="90003")))
+    assert "90003" not in [call["message_id"] for call in plugin.ctx.message.calls]
+    assert len(send_group_forward_calls(plugin)) == 4
+
+
+def test_request_path_skips_only_auto_delivered_targets(tmp_path: Path):
+    """两路共用（4.5）：请求路径只跳过自动路径登记过的目标群，未登记的照常投递。
+
+    预置 TARGET_A 的**已投递状态**（自动路径投递成功后按「源聊天流 + 转发源消息」
+    键登记的同款写入）；请求转发跳过 A、把 B 投递成功，并在结果里说明被跳过群。
+    """
+    plugin = make_forward_plugin(tmp_path)
+    wire_request_source_message(plugin)
+    seed_request_view(plugin)
+    plugin._forward_delivered.register(
+        build_delivered_key(SOURCE_STREAM, "90001"), [TARGET_A], time.time()
+    )
+
+    result = asyncio.run(invoke_request_forward_via_hooks(plugin))
+
+    assert result["success"] is True
+    assert result["accepted"] is True
+    assert "已跳过自动转发已投递的目标群" in result["content"]
+    assert TARGET_A in result["content"]
+    assert [call["stream_id"] for call in plugin.ctx.send.forward_calls] == ["stream-20002"]
+
+
+def test_request_path_stays_usable_when_auto_path_disabled(tmp_path: Path):
+    """两路共用（4.5）：`auto_enabled=false` 时自动路径零副作用，请求链路照常走完。"""
+    plugin = make_forward_plugin(tmp_path)
+    plugin.config.forward.auto_enabled = False
+    wire_request_source_message(plugin)
+    seed_request_view(plugin)
+
+    async def scenario() -> tuple[int, list[str], dict[str, Any]]:
+        await plugin.handle_forward_message(message=forward_message())
+        spawned = len(plugin._tasks)
+        result = await invoke_request_forward_via_hooks(plugin)
+        await drain_forward_tasks(plugin)
+        return spawned, [name for name, _ in plugin.protocol_calls], result  # type: ignore[attr-defined]
+
+    spawned, protocol_names, result = asyncio.run(scenario())
+
+    assert spawned == 0  # Hook 整段短路，不 spawn 任何编排
+    # 自动路径无任何协议端副作用（请求路径自己的可用性刷新不算）。
+    assert "send_group_forward_msg" not in protocol_names
+    assert result["success"] is True
+    assert [call["stream_id"] for call in plugin.ctx.send.forward_calls] == [
+        "stream-20001",
+        "stream-20002",
+    ]
 
 
 # ---- manifest 能力面 ----

@@ -29,7 +29,7 @@ class PluginSection(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="1.2.0",
+        default="1.3.0",
         json_schema_extra={"disabled": True, "hidden": True, "label": "配置版本", "order": 99},
     )
 
@@ -653,6 +653,47 @@ class ForwardSection(PluginConfigBase):
             "label": "注入文本长度上限",
             "order": 13,
             "step": 100,
+        },
+    )
+    mode: str = Field(
+        default="direct",
+        json_schema_extra={
+            "hint": (
+                "转发模式：direct = 掷骰命中即直发目标群，不经 LLM；"
+                "planner = 命中后把该转发的富摘要交给目标群 Planner，由它调用决策 Tool 决定转发与否。"
+                "非法值按 direct 处理并记 warning。"
+            ),
+            "label": "转发模式",
+            "order": 14,
+            "placeholder": "direct",
+        },
+    )
+    auto_enabled: bool = Field(
+        default=True,
+        json_schema_extra={
+            "hint": "自动转发路径开关：关闭后源群合并转发不再掷骰、不投递，请求转发路径不受影响。",
+            "label": "启用自动转发",
+            "order": 15,
+        },
+    )
+    request_enabled: bool = Field(
+        default=True,
+        json_schema_extra={
+            "hint": "请求转发路径开关：关闭后转发 Tool 与源群 Planner 入口提示都不再生效，自动转发路径不受影响。",
+            "label": "启用请求转发",
+            "order": 16,
+        },
+    )
+    summary_timeout_seconds: int = Field(
+        default=10, ge=1, le=300,
+        json_schema_extra={
+            "hint": (
+                "等待转发卡片摘要就绪的上限（秒）：超时仍未就绪则记 warning 并放弃本次，"
+                "不掷骰、不写冷却、不投递。"
+            ),
+            "label": "摘要就绪超时（秒）",
+            "order": 17,
+            "step": 1,
         },
     )
 

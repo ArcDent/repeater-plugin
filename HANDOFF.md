@@ -1,6 +1,15 @@
 # HANDOFF
 
-## 最近操作（2026-09-18）
+## 最近操作（2026-09-27）
+
+- 走完 spec-driven 阶段一（grill-with-docs）对齐转发链路改造，未动业务代码（git 仅 CONTEXT.md + 新增 ADR）：
+  - 诊断结论：①「目标群模型没有转发内容」生产实锤（麦麦在目标群回「欸 我转发什么啦」）——注入是有损段摘要（`[图片]`/`[表情]`/`[嵌套转发]` 占位）；②「图片丢失」无法回溯样本（9/18 至今自动路径仅成功投递 3 次且均无图，早期日志已轮换），改用真实生产载荷逐段复刻定位到**字节来源**问题；③主程序 `process_image_component` 处理后**清空内存字节**、识图描述**异步且不回填消息本体**（全量扫描 4286 个转发内媒体段：2.8% 按 hash 取不回字节、19.6% 描述永远为空）
+  - 用户决策（已确认）：掷骰+投递整体推迟到**摘要就绪**（消息入库且 `processed_plain_text` 非空，轮询 `get_by_id`，`summary_timeout_seconds` 兜底，**不等 VLM 回填**）；同步段只做门禁+防重+**转发源消息快照**；发送用快照字节（100% 保图）；注入改**富摘要**；新增 `forward.mode = direct|planner`（planner=命中后交目标群 Planner 据富摘要决策）与 `auto_enabled`/`request_enabled` 路径开关；取不回字节的媒体整节点丢弃；`_media_segment` 引用回落收紧防垃圾 file 引用拖垮整包；新配置全中文 label/hint + config.toml 中文注释
+  - 产物：`docs/adr/0011-forward-trigger-after-summary.md`（accepted）；CONTEXT.md 新增 6 术语（转发源消息快照/摘要就绪/富摘要/直发模式/决策模式/转发路径开关）、修订 4 条定义与 Relationships、补 2 段例对话
+- 阶段二（spec-handbook）完成：openspec change `forward-summary-trigger-and-modes` 四工件齐备且 `openspec validate --strict` 通过——proposal（Why/What/Capabilities/Impact）、delta spec（`cross-group-forward`：4 条 ADDED[触发时机与摘要就绪/转发模式/路径开关/媒体兜底] + 5 条 MODIFIED[防重与冷却/投递/内容注入/强制发言/开关与配置]）、design（D1 双段式编排、D2 就绪轮询、D3 富摘要与清洗、D4 一次性 decision 票 + 决策 Tool、D5 媒体三分支、D6 四新字段、D7 日志口径）、tasks（5 组 26 项，含 seam 与验收）
+- 下一步：阶段三 `/spec-to-todo` 已完成——tasks.md 细化为 5 组 32 项（组 1 配置骨架 / 组 2 纯逻辑 / 组 3 plugin 编排 / 组 4 集成测试 / 组 5 验证文档与人工部署），每项带 seam 与可测验收，章节即阶段四执行组、标注依赖序；`openspec validate --strict` 通过。后续：切 mode 到 multitask（UI 手动）或 agent，`/subagent-run` 按组派发实现
+
+## 历史：integrate-cross-group-forward（2026-09-18，已归档 0.6.0）
 
 - 完整走完 spec-driven 工作流 `integrate-cross-group-forward`（0.6.0，ADR 0009 + 0010）：把 arclinux 上独立运行的 `papaya0481/maibot-ForwardMessagesAuto-plugin` 并入本插件，形成第三个行为域「跨群转发」。双路径并存——**自动转发**（源群收到合并转发后对每个目标群独立掷骰 `weight_send`/`weight_silence`，命中即**协议端直发** `send_group_forward_msg`，成功后在目标群注入 `forward` 内容并触发**强制发言**、在源群注入 `forward_action` 留痕）与**请求转发**（原插件完整链路整包移植到 `forwards/request/`：源群 Planner 触发、查看资格、一次性授权、顺序投递，不掷骰、不强制发言）。两条路径共用**已投递状态**；三层防护（消息防重 / 源群冷却 / 目标群冷却）；投递前用协议端 `get_group_list`（TTL 300s + 失败 30s 退避）校验目标群可用性
 - 纯逻辑全部落在 `forwards/` 子包（`source`/`nodes`/`auto`/`state`/`texts` + 共享叶子模块 `forward_segments.py`），`plugin.py` 只做 Hook/Tool 编排；`get_components()` 覆写把转发 Tool 的 `chat_scope` 提到组件顶层（承载性 hack，不写就私聊可见）
@@ -25,7 +34,7 @@
 - `chat_scope` 只在 Runner 读取的**组件声明顶层**生效：SDK 的 `@Tool(chat_scope=…)` 只落进 `metadata`，Host 顶层优先 → 必须靠 `get_components()` 覆写补齐，否则 Tool 在私聊可见（ADR 0009 相关的承载性 hack）
 - SDK 的 `HookHandler.error_policy` 默认 `ErrorPolicy.SKIP`、系统级 Hook 超时兜底 60s（`plugin_runtime.hook_blocking_timeout_sec`）——不声明也不会中断主链，比原插件显式声明的 3~6s 更宽松
 - `forwards/request/` 必须保持「不 import `forwards/nodes.py`」：后者依赖 `repeats.py`，会让 `import forwards.request` 在裸目录下失败；共享解析核心走无依赖的叶子模块 `forwards/forward_segments.py`
-- 主程序 `EventType.ON_MESSAGE` 事件分发代码被注释（`REFERENCE/MaiBot/src/chat/message_receive/bot.py:846`），是死事件；普通消息观测的活口是 `chat.receive.before_process` hook
+- 主程序 `EventType.ON_MESSAGE` 事件分发代码被注释（`arcwsl:~/github/REFERENCE/MaiBot/src/chat/message_receive/bot.py:846`），是死事件；普通消息观测的活口是 `chat.receive.before_process` hook
 - hook 消息解析失败打 debug、webhook 上报形态不认识打 warning——两个口径相反且各有理由，详见 AGENTS.md 复读域条目
 - 改配置语义必须四源同改（config.py hint、config.toml 注释、README、AGENTS.md）；改版本号必须与 `_manifest.json` 同源
 - openspec delta 的 MODIFIED 块不能改名 Scenario 标题（`validate --strict` 判漏抄）；sync 到主 spec 时新建 capability 要保留 delta 的 `## Purpose`
