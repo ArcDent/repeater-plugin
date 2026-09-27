@@ -99,10 +99,10 @@ def test_context_section_accepts_overrides():
     assert cfg.context.self_display_name == "麦麦"
 
 
-def test_config_version_updated_to_1_2_0():
-    """config_version 是配置结构版本：新增跨群转发 [forward] 段时从 1.1.0 升到 1.2.0。"""
+def test_config_version_updated_to_1_3_0():
+    """config_version 是配置结构版本：新增四个跨群转发字段时从 1.2.0 升到 1.3.0。"""
     cfg = RepeaterConfig()
-    assert cfg.plugin.config_version == "1.2.0"
+    assert cfg.plugin.config_version == "1.3.0"
 
 
 def test_repeat_section_defaults():
@@ -152,6 +152,10 @@ def test_forward_section_defaults():
     """
     cfg = RepeaterConfig()
     assert cfg.forward.enabled is False
+    assert cfg.forward.mode == "direct"
+    assert cfg.forward.auto_enabled is True
+    assert cfg.forward.request_enabled is True
+    assert cfg.forward.summary_timeout_seconds == 10
     assert cfg.forward.source_groups == []
     assert cfg.forward.target_groups == []
     assert cfg.forward.weight_send == 30
@@ -201,6 +205,15 @@ def test_forward_config_rejects_negative_numbers():
         RepeaterConfig(forward={"delay_min_seconds": -0.5})
 
 
+def test_forward_summary_timeout_rejects_out_of_range():
+    """摘要就绪超时以 ge=1, le=300 声明：0 与 301 都必须被配置校验拒绝（与
+    repeat 域数值字段的 ge= 口径同构）。"""
+    with pytest.raises(ValueError):
+        RepeaterConfig(forward={"summary_timeout_seconds": 0})
+    with pytest.raises(ValueError):
+        RepeaterConfig(forward={"summary_timeout_seconds": 301})
+
+
 @pytest.mark.skipif(tomllib is None, reason="需要 Python 3.11+ 的 tomllib")
 def test_config_toml_repeat_defaults_match_design():
     """[repeat] 节与 [plugin].config_version 的 toml 默认值与 design D2 表逐项一致（独立字面量）；scope.ignore_senders 的默认空列表一并在此钉死（与 config.py 默认同口径，防 toml 侧漂移）。"""
@@ -208,7 +221,7 @@ def test_config_toml_repeat_defaults_match_design():
         raw = tomllib.load(fp)
     repeat = raw.get("repeat")
     assert isinstance(repeat, dict), "config.toml 缺少 [repeat] 节"
-    assert raw["plugin"]["config_version"] == "1.2.0"
+    assert raw["plugin"]["config_version"] == "1.3.0"
     assert repeat["enabled"] is True
     assert repeat["window_seconds"] == 120
     assert repeat["threshold"] == 3
@@ -238,11 +251,15 @@ def test_config_toml_forward_defaults_match_design():
     assert isinstance(forward, dict), "config.toml 缺少 [forward] 节"
     assert set(forward) == {
         "enabled",
+        "mode",
+        "auto_enabled",
+        "request_enabled",
         "source_groups",
         "target_groups",
         "weight_send",
         "weight_silence",
         "dedup_ttl_seconds",
+        "summary_timeout_seconds",
         "cooldown_seconds",
         "target_cooldown_seconds",
         "delay_min_seconds",
@@ -253,11 +270,15 @@ def test_config_toml_forward_defaults_match_design():
         "inject_max_chars",
     }
     assert forward["enabled"] is False
+    assert forward["mode"] == "direct"
+    assert forward["auto_enabled"] is True
+    assert forward["request_enabled"] is True
     assert forward["source_groups"] == []
     assert forward["target_groups"] == []
     assert forward["weight_send"] == 30
     assert forward["weight_silence"] == 70
     assert forward["dedup_ttl_seconds"] == 1800
+    assert forward["summary_timeout_seconds"] == 10
     assert forward["cooldown_seconds"] == 60
     assert forward["target_cooldown_seconds"] == 60
     assert forward["delay_min_seconds"] == 0.5
@@ -266,6 +287,60 @@ def test_config_toml_forward_defaults_match_design():
     assert forward["trigger_target_planner"] is True
     assert forward["view_failure_fallback_threshold"] == 2
     assert forward["inject_max_chars"] == 800
+
+
+def test_config_toml_forward_new_keys_have_chinese_comments():
+    """[forward] 段四个新字段各自紧邻一行中文注释（部署时改配置能看懂取值含义）。
+
+    只做文本行扫描、不用 tomllib，故不挂 skipif：Python 3.10 下同样可收集。
+    """
+    text = CONFIG_TOML.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    start = lines.index("[forward]")
+    end = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("[")),
+        len(lines),
+    )
+    section = lines[start + 1 : end]
+    for key in ("mode", "auto_enabled", "request_enabled", "summary_timeout_seconds"):
+        key_idx = next(
+            (i for i, line in enumerate(section) if re.match(rf"\s*{key}\s*=", line)),
+            None,
+        )
+        assert key_idx is not None, f"[forward] 段缺少 {key} 行"
+        comment_lines = []
+        cursor = key_idx - 1
+        while cursor >= 0 and section[cursor].lstrip().startswith("#"):
+            comment_lines.append(section[cursor])
+            cursor -= 1
+        assert comment_lines, f"[forward].{key} 上一行不是注释"
+        assert any(re.search(r"[\u4e00-\u9fff]", comment) for comment in comment_lines), (
+            f"[forward].{key} 的注释不含中文: {comment_lines!r}"
+        )
+
+
+def test_config_toml_forward_key_order_mirrors_model_order():
+    """[forward] 段的 toml 行序与 `ForwardSection` 的字段声明序一致（声明序即 webui `order` 编号序）。
+
+    文本行扫描即可，不用 tomllib：测试替身不保留 `json_schema_extra`，
+    `order` 在运行时不可读，声明序是等价且可读的口径。
+    """
+    text = CONFIG_TOML.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    start = lines.index("[forward]")
+    end = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("[")),
+        len(lines),
+    )
+    toml_order = [
+        match.group(1)
+        for line in lines[start + 1 : end]
+        if (match := re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", line))
+    ]
+    model_order = [
+        name for name in ForwardSection.__annotations__ if not name.startswith("__")
+    ]
+    assert toml_order == model_order
 
 
 @pytest.mark.skipif(tomllib is None, reason="需要 Python 3.11+ 的 tomllib")
@@ -287,14 +362,14 @@ def test_config_toml_matches_model_defaults():
 
 
 def test_manifest_version_matches_changelog_head():
-    """manifest version 与最新 CHANGELOG 条目标题一致（0.6.0：新增 [forward] 配置段）。
+    """manifest version 与最新 CHANGELOG 条目标题一致（0.7.0：摘要就绪后触发与双模式）。
 
     仓库没有独立的插件版本常量，manifest 的 version 与 CHANGELOG 首条标题是
     两个独立来源，互为校验；写错任一侧都会红。
     """
     with MANIFEST_JSON.open("r", encoding="utf-8") as fp:
         manifest = json.load(fp)
-    assert manifest["version"] == "0.6.0"
+    assert manifest["version"] == "0.7.0"
     changelog = (MANIFEST_JSON.parent / "CHANGELOG.md").read_text(encoding="utf-8")
     head = re.search(r"^## \[([^\]]+)\]", changelog, flags=re.MULTILINE)
     assert head is not None, "CHANGELOG.md 缺少 '## [x.y.z]' 形式的版本条目"
@@ -312,6 +387,8 @@ def test_manifest_declares_injection_capabilities():
         manifest = json.load(fp)
     capabilities = manifest.get("capabilities")
     assert isinstance(capabilities, list), "_manifest.json 缺少 capabilities 数组"
+    # 本次升级不新增能力，数量保持 11（test_plugin.py 另有消费集合与声明的双向校验）
+    assert len(capabilities) == 11
     assert REQUIRED_CAPABILITIES <= set(capabilities), (
         f"manifest capabilities 漂移: 缺 {REQUIRED_CAPABILITIES - set(capabilities)}"
     )

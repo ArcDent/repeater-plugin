@@ -2,6 +2,30 @@
 
 本项目变更记录，格式遵循 Keep a Changelog，语义化版本见 `_manifest.json`。
 
+## [0.7.0] - 2026-09-27
+
+### Added
+
+- **`forward.mode` 转发模式（双模式）**：`direct`（默认）掷骰命中即协议端直发目标群，不经过 LLM；`planner` 命中不直发，插件为目标群签发一次性**决策票**（按消息 ID + 目标群配对、消费即焚、TTL 受限）并把**富摘要**交给该群 Planner，模型经新增的 `decide_forward_delivery` Tool（`chat_scope="group"`，参数 `message_id` + `deliver`）回传「转发 / 不转发」：`deliver=true` 走同一套投递编舞，`false` 仅记日志。无票 / 错群 / 重复消费 / 过期票一律明确拒绝；触发失败或决策票超时未消费按「不转发」处理并记 warning。非法 `mode` 值按 `direct` 处理并记 warning。
+- **转发路径开关**：`forward.auto_enabled` 与 `forward.request_enabled`（默认均 true）分别独立停用自动转发与请求转发两条路径，另一条不受影响；`forward.enabled`（与 `plugin.enabled` 合取）仍是转发域总闸。
+- **`forward.summary_timeout_seconds`**（默认 10 秒，1~300）：等待**摘要就绪**的上限，超时记 warning 并放弃本次（不掷骰、不写冷却、不投递、不注入）。
+- **富摘要注入与 intent**：自动路径的**转发内容注入**、**强制发言** intent 与**决策模式**的决策材料改以主程序 `processed_plain_text`（转发内文本 + 已缓存图片描述，即**富摘要**）为内容主体；来源群名、发送者与富摘要统一经 `forwards.texts.sanitize_display_text` 剔除控制字符与孤立代理项，首见图占位按主程序原文保留。
+- 转发域纯逻辑扩展：新增 `forwards/summary.py`（富摘要提取、0.5s 起步退避至 1s 封顶的轮询节奏、超时判据）与 `forwards/decision.py`（一次性决策票注册表，纯同步方法、消费即焚、TTL 清理）；`forwards/texts.py` 新增决策 intent 文案与 `sanitize_display_text`。
+- 新增日志口径：「自动转发摘要就绪超时」warning（含消息 ID 与源群号）、决策模式触发 / 决策消费 / 选择不转发 info、决策票超时未消费 warning、非法 `mode` warning。
+
+### Changed
+
+- **自动转发改为摘要就绪后触发**：`before_process` 同步段收敛为「门禁 → 请求路径入口提示 → **转发防重**标记 → spawn 后台编排」，掷骰、冷却写入、投递与注入全部推迟到该转发入库且 `processed_plain_text` 非空之后；防重标记仍先于等待写入，等待期间重复上报不产生第二次编排。就绪判定不等识图描述回填（描述只进 Maisaka 内存历史、消息本体永不更新）。冷却写入随掷骰后移，就绪等待窗口内到达的新合并转发会各自独立掷骰。
+- **发送字节 100% 取自 `before_process` 时点的转发源消息快照**：投递不再从消息事后存储形态恢复图片二进制（主程序处理后会丢弃内存字节、入库形态不回填）。
+- **媒体兜底收紧**：`forwards/nodes.py` 的媒体段改三分支——有 `binary_data_base64` 转 `base64://`；段内 `data` 为 `http(s)://` / `base64://` / `file://` 前缀或含路径分隔符时按引用重建；两者皆无时该媒体段不产出。重建后内容为空的节点整条丢弃，不再产生 `[图片]` / `[表情]` 占位文本段；全部节点落空时放弃投递并记 warning。
+- `plugin.config_version` 1.2.0 → 1.3.0（新增四个配置字段，主程序自动重建 `config.toml` 骨架，已填的旧字段值保留）。
+
+### 部署注意
+
+- 默认 `mode = "direct"` 且两个路径开关为 `true` 时，升级后行为与 0.6.0 一致，仅自动转发的掷骰与投递时机后移到**摘要就绪**之后（通常亚秒级）。
+- 切 `mode = "planner"` 需要目标群 Planner 可用；模型未在决策票 TTL 内调用 `decide_forward_delivery` 时按「不转发」处理并记 warning，插件不做超时补发。
+- 升级后主程序按 `config_version` 1.2.0 → 1.3.0 重建 `config.toml` 骨架并补四个新键的默认值；`summary_timeout_seconds` 默认 10 秒，可按部署后实测的就绪耗时调整。
+
 ## [0.6.0] - 2026-09-18
 
 ### Added

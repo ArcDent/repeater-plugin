@@ -4,17 +4,17 @@ MaiBot 插件：聚合三个群聊行为——群内复读链达标后，麦麦�
 
 ## 结构
 
-- `plugin.py` — 插件主类：上报监听、门禁与掷骰编排、协议端直发、复读拦截与直发、上下文注入、转发域自动路径 Hook 与请求路径 Tool 编排、启动自检
+- `plugin.py` — 插件主类：上报监听、门禁与掷骰编排、协议端直发、复读拦截与直发、上下文注入、转发域自动路径 Hook 与双段式编排（同步段门禁 + 摘要就绪后掷骰投递）、请求路径与转发决策两个 Tool、启动自检
 - `reactions.py` — 表情回应域纯逻辑层（上报解析、表情 ID 归一、反义映射、跟风/反义决策、表情槽与冷却），不依赖 SDK，可单测
 - `repeats.py` — 复读域纯逻辑层（复读文本宽松归一、消息资格判定、复读链状态机、三出口决策、注入文案构造），不依赖 SDK，可单测
-- `forwards/` — 转发域子包（纯逻辑层，不依赖 SDK，可单测）：`source.py`（转发源消息资格解析）、`nodes.py`（转发节点解析与 OneBot 转换）、`auto.py`（逐目标群掷骰）、`state.py`（转发防重 / 冷却 / 已投递状态 / 群可用性缓存）、`texts.py`（内容注入、留痕与强制发言 intent 文案）
+- `forwards/` — 转发域子包（纯逻辑层，不依赖 SDK，可单测）：`source.py`（转发源消息资格解析）、`nodes.py`（转发节点解析与 OneBot 转换）、`auto.py`（逐目标群掷骰）、`summary.py`（摘要就绪判定、富摘要提取与轮询节奏）、`decision.py`（决策模式一次性决策票注册表与模式词表）、`state.py`（转发防重 / 冷却 / 已投递状态 / 群可用性缓存）、`texts.py`（内容注入、留痕、强制发言与决策 intent 文案，富摘要 + 控制字符清洗）
 - `forwards/forward_segments.py` — 转发段解析核心叶子模块：Hook 侧与请求侧共用「段类型判定 + 首个 `forward` 段定位 + 节点级校验」；不依赖 `repeats.py`，保住 `import forwards.request` 的独立导入
 - `forwards/request/` — 请求转发链路（原 `papaya0481/maibot-ForwardMessagesAuto-plugin` v0.2.12 整包移植）：源群 Planner 触发、查看资格、一次性授权、顺序投递与持久化状态
 - `config.py` — 配置模型（plugin/webhook/protocol/bandwagon/opposite/repeat/behavior/context/scope/forward）
 - `config.toml` — 默认配置，值必须与 `config.py` 的 default 一致
 - `tests/` — pytest（fake maibot_sdk 注入，`uv run --with pytest --with aiohttp pytest tests/ -q`）
 - `docs/emoji-id-reference.md` — 表情 ID 两套编号体系（QQ 小黄脸编号 / Unicode 码点）查表与边界
-- `docs/adr/` — 0001 走 webhook 不走 SDK 事件链；0002 分支严格互斥 + 内存态；0003 防御式拦截通知 + 插件自建注入；0004 定时 flush 兜底 + 失败回滚；0005 复读检测走 before_process hook（检测层仍有效，observe 模式与 `ctx.send.text` 发送决策被 0006 取代）；0006 复读/打断出口协议端直发 + planner 拦截 + 上下文注入（决策 3 的延迟沿用与串行编舞被 0008 取代）；0007 复读三出口改归一化出口权重（取代双概率配置口径）；0008 复读域独立延迟 + 触发消息注入与延迟并发；0009 转发域双路径并存（自动掷骰 + 请求转发，共享已投递状态）；0010 自动转发协议端直发 + 投递前目标群可用性校验（陈旧 stream 路由故障背景）
+- `docs/adr/` — 0001 走 webhook 不走 SDK 事件链；0002 分支严格互斥 + 内存态；0003 防御式拦截通知 + 插件自建注入；0004 定时 flush 兜底 + 失败回滚；0005 复读检测走 before_process hook（检测层仍有效，observe 模式与 `ctx.send.text` 发送决策被 0006 取代）；0006 复读/打断出口协议端直发 + planner 拦截 + 上下文注入（决策 3 的延迟沿用与串行编舞被 0008 取代）；0007 复读三出口改归一化出口权重（取代双概率配置口径）；0008 复读域独立延迟 + 触发消息注入与延迟并发；0009 转发域双路径并存（自动掷骰 + 请求转发，共享已投递状态）；0010 自动转发协议端直发 + 投递前目标群可用性校验（陈旧 stream 路由故障背景）；0011 自动转发改在摘要就绪后触发 + 同步段只留门禁与字节快照 + 直发/决策双模式
 - `CONTEXT.md` — 领域术语表
 
 ## 关键规则
@@ -46,15 +46,20 @@ MaiBot 插件：聚合三个群聊行为——群内复读链达标后，麦麦�
 
 ### 转发域
 
-- 双路径并存（ADR 0009）：**自动转发**挂在 `chat.receive.before_process` 的 **observe 模式** handler（`forward_detector`，`order="late"`），同步段纯内存完成形态门禁 → **源群**门禁 → 防重/冷却 → 逐**目标群**掷骰，命中后先写冷却再 spawn 后台任务；转发域**不拦截**源消息。**请求转发**是原插件完整链路（源群 Planner 触发、**查看资格**、一次性授权、顺序投递）整包移植在 `forwards/request/`，不掷骰、不受**转发权重**影响；**强制发言**只适用于自动路径
-- 自动路径的**投递编舞**（change integrate-cross-group-forward design D7）：每个命中目标群一个独立后台任务，任务内串行「延迟（`forward.delay_*`，与 `repeat` / `behavior` 两域延迟互不牵扯）→ 目标群可用性校验 → 协议端直发 `send_group_forward_msg` → 目标群**转发内容注入**（`source_kind=forward`）→ **强制发言**触发」；至少一个目标群投递成功后由收尾任务向源群注入一次**转发留痕**（`source_kind=forward_action`，只列成功群）；任一步失败按 spec 口径记 warning 止步，不重试、不熔断其它目标群与后续消息
+- 双路径并存（ADR 0009）：**自动转发**挂在 `chat.receive.before_process` 的 **observe 模式** handler（`forward_detector`，`order="late"`），同步段纯内存完成「域开关 → 形态门禁 → **源群**门禁 → 请求路径入口提示 → **转发防重** `mark_message` → spawn **一个**编排任务」；掷骰、冷却写入、投递与注入全部推迟到**摘要就绪**之后（ADR 0011）；转发域**不拦截**源消息。**请求转发**是原插件完整链路（源群 Planner 触发、**查看资格**、一次性授权、顺序投递）整包移植在 `forwards/request/`，不掷骰、不受**转发权重**影响；**强制发言**只适用于自动路径
+- **摘要就绪**（ADR 0011 / design D2）：编排任务轮询 `message.get_by_id`（首次即查，之后 0.5s 起步、退避至 1s 封顶）直到**转发源消息**入库且 `processed_plain_text`（**富摘要**）非空；总时长受 `forward.summary_timeout_seconds`（默认 10s）约束，超时记「自动转发摘要就绪超时」warning（含 msg_id 与源群号）并放弃本次（不掷骰、不写冷却、不投递、不注入）；`get_by_id` 异常按未就绪续等（debug），只有超时才放弃。就绪判定**不等识图描述回填**——描述只进 Maisaka 内存历史、消息本体永不更新，等不到；就绪只轮询一次，**富摘要**共享给本次全部目标群的注入与 intent
+- **转发防重**的 `mark_message` 仍在同步段、先于等待写入（等待期间重复上报不产生第二次编排），同步段还含只读的源群冷却预检；冷却写入（`mark_group` + `mark_targets`）后移到就绪掷骰命中时，就绪等待窗口内到达的新**合并转发**各自独立掷骰（冷却写入时刻后移是 ADR 0011 记录的已知语义变化）
+- `forward.mode` 双模式：`direct`（默认）掷骰命中即进入投递编舞；`planner` 命中不直发，为目标群签发一次性**决策票**（`forwards/decision.py`，键为 message_id + 目标群，TTL 与 `dedup_ttl_seconds` 同量级）并向目标群 `proactive.trigger`（intent 材料为**富摘要**，metadata `trigger_kind=forward_decision`）。模型经 `decide_forward_delivery` Tool（`chat_scope="group"`，参数 `message_id` + `deliver`）回传「转发 / 不转发」：`deliver=true` 走同一套投递编舞（票里携带**转发源消息快照** + 富摘要，发送字节仍取自快照），`false` 仅记 info；无票 / 错群 / 重复消费 / 过期票一律明确拒绝，触发失败与决策票超时未消费按「不转发」处理并记 warning。非法 `mode` 值运行时按 direct 并记 warning
+- **转发路径开关**：`forward.auto_enabled` 关闭即 Hook 整段短路（含请求路径入口提示）；`forward.request_enabled` 关闭即转发 Tool（`request_cross_group_forward`）与入口提示停用；两开关互不影响，`forward.enabled`（与 `plugin.enabled` 合取）仍是转发域总闸
+- 自动路径的**投递编舞**（change integrate-cross-group-forward design D7，直发模式与决策模式 `deliver=true` 共用）：每个命中目标群一个独立后台任务，任务内串行「延迟（`forward.delay_*`，与 `repeat` / `behavior` 两域延迟互不牵扯）→ 目标群可用性校验 → 协议端直发 `send_group_forward_msg` → 目标群**转发内容注入**（`source_kind=forward`）→ **强制发言**触发」；至少一个目标群投递成功后由收尾任务向源群注入一次**转发留痕**（`source_kind=forward_action`，只列成功群）；任一步失败按 spec 口径记 warning 止步，不重试、不熔断其它目标群与后续消息
+- 注入与 intent 材料用**富摘要**（主程序 `processed_plain_text`）而非插件自有节点摘要：来源群名、发送者与富摘要一律过 `forwards.texts.sanitize_display_text`（剔除 C0/C1 控制字符与孤立代理项）；首见图的占位按主程序原文保留，插件不改写。发送字节只从**转发源消息快照**重建，绝不从消息事后存储形态恢复二进制（处理后会丢弃内存字节且入库形态不回填）
 - 自动路径**协议端直发**不走主程序发送链（ADR 0010）：只依赖群号，与 Host 聊天流 / Platform IO 路由解耦，陈旧 stream 不可能把投递引向 legacy 后备驱动；目标群消息库只有请求转发路径会写入，目标群上下文靠**转发内容注入**补偿
 - 投递前**目标群可用性校验**（ADR 0010）：协议端 `get_group_list` + TTL 300s 内存缓存（`_FORWARD_GROUP_LIST_TTL_SECONDS`），缓存未命中或过期时刷新、失败按未知放行并记 warning（失败后 30s 退避，不每条投递都吃协议端超时）；不在列表的目标群跳过并记含群号与原因的 warning，绝不出现「未知错误」
 - 两条路径共用**已投递状态**（change integrate-cross-group-forward design D5）：自动路径投递成功后按「源聊天流 + **转发源消息** ID」登记，请求转发的 Tool 入口据此跳过已投递目标群；候选目标群全部已投递时返回「已转发过」。自动路径沉默不登记，请求转发仍可执行。自动路径不读请求路径的持久化 store
-- 三层防护：同一**转发源消息**按消息 ID 在 `dedup_ttl_seconds` 内只掷一次骰；**源群**冷却（`cooldown_seconds`，至少一个目标群命中才写）；**目标群**冷却（`target_cooldown_seconds`，只压制该群）。沉默出口不写任何冷却；冷却写入在 spawn 之前，投递成败不影响已进入的冷却
-- `get_components()` 覆写是**承载性 hack**：Runner 只读组件声明**顶层**的 `chat_scope`，`@Tool(chat_scope=…)` 经 SDK 只落进 `metadata`——不覆写这一层，转发 Tool 在私聊会话里同样可见（可见性过滤失效）。改 Tool 声明面时不得删掉这层覆写
-- **转发节点**转换在 `forwards/nodes.py`：段映射 text→text、at→at、image/emoji→image（`binary_data_base64` 优先转 `base64://`，缺失时退回段内引用，再无则文本占位），嵌套 forward 递归转 node；无有效节点不投递
-- 日志口径：自动路径的**投递**日志一律带「自动转发」前缀与目标群号（检测层与沉默出口的日志不带目标群号）；请求路径沿用原插件的中文文案、无统一字面前缀，共享群列表刷新等待方的刷新成败由 `plugin.py` 另以「请求转发」前缀记录；刷新任务本身只用稳定域 tag「跨群转发」（按路径的成败由各等待方在 `await` 处自行记录）
+- 三层防护：同一**转发源消息**按消息 ID 在 `dedup_ttl_seconds` 内只掷一次骰；**源群**冷却（`cooldown_seconds`，至少一个目标群命中才写）；**目标群**冷却（`target_cooldown_seconds`，只压制该群）。沉默出口不写任何冷却；冷却写入在就绪掷骰命中之后、spawn 投递任务之前，投递成败不影响已进入的冷却
+- `get_components()` 覆写是**承载性 hack**：Runner 只读组件声明**顶层**的 `chat_scope`，`@Tool(chat_scope=…)` 经 SDK 只落进 `metadata`——不覆写这一层，两个转发 Tool（`request_cross_group_forward` 与 `decide_forward_delivery`，名单见 `_FORWARD_TOOL_NAMES`）在私聊会话里同样可见（可见性过滤失效）。改 Tool 声明面时不得删掉这层覆写
+- **转发节点**转换在 `forwards/nodes.py`：段映射 text→text、at→at、image/emoji→image（三分支：有 `binary_data_base64` 转 `base64://`；否则段内 `data` 为 `http(s)://` / `base64://` / `file://` 前缀或含路径分隔符时按引用重建；否则该媒体段不产出，**不再发占位文本**），嵌套 forward 递归转 node；重建后内容为空的节点整条丢弃，全部节点落空放弃投递并记 warning；插件绝不用非引用形态的段内数据（如主程序写入的中文描述文本）当文件引用发出
+- 日志口径：自动路径的**投递**日志一律带「自动转发」前缀与目标群号（检测层与沉默出口的日志不带目标群号）；请求路径沿用原插件的中文文案、无统一字面前缀，共享群列表刷新等待方的刷新成败由 `plugin.py` 另以「请求转发」前缀记录；刷新任务本身只用稳定域 tag「跨群转发」（按路径的成败由各等待方在 `await` 处自行记录）。新增口径：摘要就绪超时 warning（含 msg_id 与源群号）、决策模式触发 / 决策消费 / 选择不转发 info、非法 mode warning、决策票超时未消费 warning
 - 转发域不复用 `scope` 白黑名单与 `behavior.delay_*`，源群过滤只认 `forward.source_groups`；整域跟随 `forward.enabled`，`plugin.enabled` 为总开关
 
 ### 公共

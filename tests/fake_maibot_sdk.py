@@ -318,14 +318,19 @@ class FakeMessageCapability:
     """ctx.message 替身（对齐真实 SDK message.get_by_id 签名）。
 
     results 按消息 ID 预置返回值，未命中回落 default_result（默认 None，
-    对齐 before_process 时消息尚未落库的时序）；fail_next 时返回 None。
+    对齐 before_process 时消息尚未落库的时序）；sequences 按消息 ID 预置
+    「第 N 次调用返回什么」的队列（就绪轮询测试用：前两次 None、第三次就绪），
+    队列耗尽后回落 results / default_result；fail_next 时返回 None。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, sequences: dict[Any, list[Any]] | None = None) -> None:
         self.calls: list[dict[str, Any]] = []
         self.results: dict[str, Any] = {}
         self.default_result: Any = None
         self.fail_next = False
+        self.sequences: dict[str, list[Any]] = {
+            str(message_id): list(values) for message_id, values in (sequences or {}).items()
+        }
 
     async def get_by_id(
         self,
@@ -347,6 +352,9 @@ class FakeMessageCapability:
         )
         if self.fail_next:
             return None
+        queue = self.sequences.get(str(message_id))
+        if queue:
+            return queue.pop(0)
         return self.results.get(str(message_id), self.default_result)
 
 

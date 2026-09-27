@@ -16,7 +16,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![MaiBot](https://img.shields.io/badge/MaiBot-1.0.0%2B-6E4AFF?style=for-the-badge)
-![Version](https://img.shields.io/badge/Version-0.6.0-2F81F7?style=for-the-badge)
+![Version](https://img.shields.io/badge/Version-0.7.0-2F81F7?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/Platform-Docker%20%7C%20Linux-blue?style=for-the-badge)
 
@@ -45,10 +45,10 @@ repeater-plugin 是一个 MaiBot 群聊行为插件，把三种「群友会做�
 
 | 特点 | 说明 |
 |:-----|:-----|
-| **纯规则 + 概率** | 三个域都不依赖 LLM 判断：达标/上报/收转发即掷骰，行为可控、频率可调、不烧 token |
+| **纯规则 + 概率** | 默认直发模式下三个域都不依赖 LLM 判断：达标/上报/收转发即掷骰，行为可控、频率可调、不烧 token（`planner` 决策模式才把「是否转发」交目标群 Planner） |
 | **协议端直发** | 复读/打断与自动转发经协议端 HTTP 直调发送，只依赖群号，与主程序发送链和聊天流路由解耦 |
 | **三域并列不混装** | 每域有独立开关、独立冷却、独立延迟；配置改名互不牵扯，出问题先按域定位 |
-| **完全可单测** | `repeats.py` / `reactions.py` / `forwards/` 都是不依赖 SDK 的纯逻辑层，604 条用例覆盖边界 |
+| **完全可单测** | `repeats.py` / `reactions.py` / `forwards/` 都是不依赖 SDK 的纯逻辑层，679 条用例覆盖边界 |
 | **记忆与事实一致** | 直发出去的复读/转发会注入麦麦的聊天历史，麦麦知道自己说过什么、转过什么 |
 
 ---
@@ -112,17 +112,26 @@ disabled_emojis = ["👍"]   # 把 👍 从反义映射里摘掉，回落到跟�
 
 第三个行为域。`forward.enabled` 开启后，**源群**（`forward.source_groups`）里出现**合并转发**时触发两条路径：
 
-**自动转发**（掷骰，不经过 LLM）：对**目标群**逐个独立掷骰，命中后走五步编舞——
+**自动转发**（掷骰，默认不经过 LLM）：源群收到合并转发后，`before_process` 同步段只做门禁与**转发防重**标记，并留一份**转发源消息快照**（原始段 + 内存字节）；后台任务先等**摘要就绪**（轮询 `message.get_by_id` 直到该转发入库且 `processed_plain_text` 非空，超时 `forward.summary_timeout_seconds` 则放弃本次），再对**目标群**逐个独立掷骰。命中后按 `forward.mode` 分两条路：
+
+- `direct`（默认）——直接进入下面的五步编舞，不经过 LLM；
+- `planner`——不直发，插件为目标群签发一次性**决策票**并把**富摘要**交给该群 Planner，模型经 `decide_forward_delivery` Tool 回传「转发 / 不转发」，只有「转发」才进入同一套编舞（决策票无票 / 错群 / 重复消费 / 过期一律拒绝，模型不决策则按不转发处理）。
+
+五步编舞（两个模式共用）：
 
 | 步骤 | 动作 | 失败时 |
 |:-----|:-----|:-------|
 | 1 | 延迟（`forward.delay_*`，默认 0.5~2.0 秒） | — |
 | 2 | 目标群可用性校验（`get_group_list` 缓存 300 秒） | 跳过该群，日志给群号与原因 |
-| 3 | 协议端直发 `send_group_forward_msg` | 记 warning 止步，不重试 |
-| 4 | 目标群**转发内容注入**（`source_kind=forward`） | 记 warning，不阻断后续 |
+| 3 | 协议端直发 `send_group_forward_msg`（字节取自**转发源消息快照**，图片不丢） | 记 warning 止步，不重试 |
+| 4 | 目标群**转发内容注入**（`source_kind=forward`，内容为**富摘要**） | 记 warning，不阻断后续 |
 | 5 | 触发目标群 Planner 针对该转发发言（软约束，可沉默） | 记 warning，不阻断 |
 
 至少一个目标群投递成功后，向源群注入一条**转发留痕**（`source_kind=forward_action`，只列实际成功的群）。
+
+为什么等摘要：主程序处理完会丢弃内存里的图片字节，早发只能发空壳；注入文案也要等转发入库后的**富摘要**（转发内文本 + 已缓存图片描述）才有内容。就绪判定**不等识图描述回填**——描述只进 Maisaka 内存历史、消息本体永不更新，等不到；首见图在富摘要里仍是占位，这是主程序边界。
+
+媒体兜底收紧：节点里的图片段只有在带二进制（转 `base64://`）或段内数据是可用引用（`http(s)://` / `base64://` / `file://` 前缀或含路径分隔符）时才发出；两者皆无的媒体段不产出，节点因此变空就整条丢弃，不再发 `[图片]` / `[表情]` 占位文本；全部节点落空则放弃本次投递并记 warning。
 
 **请求转发**（对话请求，不掷骰）：群友让麦麦分享某条合并转发时，走 `request_cross_group_forward` Tool 的完整链路——**查看资格**（已完整查看内容，或连续可重试故障达 `view_failure_fallback_threshold` 后降级用摘要）、一次性会话授权、按 `target_groups` 顺序投递、目标群 Planner 自主决定是否发言。该路径不受**转发权重**影响，**强制发言**只适用于自动路径。
 
@@ -130,11 +139,14 @@ disabled_emojis = ["👍"]   # 把 👍 从反义映射里摘掉，回落到跟�
 
 | 机制 | 默认 | 说明 |
 |:-----|:-----|:-----|
-| **转发防重** `dedup_ttl_seconds` | 1800 | 同一条**转发源消息**在此窗口内只掷一次骰 |
+| **转发防重** `dedup_ttl_seconds` | 1800 | 同一条**转发源消息**在此窗口内只掷一次骰；标记在 `before_process` 同步段写入，先于摘要等待，等待期间重复上报不触发第二次编排 |
+| **摘要就绪超时** `summary_timeout_seconds` | 10 | 等待该转发入库且**富摘要**非空的上限（秒）；超时记 warning 并放弃本次，不掷骰、不写冷却、不投递 |
 | **源群冷却** `cooldown_seconds` | 60 | 至少一个目标群命中转发才写；冷却期内该群新到的合并转发不掷骰，全沉默不写 |
 | **目标群冷却** `target_cooldown_seconds` | 60 | 该群命中转发后写入，只压制该群，与其他目标群无关 |
 | **已投递状态** | — | 自动路径投递成功的目标群会被请求转发跳过；全部已投递时返回「已转发过」 |
 | **可用性校验** | 缓存 300 秒 | 投递前校验目标群仍在机器人群列表；不在列表则跳过并给出明确原因，绝无「未知错误」 |
+
+因为掷骰与冷却写入推迟到**摘要就绪**之后，就绪等待窗口内到达的新合并转发会各自独立掷骰（冷却写入随之后移，通常窗口为亚秒级）。两条路径可分别用 `forward.auto_enabled` / `forward.request_enabled` 单独停用，互不影响；转发域总闸仍是 `forward.enabled`（与 `plugin.enabled` 合取）。
 
 自动路径投递的日志带「自动转发」前缀与目标群号，请求路径沿用原插件的中文文案，共享群列表刷新等待方的成败另以「请求转发」前缀记录——排查时先分清是哪条路径。转发域**不复用** `[scope]` 白黑名单与 `[behavior]` 延迟字段。
 
@@ -152,15 +164,17 @@ repeat-plugin/
 ├── _manifest.json          # 插件清单 v2（id/版本/依赖/能力声明）
 ├── forwards/               # 转发域子包（纯逻辑，不依赖 SDK）
 │   ├── source.py           #   转发源消息解析与资格判定
-│   ├── nodes.py            #   转发节点解析与 OneBot 转换（含嵌套转发与媒体占位降级）
+│   ├── nodes.py            #   转发节点解析与 OneBot 转换（含嵌套转发与媒体三分支兜底）
 │   ├── forward_segments.py #   段定位与节点校验的共享叶子模块（两条路径复用）
 │   ├── auto.py             #   逐目标群独立掷骰
+│   ├── summary.py          #   摘要就绪提取（富摘要）与轮询节奏
+│   ├── decision.py         #   转发决策票注册表（决策模式一次性凭据）
 │   ├── state.py            #   防重 / 冷却 / 已投递状态 / 群可用性缓存
-│   ├── texts.py            #   内容注入、留痕与强制发言 intent 文案
+│   ├── texts.py            #   内容注入、留痕、强制发言与决策 intent 文案（富摘要 + 控制字符清洗）
 │   └── request/            #   请求转发链路（原 ForwardMessagesAuto v0.2.12 整包移植）
 ├── tests/                  # pytest：纯逻辑单测 + 插件级集成（fake maibot_sdk 注入）
 ├── docs/
-│   ├── adr/                # 决策记录 0001~0010
+│   ├── adr/                # 决策记录 0001~0011
 │   └── emoji-id-reference.md  # 表情 ID 两套编号体系查表
 └── openspec/               # 行为契约（specs/ 主 spec + changes/archive 变更归档）
 ```
@@ -247,6 +261,8 @@ ssh arclinux 'docker logs --since 2m maim-bot-core | grep -E "复读插件已加
 | `复读链达标` → `已直发复读文本` / `已直发打断文本` | 复读链路通（三人接龙一次即可验证） |
 | `表情回应触发` / `已跟风贴表情` | 表情回应链路通 |
 | `自动转发命中` → `自动转发已投递` | 自动转发掷骰命中且目标群直发成功 |
+| `自动转发摘要就绪超时` | 转发长时间未入库或摘要为空，本次放弃（对照 `summary_timeout_seconds` 调参） |
+| `自动转发决策模式已触发目标群决策` | `planner` 模式下已请目标群 Planner 决策，等待 `decide_forward_delivery` Tool 回传结果 |
 | `跳过不可用目标群` | 配置里有失效群，按日志群号清理 |
 | `表情回应上报形态不认识，已忽略: {...}` | 协议端形态变了，贴回原始 JSON 补解析分支 |
 | `协议端不支持 set_msg_emoji_like（retcode=1404）` | 协议端不支持贴表情动作，插件自动停止尝试（复读不受影响） |
@@ -275,8 +291,12 @@ ssh arclinux 'docker logs --since 2m maim-bot-core | grep -E "复读插件已加
 | `trigger_target_planner` | `true` | 自动转发投递成功后是否触发目标群 Planner 发言（软约束，仍可沉默） |
 | `view_failure_fallback_threshold` | `2` | 请求转发校验**查看资格**时，连续可重试故障达该次数后降级用摘要 |
 | `inject_max_chars` | `800` | 转发内容注入文本的长度上限，超长截断并带省略标记 |
+| `mode` | `"direct"` | 转发模式：`direct` = 掷骰命中即直发目标群（默认，升级后行为不变）；`planner` = 命中后把**富摘要**交给目标群 Planner，经 `decide_forward_delivery` Tool 决定是否转发。非法值按 `direct` 处理并记 warning |
+| `auto_enabled` | `true` | **自动转发**路径开关：关闭后源群合并转发不再掷骰、不投递；请求转发路径不受影响 |
+| `request_enabled` | `true` | **请求转发**路径开关：关闭后转发 Tool 与源群 Planner 入口提示都不再生效；自动转发路径不受影响 |
+| `summary_timeout_seconds` | `10` | 等待**摘要就绪**的上限（秒，1~300）：超时记 warning 并放弃本次，不掷骰、不写冷却、不投递 |
 
-调参提示：`weight_send` / `weight_silence` 只有比例意义——「三成转发」是 30/70，「偶尔转发」可改 5/95；两权重全 0 表示该目标群永远沉默。失效群号不会变成「未知错误」，但每次投递前都会被跳过并记 warning，建议及时清理。
+调参提示：`weight_send` / `weight_silence` 只有比例意义——「三成转发」是 30/70，「偶尔转发」可改 5/95；两权重全 0 表示该目标群永远沉默。失效群号不会变成「未知错误」，但每次投递前都会被跳过并记 warning，建议及时清理。切 `planner` 模式需要目标群 Planner 可用：模型没在决策票 TTL 内调用 `decide_forward_delivery` 时按「不转发」处理并记 warning，插件不做超时补发。
 
 ### `[repeat]`（复读）
 
@@ -344,6 +364,20 @@ ssh arclinux 'docker logs --since 2m maim-bot-core | grep -E "复读插件已加
 
 ## 迁移
 
+### 从 0.6.0 升级（转发模式与路径开关）
+
+`config_version` 1.2.0 → 1.3.0：`[forward]` 新增 `mode` / `auto_enabled` / `request_enabled` / `summary_timeout_seconds` 四个字段，主程序自动重建 `config.toml` 骨架（保留已填的旧字段值、补新键默认值）。
+
+| 事项 | 说明 |
+|:-----|:-----|
+| **默认行为不变** | 默认 `mode = "direct"` + 两个路径开关为 `true`：升级后行为与 0.6.0 一致，仅自动转发的掷骰与投递时机后移到**摘要就绪**之后（通常亚秒级） |
+| **图片保全** | 发送字节 100% 取自 `before_process` 时点的**转发源消息快照**，不再依赖事后从消息库恢复图片二进制 |
+| **就绪窗口语义** | 冷却写入随掷骰后移：就绪等待窗口内到达的新合并转发会各自独立掷骰，不再被前一条的冷却压制 |
+| **切 `planner` 模式** | 需要目标群 Planner 可用；命中后由模型经 `decide_forward_delivery` Tool 决定是否转发，模型不决策则按「不转发」处理（记 warning，不补发） |
+| **媒体兜底** | 无二进制且段内数据不是可用引用的媒体段不再产生 `[图片]` / `[表情]` 占位文本，所在节点为空则丢弃；全部节点落空会放弃投递并记 warning |
+
+从更早版本（0.6.0 之前）升级时，先按下一节填好 `[forward]` 的 `source_groups` / `target_groups`，再对照本表新增四个字段。
+
 ### 从 ForwardMessagesAuto（跨群转发旧插件）
 
 原先部署 `papaya0481/maibot-ForwardMessagesAuto-plugin` 的，启用转发域前**必须停用旧插件**（`enabled = false` 或移出 plugins 目录）：两个插件都会在源群触发 Planner 并处理转发 Tool，同时启用会对同一批合并转发重复处理。原插件的 `[routing]` / `[behavior]` 不自动迁移，按 `[forward]` 表重填。
@@ -388,13 +422,13 @@ manifest id 从 `arcdent.sending-emojis-plugin` 变为 `arcdent.repeater-plugin`
 ## 开发
 
 ```bash
-# 全部测试（604 条：纯逻辑单测 + 插件级集成）
+# 全部测试（679 条：纯逻辑单测 + 插件级集成）
 uv run --with pytest --with aiohttp pytest tests/ -q
 
 # 类型检查（生产代码零错误）
 uv run --with pyright --with aiohttp pyright
 
-# 代码风格（51 条有意偏离见 AGENTS.md「验证」节）
+# 代码风格（53 条有意偏离见 AGENTS.md「验证」节）
 uv run --with ruff ruff check .
 ```
 
