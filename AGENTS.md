@@ -69,6 +69,7 @@ MaiBot 插件：聚合三个群聊行为——群内复读链达标后，麦麦�
 - 表情回应域的上下文注入默认关闭（`context.enabled`），整块试、整块关（复读域注入跟随 `repeat.enabled`，不受此开关约束）；注入路径复用 `scope` 白黑名单，但麦麦自己贴的回应不受 `ignore_reactors` 影响
 - 注入限流里**去重 ≠ 聚合**：去重（`dedup_ttl_seconds`）管「同一回应者+被回应消息+表情只注入一次」，聚合（`merge_window_seconds`）管「同一被回应消息同一表情的多条回应汇入一条注入消息」，`max_reactions_per_message` 兜住单条消息的注入条数
 - 注入文本显示名来源链：`context.self_display_name` → 主程序 `bot.nickname` → 空（不写名字）
+- 注入成功日志统一格式（对齐 smart_poke_plugin 的 `text='…', index=…, stream=…` 呈现）：三条注入路径（表情回应聚合 / 复读触发与行为 / 转发内容与留痕）的成功 info 一律为「已写入 Maisaka 上下文: kind=… text='…预览' group=… msg=… index=… stream=…」字段序，kind 即 `source_kind`，text 经 `_log_preview` 超 60 字截断，index/stream 取 append 回执与本群 stream；转发域另带「自动转发」前缀（design D8 路径前缀口径）。失败 / 跳过注入的 warning 保持各自定位字段，不并入此格式
 - 新增纯逻辑按领域写进对应纯逻辑层并加单测（表情回应域进 `reactions.py`，复读域进 `repeats.py`，转发域进 `forwards/`，三域并列、不混装）；不往 `plugin.py` 里塞可测逻辑
 
 ## 验证
