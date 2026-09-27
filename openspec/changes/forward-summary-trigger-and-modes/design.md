@@ -36,7 +36,7 @@
 
 ### D2 摘要就绪：轮询 `get_by_id` 直到入库且摘要非空
 
-- 就绪判定：`await ctx.message.get_by_id(source.message_id, stream_id=源群 stream, include_binary_data=False)` 返回 dict 且 `processed_plain_text`（strip 后）非空。流 ID 用既有 `_get_stream_id(source.group_id)` 缓存；取不到流时退化为不带 `stream_id` 的调用。
+- 就绪判定：`await ctx.message.get_by_id(source.message_id, include_binary_data=False)` 返回 dict 且 `processed_plain_text`（strip 后）非空。**只带消息 ID、不带 `stream_id`**：Host 按「聊天流 + 消息 ID」过滤，而同群在 `chat_sessions` 里可能存在新旧多个 session（群改名 / 会话平滑迁移后），插件解析到的 stream 可能是陈旧的，带上它查询恒为空（生产实测，见文末补记）；消息 ID 在平台内唯一，本就是充分条件。
 - 轮询节奏：首次立即查，之后 0.5s 间隔退避到 1s 上限；总时长受 `forward.summary_timeout_seconds`（默认 10s）约束。超时 → warning「摘要就绪超时」并放弃本次（不掷骰、不写冷却、不投递）。
 - `get_by_id` 异常按「未就绪」处理（记 debug 继续轮询），不因此放弃；只有超时才放弃。
 - 备选：固定延迟（不可观测的入库时刻，要么白等要么漏等）；等识图描述填满（19.6% 首见图永远不成立，ADR 0011 证据 5），均否决。
@@ -95,3 +95,13 @@
 
 - `summary_timeout_seconds` 默认值（10s）按部署后实测就绪耗时分布调整；不影响行为面。
 - 决策 Tool 命名与 intent 文案定稿（实现期细节）。
+
+## 生产实测补记（2026-09-27，arclinux）
+
+两条非本 change 计划内、但由本次上线暴露的主机侧口径问题，已在 `plugin.py` / `forwards/request/core/streams.py` 内修掉（插件 0.7.1）：
+
+1. **就绪轮询带 `stream_id` 会恒空**：Host `message.get_by_id` 按「聊天流 + 消息 ID」过滤，而同群在 `chat_sessions` 里存在新旧多个 session（群名被改后主程序按新路由组件算出了新会话）。插件按群解析到的是陈旧 session（`get_stream_by_group_id` 是会话列表首匹配），11 轮轮询全空后超时放弃；主机侧同参数直接查（不带流过滤）能查到。修复：就绪判定只带消息 ID。
+2. **群 → 活跃聊天流的解析必须优先 hook 上报的 `session_id`**：主程序在派发 `chat.receive.before_process` 之前已按路由口径算好 `session_id`（消息入库与 Planner 读写都用它）。此前插件用 `get_stream_by_group_id` 的首匹配，把**转发内容注入**、**强制发言**触发与**已投递状态**登记都写进了陈旧会话——麦麦在死会话里生成回复后发送失败（`未找到目标平台: qq` → `legacy.send.qq` 失败），注入内容也不出现在麦麦真正在读的会话里。修复：Hook 同步段被动学习「群 → 活跃会话」并优先使用，能力查询退居兜底；请求转发的 `GroupStreamRegistry` 接受同一来源的 `observed_session` 注入（两条路径保持同一 stream 口径，共享**已投递状态**才不会错位）。
+
+同批观察（**不修**，主机侧行为）：麦麦构建多模态 prompt 时按 `emoji_hash` / `image_hash` 回填二进制，命中不到就退化为文本占位——`images` 表里确实没有那几条 hash（表内另有 2203 条 EMOJI / 3405 条 IMAGE），且转发卡片经协议端直发不会写回主程序消息库（`mai_messages` 里查不到），属主程序图片存储的覆盖缺口，插件侧无可修项（注入文本按主程序原文保留占位）。
+

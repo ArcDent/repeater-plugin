@@ -2,6 +2,13 @@
 
 本项目变更记录，格式遵循 Keep a Changelog，语义化版本见 `_manifest.json`。
 
+## [0.7.1] - 2026-09-27
+
+### Fixed
+
+- **摘要就绪轮询改为按消息 ID 单独查**：此前轮询带上按群解析出的 `stream_id`，而 Host 的 `message.get_by_id` 按「聊天流 + 消息 ID」过滤——同一群在 `chat_sessions` 里存在新旧多个 session 时（群改名 / 会话平滑迁移后），插件解析到的可能是**陈旧** session，查询恒为空，就绪判定 11 轮全空后超时放弃（线上实测：主机侧按消息 ID 查得到、插件侧恒空）。消息 ID 在平台内唯一，就绪判定不再携带 `stream_id`。
+- **群 → 活跃聊天流优先取 hook 上报的 `session_id`**：Host 的 `chat.get_stream_by_group_id` 是会话列表**首匹配**，同群多 session 时可能返回陈旧会话。若**转发内容注入**、**强制发言**触发与**已投递状态**登记落在死会话，麦麦会在该会话里生成回复而发送失败（线上实测：`未找到目标平台: qq` → `legacy.send.qq` 失败），注入的转发内容也不会出现在麦麦真正在读的会话里。主程序在派发 `chat.receive.before_process` 之前已按路由口径（platform + group_id + account_id + scope）算好 `session_id`，插件改为从每条 hook 消息被动学习「群 → 活跃会话」并优先使用它，能力查询退居兜底；自动路径与请求转发链路共用这一口径（`GroupStreamRegistry` 新增可选 `observed_session` 注入）。
+
 ## [0.7.0] - 2026-09-27
 
 ### Added

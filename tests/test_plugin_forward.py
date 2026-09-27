@@ -149,6 +149,23 @@ def make_forward_plugin(
     return plugin
 
 
+def hook_text_message(
+    *, group: str, message_id: str, session_id: str, group_name: str = "某群"
+) -> dict[str, Any]:
+    """hook 载荷形态的普通文本消息（携带主程序算好的 `session_id`）。"""
+    return {
+        "message_id": message_id,
+        "platform": "qq",
+        "session_id": session_id,
+        "is_notify": False,
+        "message_info": {
+            "group_info": {"group_id": group, "group_name": group_name},
+            "user_info": {"user_id": "30003", "user_nickname": "群友甲", "user_cardname": ""},
+        },
+        "raw_message": [{"type": "text", "data": "随便聊聊"}],
+    }
+
+
 def forward_node(text: str = "有趣的消息", *, nickname: str = "群友甲") -> dict[str, Any]:
     """一个 `forward` 段内的原始节点（与主程序 hook 侧字段同形）。"""
     return {
@@ -173,7 +190,7 @@ def forward_message(
     return {
         "message_id": message_id,
         "platform": "qq",
-        "session_id": f"session-{group}",
+        "session_id": f"stream-{group}",  # 与 fake chat 能力的流 ID 口径一致（生产里两者同值）
         "is_notify": False,
         "message_info": {
             "group_info": {"group_id": group, "group_name": group_name},
@@ -2098,6 +2115,54 @@ def test_orchestration_survives_stale_stream_cache(tmp_path: Path, monkeypatch):
     assert len(sends) == 2
     assert all(call["group_id"] in (int(TARGET_A), int(TARGET_B)) for call in sends)
 
+
+
+def test_forward_delivery_prefers_hook_observed_session(tmp_path: Path):
+    """群 → 活跃聊天流优先取 hook 上报的 session，能力首匹配只作兜底。
+
+    回归：同一群在 `chat_sessions` 里有新旧多个 session 时，`get_stream_by_group_id`
+    返回列表首匹配（可能是**陈旧**会话）。若**转发内容注入**、**强制发言**触发与
+    **已投递状态**登记落在陈旧会话，麦麦会在死会话里生成回复、发送必然失败
+    （2026-09-27 线上实测：`未找到目标平台: qq` → `legacy.send.qq` 失败），注入的
+    转发内容也不会出现在麦麦真正在读的会话里。
+    """
+    plugin = make_forward_plugin(tmp_path)
+    # 主机侧能力查询返回「陈旧」首匹配（同群多 session 时的真实行为）
+    for stream in plugin.ctx.chat.group_streams:
+        stream["stream_id"] = f"stale-{stream['group_id']}"
+        stream["session_id"] = f"stale-{stream['group_id']}"
+    plugin._stream_ids.clear()
+
+    # 三个群各来一条普通消息：hook 载荷带主程序算好的活跃 session
+    observations = {
+        SOURCE_GROUP: "live-source",
+        TARGET_A: "live-target-a",
+        TARGET_B: "live-target-b",
+    }
+
+    async def scenario() -> None:
+        for index, (group, observed_session) in enumerate(observations.items()):
+            await plugin.handle_forward_message(
+                message=hook_text_message(
+                    group=group, message_id=f"7000{index}", session_id=observed_session
+                )
+            )
+        await plugin._orchestrate_forward_delivery(parse_source())
+
+    asyncio.run(scenario())
+
+    injected = sorted(call["stream_id"] for call in injections(plugin, "forward"))
+    assert injected == ["live-target-a", "live-target-b"]
+    triggered = sorted(call["stream_id"] for call in plugin.ctx.maisaka.proactive.calls)
+    assert triggered == ["live-target-a", "live-target-b"]
+    assert [call["stream_id"] for call in injections(plugin, "forward_action")] == ["live-source"]
+    assert not any("stale" in str(call["stream_id"]) for call in plugin.ctx.maisaka.context.calls)
+    delivered = plugin._forward_delivered.targets_for(
+        build_delivered_key("live-source", "90001"), time.time()
+    )
+    assert sorted(delivered) == [TARGET_A, TARGET_B]
+    # 观察到的群根本不需要再问能力：解析器不该被调用
+    assert [call for call in plugin.ctx.chat.calls if call["method"] == "get_stream_by_group_id"] == []
 
 
 def test_orchestration_injects_rich_summary_and_intent(tmp_path: Path):

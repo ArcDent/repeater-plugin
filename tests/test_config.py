@@ -362,14 +362,14 @@ def test_config_toml_matches_model_defaults():
 
 
 def test_manifest_version_matches_changelog_head():
-    """manifest version 与最新 CHANGELOG 条目标题一致（0.7.0：摘要就绪后触发与双模式）。
+    """manifest version 与最新 CHANGELOG 条目标题一致（0.7.1：就绪轮询与活跃会话解析修复）。
 
     仓库没有独立的插件版本常量，manifest 的 version 与 CHANGELOG 首条标题是
     两个独立来源，互为校验；写错任一侧都会红。
     """
     with MANIFEST_JSON.open("r", encoding="utf-8") as fp:
         manifest = json.load(fp)
-    assert manifest["version"] == "0.7.0"
+    assert manifest["version"] == "0.7.1"
     changelog = (MANIFEST_JSON.parent / "CHANGELOG.md").read_text(encoding="utf-8")
     head = re.search(r"^## \[([^\]]+)\]", changelog, flags=re.MULTILINE)
     assert head is not None, "CHANGELOG.md 缺少 '## [x.y.z]' 形式的版本条目"

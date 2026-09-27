@@ -92,6 +92,8 @@ _FORWARD_TOOL_NAMES = (FORWARD_TOOL_NAME, DECIDE_FORWARD_TOOL_NAME)
 # **强制发言**（投递成功后要求发言）与**决策模式**（等待目标群转发决策）各一个。
 _FORWARD_COMMENT_TRIGGER_KIND = "auto_forward"
 _FORWARD_DECISION_TRIGGER_KIND = "forward_decision"
+# 「群 → 活跃聊天流」观察表的上界：群数量级远小于它，只为防御无限增长。
+_OBSERVED_STREAM_IDS_LIMIT = 200
 # Resident flush-loop tick (design.md D2): hardcoded on purpose — far below
 # the default 30s merge window, so worst-case injection lag is window + tick.
 _INJECTION_FLUSH_TICK_SECONDS = 5
@@ -138,6 +140,7 @@ class RepeaterPlugin(MaiBotPlugin):
     _forward_group_list_failed_at: float | None
     _forward_runtime: ForwardingRuntime | None
     _forward_tasks: set[asyncio.Task]
+    _observed_stream_ids: dict[str, str]
 
     def get_components(self) -> list[dict[str, Any]]:
         """在 SDK 收集的组件声明上把转发 Tool 的 `chat_scope` 提到**顶层**。
@@ -238,6 +241,11 @@ class RepeaterPlugin(MaiBotPlugin):
             self._self_qq = configured_self_qq
         context = self.config.context
         self._stream_ids = {}
+        # **群 → 活跃聊天流**的被动观察表：hook 每条消息都带主程序按路由口径算好
+        # 的 `session_id`，比 `get_stream_by_group_id` 的「列表首匹配」可信得多
+        # （同一群在 chat_sessions 里可能有新旧多个 session，首匹配可能是陈旧会话）。
+        # 与其他状态容器同生命周期：随重建清空，下一次群消息到达即重新学到。
+        self._observed_stream_ids = {}
         self._bot_display_name = ""
         # One-shot resolution flag (design.md D6): display-name lookups stop
         # once resolved; only a rebuild (config reload) resets it.
@@ -283,6 +291,9 @@ class RepeaterPlugin(MaiBotPlugin):
                 # 刷新语义（TTL 判断 + in-flight 合并）；不注入的话，缓存过期后
                 # 请求路径只读过期快照、会静默放行到已失效的群（design D4）。
                 group_list_refresher=lambda: self._ensure_group_availability("请求转发"),
+                # 请求路径的群 → 流解析同样优先用 hook 观察到的活跃会话：Host 的
+                # 能力查询是首匹配，可能把目标群解析到陈旧会话（与自动路径同源）。
+                observed_session=self._observed_stream_id,
                 plugin_version=read_plugin_version(),
             )
             if self._forward_enabled()
@@ -609,13 +620,22 @@ class RepeaterPlugin(MaiBotPlugin):
         )
 
     async def _get_stream_id(self, group_id: str) -> str:
-        """群号 → 聊天流 ID；成功缓存，失败返回空串且不缓存（design.md D6）。
+        """群号 → 聊天流 ID；优先 hook 观察到的**活跃**会话，其次能力查询（design.md D6）。
+
+        主程序按路由口径算出的 `session_id`（hook 每条消息都带）比
+        `get_stream_by_group_id` 的「会话列表首匹配」可信：同一群在
+        `chat_sessions` 里可能有新旧多个 session，首匹配可能是陈旧会话，注入与
+        触发会落在没人读的死会话里（2026-09-27 线上实测：麦麦回复「未找到目标
+        平台」发送失败）。
 
         The main program looks sessions up in memory and creates them lazily,
         so a failed lookup is transient: caching the empty string would pin
         the group as "no stream" forever. Success values are deterministic
         (session_id is stable), so they are cached as before.
         """
+        observed = self._observed_stream_id(group_id)
+        if observed:
+            return observed
         cached = self._stream_ids.get(group_id)
         if cached is not None:
             return cached
@@ -934,6 +954,9 @@ class RepeaterPlugin(MaiBotPlugin):
         `forward.request_enabled`）。
         """
         forward = self.config.forward
+        # **群 → 活跃聊天流**的观察先于所有门禁：它是纯内存记账（每条群消息都带
+        # 主程序算好的 session_id），关域或非候选时也要记，请求转发路径同样受益。
+        self._observe_group_session(message)
         if not self._forward_enabled():
             return
         if not forward.auto_enabled:
@@ -962,6 +985,42 @@ class RepeaterPlugin(MaiBotPlugin):
             return
         self._forward_state.mark_message(source.message_id, now)
         self._spawn_forward(self._orchestrate_forward_delivery(source))
+
+    def _observe_group_session(self, message: Any) -> None:
+        """从 hook 载荷里记下「群号 → 主程序路由算出的 session_id」（纯内存）。
+
+        主程序在派发 `chat.receive.before_process` 之前就已按路由口径
+        （platform + group_id + account_id + scope）算好 `session_id`，消息入库
+        与 Planner 读写都用它——因此这是该群**活跃会话**的权威来源。Host 的
+        `chat.get_stream_by_group_id` 是会话列表**首匹配**，同群存在新旧多个
+        session 时可能返回陈旧会话（2026-09-27 线上实测：注入与触发落在死会话，
+        麦麦回复发送失败）。
+
+        观察表有上界：超出 `_OBSERVED_STREAM_IDS_LIMIT` 时按插入顺序淘汰最旧项；
+        群数量级远小于该上界，淘汰只为防御异常输入导致的无限增长。
+        """
+        if not isinstance(message, dict):
+            return
+        session_id = str(message.get("session_id") or "").strip()
+        if not session_id:
+            return
+        message_info = message.get("message_info")
+        if not isinstance(message_info, dict):
+            return
+        group_info = message_info.get("group_info")
+        if not isinstance(group_info, dict):
+            return
+        group_id = str(group_info.get("group_id") or "").strip()
+        if not group_id:
+            return
+        self._observed_stream_ids[group_id] = session_id
+        while len(self._observed_stream_ids) > _OBSERVED_STREAM_IDS_LIMIT:
+            self._observed_stream_ids.pop(next(iter(self._observed_stream_ids)))
+
+    def _observed_stream_id(self, group_id: Any) -> str:
+        """取 hook 上报学到的活跃 session；没有观察记录时返回空串。"""
+
+        return self._observed_stream_ids.get(str(group_id or "").strip(), "")
 
     async def _orchestrate_forward_delivery(self, source: ForwardSource) -> None:
         """自动路径后台编排：等**摘要就绪** → 逐目标群掷骰 → 写冷却 → 后台投递。

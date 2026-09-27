@@ -57,7 +57,7 @@
 - [x] 3.1 同步段收敛：`_process_forward_message` 删除掷骰与 `mark_group` / `mark_targets`，保留「域开关 → 解析 → 源群门禁 → 请求路径入口提示 → 防重 `mark_message` → spawn 编排任务」；掷骰与冷却写入移入 3.3
   - seam：`RepeaterPlugin._process_forward_message` / `handle_forward_message`
   - 验收：同步段用例断言「不掷骰、不写冷却、只 mark_message 与 spawn」；非候选 / 非白名单 / 麦麦自身 / 域关闭四种用例断言无任务无状态写入（回归）
-- [x] 3.2 编排任务就绪段：`_orchestrate_forward_delivery(source)` 轮询 `ctx.message.get_by_id`（首次即查，之后按 `forwards.summary` 退避间隔，总超时 `forward.summary_timeout_seconds`）等待**摘要就绪**，就绪则取得富摘要；超时记 warning（含 msg_id 与源群号）并放弃；`get_by_id` 异常按未就绪续等；流 ID 取不到时退化为不带 `stream_id` 调用
+- [x] 3.2 编排任务就绪段：`_orchestrate_forward_delivery(source)` 轮询 `ctx.message.get_by_id`（**只带消息 ID，不带 `stream_id`**——Host 按「流 + 消息 ID」过滤，陈旧流会恒空；见 design「生产实测补记」）等待**摘要就绪**，首次即查、之后按 `forwards.summary` 退避间隔，总超时 `forward.summary_timeout_seconds`；就绪则取得富摘要；超时记 warning（含 msg_id 与源群号）并放弃；`get_by_id` 异常按未就绪续等
   - seam：`RepeaterPlugin._orchestrate_forward_delivery`（后台任务入口，测试直接 await）
   - 验收：就绪前无任何掷骰 / 冷却 / 投递（计数 roll 与调用记录断言）；超时放弃时日志含 warning；就绪轮询全程只发生在一个任务内
 - [x] 3.3 编排任务决策段：就绪后 `decide_forward_targets` 逐目标群掷骰 → 命中先写冷却（`mark_group` + `mark_targets`）→ 每命中群 spawn 既有 `_deliver_forward_to_target`（传入富摘要）→ spawn 既有 `_finalize_forward_delivery`；无命中按既有口径记 info 收尾；编排任务经 `_spawn_forward` 登记（卸载取消覆盖）
@@ -118,3 +118,17 @@
 - [ ] 5.3 arclinux 部署与人工验证（按 design Migration Plan）：rsync 新版本（排除 `config.toml`）、`config.toml` 增加四字段（保持 `mode = "direct"`）、重启；源群发含图合并转发，核对目标群带图转发、富摘要注入、麦麦发言内容；切 `planner` 模式验证决策流转
   - seam：线上验证（人工）
   - 验收：目标群收到带图转发且图片与源消息一致；注入文本含已缓存图描述；决策模式转发 / 不转发 / 无票拒绝三条路径符合预期；日志无「未知错误」
+
+## 6. 上线后修复（2026-09-27 生产实测暴露，已随 0.7.1 部署）
+
+> 详见 design.md「生产实测补记」；两项都不是本 change 计划内的行为面，而是插件与 Host 会话/过滤口径的接口问题。
+
+- [x] 6.1 就绪轮询改为只带消息 ID（不带 `stream_id`）：Host 按「聊天流 + 消息 ID」过滤，同群存在新旧多个 session 时插件解析到的陈旧 stream 会让查询恒空 → 超时放弃
+  - seam：`RepeaterPlugin._fetch_forward_source_message` + `tests/test_plugin_forward.py::test_orchestration_survives_stale_stream_cache`
+  - 验收：陈旧流缓存下仍能取到富摘要并完成投递；轮询调用参数不含 `stream_id`
+- [x] 6.2 群 → 活跃聊天流优先取 hook 上报的 `session_id`：`chat.get_stream_by_group_id` 是会话列表首匹配，可能返回陈旧会话，导致注入 / 触发 / 已投递登记落进死会话（麦麦回复 `未找到目标平台` 发送失败）
+  - seam：`RepeaterPlugin._observe_group_session` / `_get_stream_id` + `forwards/request/core/streams.py::GroupStreamRegistry(observed_session=…)` + `tests/test_plugin_forward.py::test_forward_delivery_prefers_hook_observed_session` / `tests/forwards/request/core/test_streams.py::test_group_stream_registry_prefers_observed_session`
+  - 验收：观察到的活跃会话优先于能力首匹配；自动路径注入 / 触发 / 登记与请求路径解析共用同一 stream 口径
+- [x] 6.3 回归与文档：新增回归用例（旧逻辑下确实变红）、全量 pytest / pyright / ruff 通过；AGENTS.md 转发域补两条解析口径、CHANGELOG 增 0.7.1 条目、design 补记主机侧根因
+  - seam：仓库级命令 + 文档
+  - 验收：`pytest tests/ -q` 全绿（682 通过）、`pyright` 零错误、`ruff` 仍只剩声明的六类偏离

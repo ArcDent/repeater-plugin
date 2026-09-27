@@ -74,6 +74,7 @@ class ForwardingRuntime:
         delivered_registry: DeliveredRegistryLike,
         availability_cache: GroupAvailabilityCacheLike,
         group_list_refresher: Callable[[], Awaitable[None]] | None = None,
+        observed_session: Any = None,
         plugin_version: str = "",
     ) -> None:
         """创建一次插件生命周期内共享的服务对象。
@@ -98,6 +99,10 @@ class ForwardingRuntime:
                 `plugin.py` 注入自动路径同款实现（TTL 判断 + in-flight 合并），
                 使缓存过期不再退化为静默放行（design D4）。省略时维持只读
                 缓存的原插件语义。
+            observed_session: 可选的「群号 → 活跃聊天流」回调查看器（本插件的
+                适配注入）：Host 的 ``get_stream_by_group_id`` 按会话列表首匹配
+                返回，同群存在新旧多个 session 时可能是陈旧会话；插件从 hook
+                上报学到的活跃 session 优先，省略时维持原来的能力解析顺序。
             plugin_version: 本地调试统计的版本分桶名；省略时读取插件根
                 `_manifest.json`。
         """
@@ -105,7 +110,7 @@ class ForwardingRuntime:
         self._config_provider = config_provider
         self.view_eligibility = ViewEligibilityStore()
         self._pending_view_judgments: dict[str, dict[str, bool]] = {}
-        self.streams = GroupStreamRegistry(context)
+        self.streams = GroupStreamRegistry(context, observed_session)
         self.delivered_registry = delivered_registry
         self.availability_cache = availability_cache
         self.state = ForwardStateStore(
