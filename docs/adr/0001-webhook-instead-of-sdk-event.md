@@ -16,7 +16,7 @@ status: accepted
 
 - 协议端需要再配一个 HTTP 上报目标（`friend-request-handler` 已占一个），换端口或换 token 时两处都要同步。
 - 插件依赖协议端容器在同一 Docker 网络内可达，不只依赖 MaiBot 进程内 RPC。
-- 上报体形态与动作参数已对照 SnowLuma 源码核实（clone 在 `REFERENCE/snowluma`）：
+- 上报体形态与动作参数已对照 SnowLuma 源码核实（clone 在 `arcwsl:~/github/REFERENCE/snowluma`）：
   - `packages/onebot/src/event-converter/to-notice.ts` 的 `convertGroupMsgEmojiLike` 产出 `notice_type: 'group_msg_emoji_like'`、`sub_type: 'add' | 'remove'`、`group_id`、`user_id`、`operator_id`、`message_id`、`message_seq`、`likes: [{ emoji_id, count }]`，与本插件解析层一致
   - `packages/onebot/src/actions/extended.ts` 的 `set_msg_emoji_like` 接 `message_id` / `emoji_id` / `set`（默认 true），与本插件发送参数一致
   - `packages/onebot/src/actions/message.ts` 的 `get_msg` 返回首次收到时存储的消息副本，含 `sender.user_id`，与本插件读取原作者的方式一致

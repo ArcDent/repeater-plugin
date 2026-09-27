@@ -17,7 +17,7 @@ Unicode 码点），归一正好抹平「上报给字符、发送要码点」的
 
 ## QQ 小黄脸编号边界
 
-编号语义没有公开权威静态表，以下边界来自 SnowLuma（`REFERENCE/snowluma`）
+编号语义没有公开权威静态表，以下边界来自 SnowLuma（`arcwsl:~/github/REFERENCE/snowluma`）
 `packages/protocol/src/sys-face-store.ts` 的 `faceWireFor`：
 
 - `face_id < 260`：classic 小黄脸

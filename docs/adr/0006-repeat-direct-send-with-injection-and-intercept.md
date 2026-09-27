@@ -9,7 +9,7 @@ ADR 0005 的两个核心决策被本 ADR 取代：(a) 复读检测 handler 从 o
 
 ## Context
 
-复读功能在线上暴露两个问题：**双重发言**（复读链达标时，麦麦的复读与 LLM planner 对同一条触发消息的回复同时发出）与**发送链路受扰**（`ctx.send.text` 走主程序 send_service，路过的其他插件 blocking hook 可改写/取消，且发送前置依赖 stream_id 查询成功）。源码实证（`REFERENCE/MaiBot` @ repeat-fix 调查）：
+复读功能在线上暴露两个问题：**双重发言**（复读链达标时，麦麦的复读与 LLM planner 对同一条触发消息的回复同时发出）与**发送链路受扰**（`ctx.send.text` 走主程序 send_service，路过的其他插件 blocking hook 可改写/取消，且发送前置依赖 stream_id 查询成功）。源码实证（`arcwsl:~/github/REFERENCE/MaiBot` @ repeat-fix 调查）：
 
 - 主程序不存在消息级「跳过 planner」机制：hook 动作词表只有 `continue`/`abort`（`plugin_runtime/host/hook_dispatcher.py:535-549`）。`abort` = 整条消息从主链消失（不写库、不进上下文、不进 planner）。
 - `ctx.send.text` 两参调用默认 `sync_to_maisaka_history=False`，不进内存上下文——麦麦当场不知道自己复读过什么。

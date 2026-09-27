@@ -220,20 +220,41 @@ def test_nodes_to_onebot_messages_maps_emoji_with_binary_to_image():
     ]
 
 
-def test_nodes_to_onebot_messages_falls_back_to_segment_reference():
-    segment = {"type": "image", "data": "https://example.com/a.png"}
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "https://example.com/a.png",
+        "http://example.com/a.png",
+        "base64://aGVsbG8=",
+        "file:///tmp/a.png",
+        "C:\\images\\a.png",
+    ],
+)
+def test_nodes_to_onebot_messages_keeps_reference_like_media_data(reference):
+    segment = {"type": "image", "data": reference}
     assert nodes_to_onebot_messages([_node_of((segment,))])[0]["data"]["content"] == [
-        {"type": "image", "data": {"file": "https://example.com/a.png"}}
+        {"type": "image", "data": {"file": reference}}
     ]
 
 
-def test_nodes_to_onebot_messages_media_without_reference_becomes_text_placeholder():
+def test_nodes_to_onebot_messages_media_without_usable_source_is_dropped():
+    """无字节且无可引用数据时该媒体段不产出，节点因内容为空被整条丢弃。"""
     image = {"type": "image", "hash": "abc"}
     emoji = {"type": "emoji", "hash": "def"}
-    content = nodes_to_onebot_messages([_node_of((image, emoji))])[0]["data"]["content"]
-    assert content == [
-        {"type": "text", "data": {"text": "[图片]"}},
-        {"type": "text", "data": {"text": "[表情]"}},
+    assert nodes_to_onebot_messages([_node_of((image, emoji))]) == []
+
+
+def test_nodes_to_onebot_messages_chinese_description_data_is_not_a_file_reference():
+    """主程序写入的中文描述文本不是文件引用，不得当 file 发出。"""
+    segment = {"type": "image", "data": "[图片：一张猫]"}
+    assert nodes_to_onebot_messages([_node_of((segment,))]) == []
+
+
+def test_nodes_to_onebot_messages_mixed_node_keeps_only_usable_segments():
+    """混合节点只保留可重建的段，不可用媒体段不产生占位文本。"""
+    node = _node_of((_text("看图"), {"type": "image", "data": "[图片：一张猫]"}))
+    assert nodes_to_onebot_messages([node])[0]["data"]["content"] == [
+        {"type": "text", "data": {"text": "看图"}}
     ]
 
 

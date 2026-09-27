@@ -18,7 +18,7 @@ observe 模式对主链的影响有源码保证：`plugin_runtime/host/hook_disp
 ## Consequences
 
 - 两个功能的通路按「SDK 链有用 SDK 链、没有才自建」的原则分野：表情回应 notice 走 webhook（ADR 0001）、贴表情动作走协议端直调（SDK 无该动作）；复读检测走 hook 观测（SDK 链有活口）、复读发送走 `ctx.send.text`（SDK 有且消息进上下文是刚需）。
-- 通路判定依据从 ADR 0001 时期的「无法验证、押注猜测」升级为源码实证（`REFERENCE/MaiBot` 与 `REFERENCE/maibot-plugin-sdk` 已 clone），但实证针对的是当前版本：主程序未来若恢复 ON_MESSAGE 分发或调整 hook 形态，本 ADR 的前提需要重审。
+- 通路判定依据从 ADR 0001 时期的「无法验证、押注猜测」升级为源码实证（`arcwsl:~/github/REFERENCE/MaiBot` 与 `arcwsl:~/github/REFERENCE/maibot-plugin-sdk` 已 clone），但实证针对的是当前版本：主程序未来若恢复 ON_MESSAGE 分发或调整 hook 形态，本 ADR 的前提需要重审。
 - observe handler 收到的是 kwargs 快照（dict 深拷贝）里的序列化 SessionMessage；检测层必须容许形态变化。认不出的消息形态打 **debug** 不打 warning：与 webhook 上报不同（上报的 warning 承担 ADR 0001 的部署验证职责），hook 对每条群消息都触发，warning 会刷屏；消息段形态由 QQ 客户端决定、高度稳定（口径与 change repeat-and-rebrand 的 design D4 一致）。
 - hook 挂在 `process()` 之前，消息段保持原始 OneBot 形态，「仅含 text 段」的**复读文本**判定在原始形态上做，不受主程序预处理影响。
 - 麦麦自己经 `ctx.send.text` 发出的复读/打断消息不会回流到 `chat.receive` 入站链（那是入站专用），不存在「自己复读触发自己」的直接回路；群友看到复读后接续发送的**复读链**后续处理见术语表与后续决策。
