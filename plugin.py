@@ -41,7 +41,12 @@ from .forwards.request import (
 )
 from .forwards.source import ForwardSource, parse_forward_source
 from .forwards.state import DeliveredRegistry, ForwardState, GroupAvailabilityCache
-from .forwards.summary import extract_rich_summary, next_poll_interval, should_give_up
+from .forwards.summary import (
+    count_rich_summary_placeholders,
+    extract_rich_summary,
+    next_poll_interval,
+    should_give_up,
+)
 from .forwards.texts import (
     build_forced_comment_intent,
     build_forward_content_text,
@@ -984,9 +989,10 @@ class RepeaterPlugin(MaiBotPlugin):
         if source.group_id not in qq_set(forward.source_groups):
             return
         if self._forward_runtime is not None and forward.request_enabled:
-            # 请求转发链路的入口提示（spec 请求转发链路）：源群 Planner 触发由
-            # 运行时按 trigger_source_planner / 永久防重自行判定，冷却与防重
-            # 只约束自动路径，不压制这条提示。
+            # 请求转发链路的入口提示（spec 请求转发链路）：入口提示随
+            # request_enabled 固化开启，源群 Planner 触发由运行时按
+            # _is_unloading / 永久防重自行判定；冷却与防重只约束自动路径，
+            # 不压制这条提示。
             self._forward_runtime.observe_source_message(message)
         now = time.time()
         if self._forward_state.is_duplicate(
@@ -1046,6 +1052,13 @@ class RepeaterPlugin(MaiBotPlugin):
         rich_summary = await self._wait_for_forward_summary(source)
         if rich_summary is None:
             return
+        # 占位观测（change design D3）：就绪即记一次富摘要的媒体占位计数，供主机侧
+        # 多模态降级排查。纯观测：不改写富摘要，不参与任何行为分支。
+        self.ctx.logger.info(
+            f"自动转发富摘要媒体占位 {count_rich_summary_placeholders(rich_summary)} 处"
+            f"（主程序 images 表缺 hash 时麦麦多模态降级）"
+            f"msg={source.message_id} group={source.group_id}"
+        )
         forward = self.config.forward
         now = time.time()
         # **目标群**冷却只压制该群：先按请求路径同款口径归一（去空、去重、去
@@ -1798,7 +1811,7 @@ class RepeaterPlugin(MaiBotPlugin):
             },
             "content_summary": {
                 "type": "string",
-                "description": "查看连续失败达到降级阈值后使用的忠实内容摘要（可空）",
+                "description": "查看失败（消息不可见或内容取不到）时使用的忠实内容摘要（可空）",
             },
         },
         chat_scope="group",

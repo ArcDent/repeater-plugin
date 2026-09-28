@@ -588,13 +588,13 @@ class RequestHarness:
             kwargs,
         )
 
-    async def trigger_source_planner_for_forward_message(
+    async def observe_source_message(
         self,
         *,
         message: Any = None,
         **kwargs: Any,
     ) -> None:
-        """等价原插件 ``after_process`` Hook：筛选并安排 source Planner 触发。
+        """等价 ``chat.receive.before_process`` Hook 的入口提示委托：筛选并安排 source Planner 触发。
 
         Args:
             message: 入站消息载荷。
@@ -609,8 +609,6 @@ def build_config(
     *,
     source_groups: list[str] | None = None,
     target_groups: list[str] | None = None,
-    view_failure_fallback_threshold: int = 2,
-    trigger_source_planner: bool = True,
     trigger_target_planner: bool = True,
     forward_enabled: bool = True,
     plugin_enabled: bool = True,
@@ -620,8 +618,6 @@ def build_config(
     Args:
         source_groups: source 白名单；省略时使用默认单源群。
         target_groups: target 白名单；省略时使用默认两个目标群。
-        view_failure_fallback_threshold: 查看失败降级阈值。
-        trigger_source_planner: 是否安排 source Planner 触发。
         trigger_target_planner: 投递成功后是否触发目标群 Planner。
         forward_enabled: 转发域独立开关。
         plugin_enabled: 插件总开关。
@@ -637,8 +633,6 @@ def build_config(
             enabled=forward_enabled,
             source_groups=["10001"] if source_groups is None else list(source_groups),
             target_groups=["20001", "20002"] if target_groups is None else list(target_groups),
-            view_failure_fallback_threshold=view_failure_fallback_threshold,
-            trigger_source_planner=trigger_source_planner,
             trigger_target_planner=trigger_target_planner,
         ),
     )
@@ -650,8 +644,6 @@ def build_plugin(
     failed_streams: set[str] | None = None,
     source_groups: list[str] | None = None,
     target_groups: list[str] | None = None,
-    view_failure_fallback_threshold: int = 2,
-    trigger_source_planner: bool = True,
     trigger_target_planner: bool = True,
     forward_enabled: bool = True,
     plugin_enabled: bool = True,
@@ -666,10 +658,6 @@ def build_plugin(
         failed_streams: 应由发送能力模拟失败的目标聊天流集合。
         source_groups: 可选的 source 群白名单；省略时使用 ``["10001"]``。
         target_groups: 可选的 target 群号配置；省略时使用两个默认目标群。
-        view_failure_fallback_threshold: 允许摘要或预览降级前，同一消息需要
-            连续累计的可重试查看故障次数。
-        trigger_source_planner: source 群收到合并转发时是否强制触发本群
-            Planner，默认开启；传入 ``False`` 可覆盖默认值以测试关闭路径。
         trigger_target_planner: 发送成功后是否触发目标群 Planner。
         forward_enabled: 转发域独立开关。
         plugin_enabled: 插件总开关。
@@ -685,8 +673,6 @@ def build_plugin(
     config = build_config(
         source_groups=source_groups,
         target_groups=target_groups,
-        view_failure_fallback_threshold=view_failure_fallback_threshold,
-        trigger_source_planner=trigger_source_planner,
         trigger_target_planner=trigger_target_planner,
         forward_enabled=forward_enabled,
         plugin_enabled=plugin_enabled,

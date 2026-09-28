@@ -388,19 +388,20 @@ def test_completed_request_does_not_repeat_auto_view(tmp_path: Path) -> None:
         "",
     ],
 )
-def test_auto_view_retries_until_existing_fallback_boundary(
+def test_auto_view_falls_back_after_first_failure(
     tmp_path: Path,
     failure_content: str,
 ) -> None:
-    """验证自动查看沿用可重试故障和空内容的既有两次边界。
+    """验证自动查看首次失败即恢复原请求并用摘要降级。
 
-    首次失败后必须再生成一个查看调用，第二次连续同类失败后才恢复原请求；
-    处理器随后使用原 ``content_summary`` 完成转发。该测试防止自动路径首次
-    失败就降级，或达到阈值后仍无限消耗 Planner 内部轮次。
+    系统查看失败（可重试故障或空内容）后不再发起第二次查看：下一续轮必须
+    恢复原转发请求而不是再看一次，处理器随首次失败直接使用原
+    ``content_summary`` 完成转发。该测试锁定「查看失败首次即降级」语义，
+    防止插件内部继续消耗 Planner 轮次或要求 Planner 重试。
 
     Args:
         tmp_path: pytest 提供的临时数据目录，用于隔离投递状态。
-        failure_content: 两次查看返回的同类失败文本；空串模拟空内容。
+        failure_content: 查看返回的失败文本；空串模拟空内容。
     """
 
     async def scenario() -> None:
@@ -413,6 +414,7 @@ def test_auto_view_retries_until_existing_fallback_boundary(
             tool_calls=[build_forward_call(content_summary="自动查看失败后的摘要")],
         )
         first_view = first["modified_kwargs"]["tool_calls"][0]
+        assert first_view["function"]["name"] == VIEW_FORWARD_TOOL_NAME
         messages = build_view_history(first_view, failure_content)
         await plugin.capture_view_forward_result(
             session_id="source-stream",
@@ -420,30 +422,10 @@ def test_auto_view_retries_until_existing_fallback_boundary(
             tool_definitions=[],
         )
 
-        retry = await run_after_response_hooks(
-            plugin,
-            session_id="source-stream",
-            response="桥接",
-            tool_calls=[],
-        )
-        second_view = retry["modified_kwargs"]["tool_calls"][0]
-        assert second_view["function"]["name"] == VIEW_FORWARD_TOOL_NAME
-        assert second_view["id"] != first_view["id"]
-
-        messages = build_view_history(
-            second_view,
-            failure_content,
-            previous_messages=messages,
-        )
-        await plugin.capture_view_forward_result(
-            session_id="source-stream",
-            messages=messages,
-            tool_definitions=[],
-        )
         resumed = await run_after_response_hooks(
             plugin,
             session_id="source-stream",
-            response="第二次桥接",
+            response="桥接",
             tool_calls=[],
         )
         restored = resumed["modified_kwargs"]["tool_calls"][0]
@@ -456,6 +438,7 @@ def test_auto_view_retries_until_existing_fallback_boundary(
             stream_id="source-stream",
         )
         assert result["success"] is True
+        await wait_for_background_tasks(plugin)
         assert plugin.ctx.events[:2] == [("send", "target-a"), ("planner", "target-a")]
         await plugin.on_unload()
 

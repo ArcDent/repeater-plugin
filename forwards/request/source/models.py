@@ -35,12 +35,9 @@ class ViewObservationKind(str, Enum):
 
 @dataclass(slots=True)
 class ViewFailureState:
-    """同一消息最近一段连续查看失败的分类状态。"""
+    """同一消息最近一次可见查看失败的分类。"""
 
-    retryable_count: int = 0
-    empty_content_count: int = 0
     last_kind: ViewObservationKind | None = None
-    last_content: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,7 +47,4 @@ class ViewEligibilityLookup:
     status: ViewEligibilityStatus
     content: str
     content_complete: bool
-    retryable_failure_count: int
-    empty_content_failure_count: int
     last_observation_kind: ViewObservationKind | None
-    last_failure_content: str

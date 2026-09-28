@@ -29,7 +29,7 @@ class PluginSection(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="1.3.0",
+        default="1.4.0",
         json_schema_extra={"disabled": True, "hidden": True, "label": "配置版本", "order": 99},
     )
 
@@ -618,14 +618,6 @@ class ForwardSection(PluginConfigBase):
             "step": 0.1,
         },
     )
-    trigger_source_planner: bool = Field(
-        default=True,
-        json_schema_extra={
-            "hint": "源群收到合并转发时，是否安排一次本群 Planner 触发，作为请求转发路径的入口提示。",
-            "label": "触发源群 Planner",
-            "order": 10,
-        },
-    )
     trigger_target_planner: bool = Field(
         default=True,
         json_schema_extra={
@@ -634,16 +626,7 @@ class ForwardSection(PluginConfigBase):
                 "软约束：Planner 仍可沉默，插件不检测也不补发。"
             ),
             "label": "触发目标群 Planner",
-            "order": 11,
-        },
-    )
-    view_failure_fallback_threshold: int = Field(
-        default=2, ge=1,
-        json_schema_extra={
-            "hint": "请求转发校验查看资格时，连续可重试故障达到该次数后降级使用摘要投递。",
-            "label": "查看失败降级阈值",
-            "order": 12,
-            "step": 1,
+            "order": 10,
         },
     )
     inject_max_chars: int = Field(
@@ -651,7 +634,7 @@ class ForwardSection(PluginConfigBase):
         json_schema_extra={
             "hint": "转发内容注入文本的长度上限，超长按上限截断并带省略标记。",
             "label": "注入文本长度上限",
-            "order": 13,
+            "order": 11,
             "step": 100,
         },
     )
@@ -664,7 +647,7 @@ class ForwardSection(PluginConfigBase):
                 "非法值按 direct 处理并记 warning。"
             ),
             "label": "转发模式",
-            "order": 14,
+            "order": 12,
             "placeholder": "direct",
         },
     )
@@ -673,7 +656,7 @@ class ForwardSection(PluginConfigBase):
         json_schema_extra={
             "hint": "自动转发路径开关：关闭后源群合并转发不再掷骰、不投递，请求转发路径不受影响。",
             "label": "启用自动转发",
-            "order": 15,
+            "order": 13,
         },
     )
     request_enabled: bool = Field(
@@ -681,7 +664,7 @@ class ForwardSection(PluginConfigBase):
         json_schema_extra={
             "hint": "请求转发路径开关：关闭后转发 Tool 与源群 Planner 入口提示都不再生效，自动转发路径不受影响。",
             "label": "启用请求转发",
-            "order": 16,
+            "order": 14,
         },
     )
     summary_timeout_seconds: int = Field(
@@ -692,7 +675,7 @@ class ForwardSection(PluginConfigBase):
                 "不掷骰、不写冷却、不投递。"
             ),
             "label": "摘要就绪超时（秒）",
-            "order": 17,
+            "order": 15,
             "step": 1,
         },
     )

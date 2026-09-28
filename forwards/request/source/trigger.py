@@ -32,7 +32,7 @@ class SourcePlannerTriggerService:
             context: MaiBot ``PluginContext``，用于查询消息、触发 Planner、
                 访问插件数据目录并记录日志。
             config_provider: 返回最新强类型配置的回调，使热更新可立即控制
-                source 触发开关和白名单。
+                source 启用状态与白名单。
             forward_state: 已加载的转发状态，用于识别带最终目标消息 ID 的
                 历史转发回声。
         """
@@ -71,8 +71,9 @@ class SourcePlannerTriggerService:
         """筛选一条入站消息，并在满足条件时异步安排 Planner 触发。
 
         方法不会等待消息落库或 Planner 入队，因此观察型 Hook 不会延长
-        入站主链。开关关闭、插件关闭、source 不匹配、消息格式不符、已知
-        转发回声、正在处理或已经成功触发过的消息都会被忽略。
+        入站主链。插件卸载、插件关闭、source 不匹配、消息格式不符、已知
+        转发回声、正在处理或已经成功触发过的消息都会被忽略。入口提示已随
+        `request_enabled` 固化开启，不再有独立触发开关。
 
         Args:
             message: ``chat.receive.after_process`` Hook 提供的消息载荷。
@@ -85,7 +86,7 @@ class SourcePlannerTriggerService:
         """
 
         config = self._config_provider()
-        if self._is_unloading or not config.enabled or not config.trigger_source_planner:
+        if self._is_unloading or not config.enabled:
             return False
         observation = SourceForwardMessageParser.parse(message)
         if observation is None:
@@ -158,7 +159,7 @@ class SourcePlannerTriggerService:
                 )
                 return
             config = self._config_provider()
-            if self._is_unloading or not config.enabled or not config.trigger_source_planner:
+            if self._is_unloading or not config.enabled:
                 return
             if observation.group_id not in set(GroupIdList.normalize(config.source_groups)):
                 return
@@ -200,11 +201,11 @@ class SourcePlannerTriggerService:
 
         Returns:
             在固定等待窗口内查询到同一聊天流的有效合并转发时返回 ``True``；
-            插件卸载、开关关闭、消息始终不可见或结构变化时返回 ``False``。
+            插件卸载、消息始终不可见或结构变化时返回 ``False``。
         """
 
         for attempt in range(MESSAGE_READY_MAX_ATTEMPTS):
-            if self._is_unloading or not self._config_provider().trigger_source_planner:
+            if self._is_unloading:
                 return False
             try:
                 result = await self._ctx.message.get_by_id(

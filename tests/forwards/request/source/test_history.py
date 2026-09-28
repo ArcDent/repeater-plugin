@@ -142,7 +142,8 @@ def test_view_result_parser_classifies_known_host_failures(
 
     每种稳定错误前缀以及原始空白结果都应映射为可修正、终止、可重试、
     空内容或未知失败，同时成功结果接口返回空列表。该测试防止错误文本
-    被登记为 source 查看资格，也防止空结果被遗漏或不可恢复错误被误计入阈值。
+    被登记为 source 查看资格，也防止空结果被遗漏或不可恢复错误被误当成
+    可重试失败。
 
     Args:
         content: pytest 参数化提供的 Host ToolResult 文本。
@@ -178,12 +179,13 @@ def test_view_result_parser_classifies_known_host_failures(
     assert PlannerHistoryParser.extract_view_results(messages) == []
 
 
-def test_empty_raw_view_results_reach_fallback_counter() -> None:
-    """验证连续原始空结果会进入查看资格的空内容降级计数。
+def test_empty_raw_view_results_classified_as_empty_content_failure() -> None:
+    """验证连续原始空结果仍被识别为空内容失败。
 
     两个独立 ``view_forward_message`` 调用分别返回空字符串和纯空白文本时，
-    解析器应保留两条空内容失败，资格存储应得到连续计数 ``2``。该测试防止
-    解析层再次丢弃空结果，导致既定的第二次空内容降级永远无法触发。
+    解析器应保留两条空内容失败，资格存储应把最近一次失败分类记为
+    ``EMPTY_CONTENT_FAILURE``。该测试防止解析层再次丢弃空结果，导致请求
+    路径既无法识别空内容失败也无法按既定口径降级用摘要。
     """
 
     messages = [
@@ -225,7 +227,8 @@ def test_empty_raw_view_results_reach_fallback_counter() -> None:
     lookup = store.lookup("stream-1", "message-1")
     assert len(observations) == 2
     assert all(item.kind is ViewObservationKind.EMPTY_CONTENT_FAILURE for item in observations)
-    assert lookup.empty_content_failure_count == 2
+    assert lookup.status is ViewEligibilityStatus.MISSING
+    assert lookup.last_observation_kind is ViewObservationKind.EMPTY_CONTENT_FAILURE
 
 
 def test_context_item_explicit_failure_does_not_grant_view_eligibility() -> None:

@@ -82,9 +82,6 @@ def make_forward_plugin(
     forward.delay_max_seconds = 0.0
     forward.cooldown_seconds = 0
     forward.target_cooldown_seconds = 0
-    # 源群 Planner 触发默认关闭：真实运行时会为每条合格源消息起一个等待消息
-    # 落库的后台任务，自动路径用例不需要它；委托断言用替身运行时单独覆盖。
-    forward.trigger_source_planner = False
 
     plugin._runner = None
     plugin._site = None
@@ -94,6 +91,12 @@ def make_forward_plugin(
     plugin._self_qq = BOT_QQ
     plugin._emoji_action_supported = True
     plugin._rebuild_runtime()
+    # 源群 Planner 入口提示恒定开启：真实运行时会给每条合格源消息起一个等待消息
+    # 落库的后台任务，自动路径用例不需要它。这里按旧「源群触发开关关闭」的等价
+    # 行为挡掉触发服务本身（调试统计仍照常），委托断言用替身运行时单独覆盖。
+    plugin._forward_runtime.source_trigger.observe = (  # type: ignore[method-assign]
+        lambda message: False
+    )
     # 消息替身默认就绪：编排任务第一次查询即可拿到富摘要（轮询用例再覆盖）。
     plugin.ctx.message.default_result = {"processed_plain_text": DEFAULT_RICH_SUMMARY}
 
@@ -313,6 +316,50 @@ def mark_forward_timeline(
 
     monkeypatch.setattr(asyncio, "sleep", spy_sleep)
     return sleeps
+
+
+# 占位观测（task 2.3）用例的全序事件基线：就绪查询与占位 info 两个观测标记、
+# 两次掷骰、逐目标群「直发 → 注入 → trigger」、源群留痕；两个占位用例共用。
+FULL_DELIVERY_EVENT_SEQUENCE = [
+    "get_by_id",
+    "placeholder_log",
+    "roll",
+    "roll",
+    "get_group_list",
+    "send_group_forward_msg",
+    "context.append:forward",
+    "proactive.trigger",
+    "send_group_forward_msg",
+    "context.append:forward",
+    "proactive.trigger",
+    "context.append:forward_action",
+]
+
+
+def placeholder_log_message(count: int) -> str:
+    """占位观测 info 的定稿文案（`mark_placeholder_log_timeline` 按前缀识别）。"""
+    return (
+        f"自动转发富摘要媒体占位 {count} 处"
+        "（主程序 images 表缺 hash 时麦麦多模态降级）msg=90001 group=10001"
+    )
+
+
+def mark_placeholder_log_timeline(
+    plugin: RepeaterPlugin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """把占位观测 info 记进 `ctx.events` 时间线，供与轮询 / 掷骰的相对序断言。
+
+    只按定稿文案前缀识别、原样转发调用（不改日志内容），与
+    `mark_forward_timeline` 同用 `monkeypatch.setattr` 的观测口径。
+    """
+    raw_info = plugin.ctx.logger.info
+
+    def spy_info(message: Any, *args: Any, **kwargs: Any) -> None:
+        if "自动转发富摘要媒体占位" in str(message):
+            plugin.ctx.events.append("placeholder_log")
+        raw_info(message, *args, **kwargs)
+
+    monkeypatch.setattr(plugin.ctx.logger, "info", spy_info)
 
 
 class FakeForwardRuntime:
@@ -2198,6 +2245,54 @@ def test_orchestration_sanitizes_control_chars_in_display_text(tmp_path: Path):
     intent = plugin.ctx.maisaka.proactive.calls[0]["intent"]
     assert "\x11" not in intent and "\x10" not in intent
     assert "柴犬的新窝" in intent
+
+
+def test_orchestration_logs_placeholder_count_before_rolling(tmp_path: Path, monkeypatch):
+    """占位观测（2.3）：就绪拿到含 2 处 `[图片]` 的富摘要后、掷骰之前记占位 info。
+
+    全序断言：`get_by_id → 占位 info → 掷骰 → 直发 → 注入 → trigger → 留痕`；
+    占位按主程序原文保留进注入与 intent，观测不改写材料、不进行为分支。
+    """
+    plugin = make_forward_plugin(tmp_path)
+    rich = "【合并转发消息】群友甲：[图片] 群友乙：[图片]"
+    plugin.ctx.message.default_result = {"processed_plain_text": rich}
+    mark_forward_timeline(plugin, monkeypatch, plugin.ctx.events)
+    mark_placeholder_log_timeline(plugin, monkeypatch)
+
+    async def scenario() -> None:
+        await plugin.handle_forward_message(message=forward_message())
+        await drain_forward_tasks(plugin)
+
+    asyncio.run(scenario())
+
+    assert placeholder_log_message(2) in plugin.ctx.logger.texts("info")
+    assert plugin.ctx.events == FULL_DELIVERY_EVENT_SEQUENCE
+    # 占位观测不改写注入与 intent 材料：富摘要原文（含两处占位）照常贯通。
+    contents = [call["visible_text"] for call in injections(plugin, "forward")]
+    assert len(contents) == 2
+    assert all(rich in text for text in contents)
+
+
+def test_orchestration_zero_placeholder_keeps_delivery_sequence(tmp_path: Path, monkeypatch):
+    """占位观测（2.3）：富摘要无占位 → 计数 0；掷骰 / 投递全序与既有基线逐项一致。
+
+    期望事件序列就是无该日志时的既有全链路基线（`get_group_list → 逐目标群
+    「直发 → 注入 → trigger」→ 留痕`），仅前置两个观测标记（`get_by_id` 与
+    占位 info 同为观测，不改变行为步骤及其相对序）。
+    """
+    plugin = make_forward_plugin(tmp_path)
+    mark_forward_timeline(plugin, monkeypatch, plugin.ctx.events)
+    mark_placeholder_log_timeline(plugin, monkeypatch)
+
+    async def scenario() -> None:
+        await plugin.handle_forward_message(message=forward_message())
+        await drain_forward_tasks(plugin)
+
+    asyncio.run(scenario())
+
+    assert placeholder_log_message(0) in plugin.ctx.logger.texts("info")
+    assert plugin.ctx.events == FULL_DELIVERY_EVENT_SEQUENCE
+    assert len(send_group_forward_calls(plugin)) == 2
 
 
 @pytest.mark.parametrize(
