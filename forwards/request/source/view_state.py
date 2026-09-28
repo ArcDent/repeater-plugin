@@ -36,8 +36,9 @@ class ViewEligibilityStore:
 
         任一仍可见的成功结果都会使对应 ``msg_id`` 合法，并使用最后一次
         成功结果的文本；同时根据根层和已发现嵌套路径的成功结果计算完整性。
-        仅在没有成功结果时才根据最后一段连续失败计算降级状态。旧快照中
-        存在但本次上下文已不可见的消息会立即移除。
+        仅在没有成功结果时才记录最近一次可见失败的分类，供请求处理
+        器首次即用摘要降级。旧快照中存在但本次上下文已不可见的消息会立即
+        移除。
 
         Args:
             stream_id: 当前 source Planner 的聊天流 ID。
@@ -104,7 +105,7 @@ class ViewEligibilityStore:
         Returns:
             ``ViewEligibilityLookup``。当前上下文仍含成功查看结果时返回
             ``READY``、最后一次结果文本和完整性状态，否则返回 ``MISSING``
-            及可见失败状态。
+            及最近一次可见失败分类。
         """
 
         key = (stream_id, message_id)
@@ -114,10 +115,7 @@ class ViewEligibilityStore:
             status=ViewEligibilityStatus.READY if entry is not None else ViewEligibilityStatus.MISSING,
             content=entry.content if entry is not None else "",
             content_complete=entry.content_complete if entry is not None else False,
-            retryable_failure_count=failure_state.retryable_count,
-            empty_content_failure_count=failure_state.empty_content_count,
             last_observation_kind=failure_state.last_kind,
-            last_failure_content=failure_state.last_content,
         )
 
     @staticmethod
@@ -158,51 +156,18 @@ class ViewEligibilityStore:
     def _build_failure_state(
         observations: list[ViewToolObservation],
     ) -> ViewFailureState:
-        """从同一消息的可见失败结果计算最后一段连续状态。
+        """取同一消息最近一次可见失败的分类。
+
+        查看资格不再累计连续失败次数：任何一次失败（消息在等待窗口内不可见
+        或内容取不到）都由请求处理器首次即用摘要降级，因此这里只保留最后
+        一次失败观察的分类。
 
         Args:
             observations: 同一 ``msg_id`` 按上下文顺序排列的失败观察。
 
         Returns:
-            最近失败的分类和文本。最近分类为可重试故障或空内容时，还会
-            携带从列表末尾向前计算的同类连续次数。
+            最近一次失败的分类。
         """
 
         latest = observations[-1]
-        state = ViewFailureState(
-            last_kind=latest.kind,
-            last_content=latest.content,
-        )
-        if latest.kind is ViewObservationKind.RETRYABLE_FAILURE:
-            state.retryable_count = ViewEligibilityStore._count_trailing_kind(
-                observations,
-                latest.kind,
-            )
-        elif latest.kind is ViewObservationKind.EMPTY_CONTENT_FAILURE:
-            state.empty_content_count = ViewEligibilityStore._count_trailing_kind(
-                observations,
-                latest.kind,
-            )
-        return state
-
-    @staticmethod
-    def _count_trailing_kind(
-        observations: list[ViewToolObservation],
-        kind: ViewObservationKind,
-    ) -> int:
-        """统计观察列表末尾连续出现指定分类的次数。
-
-        Args:
-            observations: 同一消息按上下文顺序排列的失败观察。
-            kind: 要从列表末尾连续匹配的失败分类。
-
-        Returns:
-            末尾连续匹配数量；调用方传入末项分类时至少为 ``1``。
-        """
-
-        count = 0
-        for observation in reversed(observations):
-            if observation.kind is not kind:
-                break
-            count += 1
-        return count
+        return ViewFailureState(last_kind=latest.kind)

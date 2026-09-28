@@ -3,7 +3,7 @@
 
 [plugin]
 enabled = true
-config_version = "1.3.0"
+config_version = "1.4.0"
 
 # 协议端 HTTP 上报的接收端点。协议端需要新增一个 HTTP 上报目标指向这里
 # （好友申请插件已占 18080，本插件默认 18081）。
@@ -120,12 +120,8 @@ target_cooldown_seconds = 60
 # 命中转发后发送前的随机等待区间（秒），与 [repeat]、[behavior] 两域延迟互相独立
 delay_min_seconds = 0.5
 delay_max_seconds = 2.0
-# 源群收到合并转发时是否安排一次本群 Planner 触发（请求转发路径的入口提示）
-trigger_source_planner = true
 # 自动转发投递成功后是否触发目标群 Planner 针对该转发发言（软约束，Planner 仍可沉默）
 trigger_target_planner = true
-# 请求转发校验查看资格时，连续可重试故障达到该次数后降级用摘要投递
-view_failure_fallback_threshold = 2
 # 转发内容注入文本的长度上限，超长按上限截断并带省略标记
 inject_max_chars = 800
 # 转发模式：direct = 掷骰命中即直发目标群（默认，升级后行为不变）；

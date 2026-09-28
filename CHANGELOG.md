@@ -2,6 +2,27 @@
 
 本项目变更记录，格式遵循 Keep a Changelog，语义化版本见 `_manifest.json`。
 
+## [0.8.0] - 2026-09-27
+
+### Removed
+
+- **BREAKING：删除 `forward.trigger_source_planner`**：源群 **Planner** 入口提示改为随 `forward.request_enabled` 固化开启，不再有独立开关；`forwards/request/config.py` 适配层不再透传该字段，`forwards/request/source/trigger.py` 的三处判定（入口筛选 / 就绪后 / 等待窗口轮询守卫）删除，轮询守卫只保留 `_is_unloading` 卸载中止语义。
+- **BREAKING：删除 `forward.view_failure_fallback_threshold`**：请求转发的**查看资格**判定不再计数，查看失败（消息在等待窗口内不可见或内容取不到）**首次即用摘要降级**，不再有连续失败阈值与重试分支。
+
+### Added
+
+- **自动转发的富摘要占位观测**：编排任务在**摘要就绪**（拿到主程序 `processed_plain_text`）后、掷骰之前记一条 info，含本次**富摘要**中媒体占位（`[图片]` / `[表情]` / `[嵌套转发]`）的出现计数；占位计数只进日志，不改写注入文本或 intent 材料、不新增配置项、不影响掷骰 / 冷却 / 投递 / 注入的任何行为分支。
+
+### Changed
+
+- `plugin.config_version` 1.3.0 → 1.4.0（删除两个字段，主程序按结构版本重建 `config.toml` 骨架）；`[forward]` 段字段 18 → 16，旧 `config.toml` 残留两行由配置层忽略，不影响加载。
+- 入口提示固化开启后，请求路径的开关语义收敛为 `forward.request_enabled` 一个旋钮（关闭即转发 Tool 与入口提示一并停用，自动路径不受影响）。
+
+### 部署注意
+
+- 旧 `config.toml` 里的 `trigger_source_planner` / `view_failure_fallback_threshold` 两行留不留行为完全相同（残留行按额外字段忽略、不报错）；生效的是新默认口径——入口提示随 `request_enabled` 固化开启、查看失败首次即摘要降级。
+- 若此前依赖 `trigger_source_planner = false` 完全静默入口提示，改设 `request_enabled = false`（注意这会同时停用请求转发 Tool）。
+
 ## [0.7.1] - 2026-09-27
 
 ### Fixed

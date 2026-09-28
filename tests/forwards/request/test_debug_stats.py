@@ -99,15 +99,16 @@ def test_debug_stats_are_disabled_by_default(
     asyncio.run(scenario())
 
 
-def test_observed_stats_do_not_depend_on_source_planner_trigger(
+def test_observed_stats_count_unique_sources_with_trigger_always_on(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """验证 source Planner 开关关闭时仍按消息身份统计唯一观察量。
+    """验证入口提示固化开启后调试统计仍按消息身份统计唯一观察量。
 
     同一 ``stream + msg_id`` 的重复 Hook 只计一次，不同 stream 的同名消息
-    分别计数；非 source、机器人自身消息和已知插件转发回声均不计。Planner
-    触发事件保持为空。该测试防止分母被错误绑定到主动触发功能。
+    分别计数；非 source、机器人自身消息和已知插件转发回声均不计。统计口径
+    与 source Planner 触发解耦：入口提示恒定开启、触发任务并行运行都不改变
+    observed 分母。
 
     Args:
         tmp_path: pytest 提供的插件运行时数据目录。
@@ -116,19 +117,19 @@ def test_observed_stats_do_not_depend_on_source_planner_trigger(
 
     async def scenario() -> None:
         monkeypatch.setenv(DEBUG_STATS_ENV_VAR, "1")
-        plugin = build_plugin(tmp_path, trigger_source_planner=False)
+        plugin = build_plugin(tmp_path)
         await plugin.on_load()
 
         source_message = build_forward_message()
-        await plugin.trigger_source_planner_for_forward_message(message=source_message)
-        await plugin.trigger_source_planner_for_forward_message(message=source_message)
-        await plugin.trigger_source_planner_for_forward_message(
+        await plugin.observe_source_message(message=source_message)
+        await plugin.observe_source_message(message=source_message)
+        await plugin.observe_source_message(
             message=build_forward_message(stream_id="second-source-stream")
         )
-        await plugin.trigger_source_planner_for_forward_message(
+        await plugin.observe_source_message(
             message=build_forward_message(group_id="30001", stream_id="non-source-stream")
         )
-        await plugin.trigger_source_planner_for_forward_message(
+        await plugin.observe_source_message(
             message=build_forward_message(sender_id="99999", self_id="99999")
         )
 
@@ -149,12 +150,11 @@ def test_observed_stats_do_not_depend_on_source_planner_trigger(
         )
         echo_message = build_forward_message(self_id="")
         echo_message["message_id"] = "echo-message"
-        await plugin.trigger_source_planner_for_forward_message(message=echo_message)
+        await plugin.observe_source_message(message=echo_message)
 
         snapshot = plugin.runtime.debug_stats.snapshot()
         assert snapshot.observed == 2
         assert snapshot.requested == 0
-        assert plugin.ctx.events == []
         await plugin.on_unload()
 
     asyncio.run(scenario())
@@ -179,7 +179,7 @@ def test_early_hook_counts_only_observed_unique_planner_requests(
         monkeypatch.setenv(DEBUG_STATS_ENV_VAR, "true")
         plugin = build_plugin(tmp_path)
         await plugin.on_load()
-        await plugin.trigger_source_planner_for_forward_message(message=build_forward_message())
+        await plugin.observe_source_message(message=build_forward_message())
 
         tool_calls = [
             _build_forward_call("request-a", "forward-message"),

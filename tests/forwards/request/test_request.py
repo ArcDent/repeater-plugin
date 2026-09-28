@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 import pytest
@@ -20,13 +21,12 @@ from tests.forwards.request.support import (
 )
 
 
-def test_tool_rejects_unviewed_and_single_failure_before_fallback(tmp_path: Path) -> None:
-    """验证缺少成功查看时会要求紧接续轮重试且不会静默降级转发。
+def test_tool_rejects_unviewed_and_falls_back_on_first_failure(tmp_path: Path) -> None:
+    """验证未查看时要求续轮查看、首次查看失败即用摘要降级。
 
-    未查看时即使提供摘要也应拒绝任务；登记一次已知失败后仍应要求 Planner
-    在当前 ToolResult 后的紧接续轮再次查看，并明确禁止等待新消息或使用摘要
-    绕过。第二个独立查看调用也失败后，才允许使用摘要创建转发任务。该测试
-    防止暂时性缺失绕过完整查看要求或把重试错误推迟到下一条聊天消息。
+    未查看时即使提供摘要也应拒绝任务；登记一次可重试失败（消息在等待窗口内
+    不可见）后，插件不得再要求重试或拒绝投递，而应直接使用摘要创建转发任务
+    并照常投递。该测试锁定「查看失败首次即降级」的收紧语义。
 
     Args:
         tmp_path: pytest 提供的隔离状态目录，用于运行真实请求和后台投递。
@@ -53,30 +53,10 @@ def test_tool_rejects_unviewed_and_single_failure_before_fallback(tmp_path: Path
         assert plugin.ctx.events == []
 
         sync_failed_views(plugin, [ViewObservationKind.RETRYABLE_FAILURE])
-        first_failure_result = await invoke_forward_tool(
-            plugin,
-            "forward-message",
-            content_summary="仍不应使用的摘要",
-            platform="qq",
-            group_id="10001",
-            stream_id="source-stream",
-        )
-        assert first_failure_result["success"] is False
-        assert "配置阈值 2 次" in first_failure_result["content"]
-        assert "收到本工具结果后的紧接续轮" in first_failure_result["content"]
-        assert plugin.ctx.events == []
-
-        sync_failed_views(
-            plugin,
-            [
-                ViewObservationKind.RETRYABLE_FAILURE,
-                ViewObservationKind.RETRYABLE_FAILURE,
-            ],
-        )
         fallback_result = await invoke_forward_tool(
             plugin,
             "forward-message",
-            content_summary="两次失败后的降级摘要",
+            content_summary="首次失败即使用的降级摘要",
             platform="qq",
             group_id="10001",
             stream_id="source-stream",
@@ -90,57 +70,79 @@ def test_tool_rejects_unviewed_and_single_failure_before_fallback(tmp_path: Path
     asyncio.run(scenario())
 
 
-def test_tool_uses_configured_view_failure_fallback_threshold(tmp_path: Path) -> None:
-    """验证自定义连续失败阈值会实时控制何时允许降级。
+def test_tool_falls_back_on_first_retryable_view_failure(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """验证可重试查看故障不再计数：一次失败即接受摘要降级。
 
-    将阈值配置为三次后，前两次查看失败仍应拒绝转发并报告当前阈值；第三次
-    失败后才接受摘要降级。该测试防止请求服务重新使用硬编码次数。
+    旧配置字段 `view_failure_fallback_threshold` 已删除，工具结果不得再出现
+    「配置阈值 N 次」或「紧接续轮再次查看」等要求重试的文案，改为记录一次
+    摘要降级并使用 Planner 摘要完成投递。
 
     Args:
         tmp_path: pytest 提供的隔离状态目录，用于运行真实请求和后台投递。
+        caplog: pytest 提供的日志捕获器，用于确认降级路径确实被走到。
     """
 
     async def scenario() -> None:
-        plugin = build_plugin(tmp_path, view_failure_fallback_threshold=3)
+        caplog.set_level(logging.INFO)
+        plugin = build_plugin(tmp_path)
         await plugin.on_load()
-        sync_failed_views(
-            plugin,
-            [
-                ViewObservationKind.RETRYABLE_FAILURE,
-                ViewObservationKind.RETRYABLE_FAILURE,
-            ],
-        )
+        sync_failed_views(plugin, [ViewObservationKind.RETRYABLE_FAILURE])
 
-        before_threshold = await invoke_forward_tool(
+        result = await invoke_forward_tool(
             plugin,
             "forward-message",
-            content_summary="两次失败时不应使用的摘要",
+            content_summary="首次失败后的降级摘要",
             platform="qq",
             group_id="10001",
             stream_id="source-stream",
         )
-        assert before_threshold["success"] is False
-        assert "配置阈值 3 次" in before_threshold["content"]
-        assert plugin.ctx.events == []
 
-        sync_failed_views(
-            plugin,
-            [
-                ViewObservationKind.RETRYABLE_FAILURE,
-                ViewObservationKind.RETRYABLE_FAILURE,
-                ViewObservationKind.RETRYABLE_FAILURE,
-            ],
-        )
-        at_threshold = await invoke_forward_tool(
+        assert result["success"] is True
+        assert result["accepted"] is True
+        assert "配置阈值" not in result["content"]
+        assert "使用 Planner 摘要降级" in caplog.text
+        await wait_for_background_tasks(plugin)
+        assert plugin.ctx.events[:2] == [("send", "target-a"), ("planner", "target-a")]
+        await plugin.on_unload()
+
+    asyncio.run(scenario())
+
+
+def test_successful_view_uses_full_content_instead_of_summary(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """验证查看成功仍走全文：即使 Planner 带了摘要，也不触发降级路径。
+
+    该用例钉住「查看成功用全文、查看失败用摘要」两级材料结构中成功的一级，
+    防止删阈值分支时把成功优先一起改掉。
+
+    Args:
+        tmp_path: pytest 提供的隔离状态目录，用于运行真实请求和后台投递。
+        caplog: pytest 提供的日志捕获器，用于确认没有走摘要降级。
+    """
+
+    async def scenario() -> None:
+        caplog.set_level(logging.INFO)
+        plugin = build_plugin(tmp_path)
+        await plugin.on_load()
+        seed_successful_view(plugin, content="完整展开内容")
+
+        result = await invoke_forward_tool(
             plugin,
             "forward-message",
-            content_summary="三次失败后的降级摘要",
+            content_summary="不应使用的摘要",
             platform="qq",
             group_id="10001",
             stream_id="source-stream",
         )
-        assert at_threshold["success"] is True
-        assert at_threshold["accepted"] is True
+
+        assert result["success"] is True
+        assert result["accepted"] is True
+        assert "使用 Planner 摘要降级" not in caplog.text
         await wait_for_background_tasks(plugin)
         assert plugin.ctx.events[:2] == [("send", "target-a"), ("planner", "target-a")]
         await plugin.on_unload()
@@ -153,7 +155,7 @@ def test_tool_uses_configured_view_failure_fallback_threshold(tmp_path: Path) ->
     [
         (ViewObservationKind.CORRECTABLE_FAILURE, "请检查并修正 msg_id"),
         (ViewObservationKind.TERMINAL_FAILURE, "不是可展开的合并转发消息"),
-        (ViewObservationKind.UNKNOWN_FAILURE, "不会累计次数或开放降级"),
+        (ViewObservationKind.UNKNOWN_FAILURE, "也不会开放摘要降级"),
     ],
 )
 def test_non_retryable_failures_never_unlock_fallback(
@@ -195,14 +197,11 @@ def test_non_retryable_failures_never_unlock_fallback(
     asyncio.run(scenario())
 
 
-def test_empty_view_content_allows_one_diagnostic_retry_before_fallback(
-    tmp_path: Path,
-) -> None:
-    """验证空内容需连续出现两次才允许降级。
+def test_empty_view_content_falls_back_on_first_failure(tmp_path: Path) -> None:
+    """验证空内容不再要求诊断重试：首次空内容即接受摘要降级。
 
-    首次空内容应要求 Planner 再诊断查看一次，第二个独立调用仍为空时才接受
-    摘要并创建任务。该测试防止偶发空结果立即降低上下文质量，同时避免持续
-    空内容无限阻塞转发。
+    旧语义要求连续两次空内容才允许降级，本版收敛为首次即降级；该测试防止
+    重试分支被删后空内容反而卡住请求，也防止重新引入计数。
 
     Args:
         tmp_path: pytest 提供的隔离状态目录，用于运行真实请求和后台投递。
@@ -213,35 +212,18 @@ def test_empty_view_content_allows_one_diagnostic_retry_before_fallback(
         await plugin.on_load()
         sync_failed_views(plugin, [ViewObservationKind.EMPTY_CONTENT_FAILURE])
 
-        first_result = await invoke_forward_tool(
+        result = await invoke_forward_tool(
             plugin,
             "forward-message",
-            content_summary="首次不应使用的摘要",
-            platform="qq",
-            group_id="10001",
-            stream_id="source-stream",
-        )
-        assert first_result["success"] is False
-        assert "再进行一次诊断查看" in first_result["content"]
-
-        sync_failed_views(
-            plugin,
-            [
-                ViewObservationKind.EMPTY_CONTENT_FAILURE,
-                ViewObservationKind.EMPTY_CONTENT_FAILURE,
-            ],
-        )
-        second_result = await invoke_forward_tool(
-            plugin,
-            "forward-message",
-            content_summary="连续空内容后的降级摘要",
+            content_summary="首次空内容后的降级摘要",
             platform="qq",
             group_id="10001",
             stream_id="source-stream",
         )
 
-        assert second_result["success"] is True
-        assert second_result["accepted"] is True
+        assert result["success"] is True
+        assert result["accepted"] is True
+        assert "诊断查看" not in result["content"]
         await wait_for_background_tasks(plugin)
         assert plugin.ctx.events[:2] == [("send", "target-a"), ("planner", "target-a")]
         await plugin.on_unload()

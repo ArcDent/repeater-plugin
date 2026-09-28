@@ -41,7 +41,12 @@ from .forwards.request import (
 )
 from .forwards.source import ForwardSource, parse_forward_source
 from .forwards.state import DeliveredRegistry, ForwardState, GroupAvailabilityCache
-from .forwards.summary import extract_rich_summary, next_poll_interval, should_give_up
+from .forwards.summary import (
+    count_rich_summary_placeholders,
+    extract_rich_summary,
+    next_poll_interval,
+    should_give_up,
+)
 from .forwards.texts import (
     build_forced_comment_intent,
     build_forward_content_text,
@@ -103,6 +108,15 @@ _FORWARD_GROUP_LIST_TTL_SECONDS = 300.0
 # 群列表刷新失败后的退避窗口：协议端不可达时，每条投递消息都重查会让批量延迟
 # 被每次协议端超时放大；窗口内跳过重查、保持「未知放行」，窗口外再试。
 _FORWARD_GROUP_LIST_FAILURE_BACKOFF_SECONDS = 30.0
+# 注入文本的日志预览长度：Maisaka 上下文写入日志统一「kind → text → 定位 →
+# 回执」字段序（对齐 smart_poke_plugin 的 `text='…', index=…, stream=…` 风格），
+# 超限截断带省略号，免得富摘要（上限 800 字）把单行日志撑爆。
+_LOG_TEXT_PREVIEW_CHARS = 60
+
+
+def _log_preview(text: str) -> str:
+    """注入文本的单行预览：超 `_LOG_TEXT_PREVIEW_CHARS` 截断并加省略号。"""
+    return text if len(text) <= _LOG_TEXT_PREVIEW_CHARS else f"{text[:_LOG_TEXT_PREVIEW_CHARS]}…"
 
 
 def _consume_task_exception(task: asyncio.Task) -> None:
@@ -615,8 +629,10 @@ class RepeaterPlugin(MaiBotPlugin):
             return
         state.mark_injected(aggregate.message_id, time.time())
         self.ctx.logger.info(
-            f"已注入表情回应上下文 group={group_id} msg={aggregate.message_id} "
-            f"emoji={aggregate.emoji_id} 回应者={aggregate.responders}"
+            f"已写入 Maisaka 上下文: kind=reaction text='{_log_preview(text)}', "
+            f"group={group_id}, msg={aggregate.message_id}, "
+            f"emoji={aggregate.emoji_id}, responders={len(aggregate.responders)}, "
+            f"index={response.get('index')}, stream={stream_id}"
         )
 
     async def _get_stream_id(self, group_id: str) -> str:
@@ -883,9 +899,10 @@ class RepeaterPlugin(MaiBotPlugin):
         事件流聚合的需求）。失败（stream 查不到 / append 异常或失败）记 warning
         即返：不重试、不回滚，调用方照常走后续步骤——注入与直发成败解耦。
 
-        `log_prefix` 只影响 warning 文案：转发域的注入日志带「自动转发」前缀
-        （design D8 的路径前缀口径，便于按路径 grep），复读域不传、沿用
-        `source_kind` 自带语境。
+        `log_prefix` 影响本方法的 warning 与成功日志文案：转发域的注入日志带
+        「自动转发」前缀（design D8 的路径前缀口径，便于按路径 grep），复读域
+        不传、沿用 `source_kind` 自带语境。成功日志统一「kind → text 预览 →
+        group/msg 定位 → index/stream 回执」字段序，与表情回应域注入同一格式。
         """
         prefix = f"{log_prefix} " if log_prefix else ""
         stream_id = await self._get_stream_id(group_id)
@@ -914,7 +931,9 @@ class RepeaterPlugin(MaiBotPlugin):
             )
             return
         self.ctx.logger.info(
-            f"已注入上下文 group={group_id} source_kind={source_kind} message_id={message_id}"
+            f"{prefix}已写入 Maisaka 上下文: kind={source_kind} "
+            f"text='{_log_preview(text)}', group={group_id}, msg={message_id}, "
+            f"index={response.get('index')}, stream={stream_id}"
         )
 
     # ---- 转发域：自动路径（chat.receive.before_process observe Hook）----
@@ -970,9 +989,10 @@ class RepeaterPlugin(MaiBotPlugin):
         if source.group_id not in qq_set(forward.source_groups):
             return
         if self._forward_runtime is not None and forward.request_enabled:
-            # 请求转发链路的入口提示（spec 请求转发链路）：源群 Planner 触发由
-            # 运行时按 trigger_source_planner / 永久防重自行判定，冷却与防重
-            # 只约束自动路径，不压制这条提示。
+            # 请求转发链路的入口提示（spec 请求转发链路）：入口提示随
+            # request_enabled 固化开启，源群 Planner 触发由运行时按
+            # _is_unloading / 永久防重自行判定；冷却与防重只约束自动路径，
+            # 不压制这条提示。
             self._forward_runtime.observe_source_message(message)
         now = time.time()
         if self._forward_state.is_duplicate(
@@ -1032,6 +1052,13 @@ class RepeaterPlugin(MaiBotPlugin):
         rich_summary = await self._wait_for_forward_summary(source)
         if rich_summary is None:
             return
+        # 占位观测（change design D3）：就绪即记一次富摘要的媒体占位计数，供主机侧
+        # 多模态降级排查。纯观测：不改写富摘要，不参与任何行为分支。
+        self.ctx.logger.info(
+            f"自动转发富摘要媒体占位 {count_rich_summary_placeholders(rich_summary)} 处"
+            f"（主程序 images 表缺 hash 时麦麦多模态降级）"
+            f"msg={source.message_id} group={source.group_id}"
+        )
         forward = self.config.forward
         now = time.time()
         # **目标群**冷却只压制该群：先按请求路径同款口径归一（去空、去重、去
@@ -1784,7 +1811,7 @@ class RepeaterPlugin(MaiBotPlugin):
             },
             "content_summary": {
                 "type": "string",
-                "description": "查看连续失败达到降级阈值后使用的忠实内容摘要（可空）",
+                "description": "查看失败（消息不可见或内容取不到）时使用的忠实内容摘要（可空）",
             },
         },
         chat_scope="group",

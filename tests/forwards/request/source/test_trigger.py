@@ -11,9 +11,11 @@ import json
 from pathlib import Path
 
 from repeater_plugin.forwards.request.core.models import ForwardJob
+from repeater_plugin.forwards.request.source.message import SourceForwardMessageParser
 
 from tests.forwards.request.support import (
     FakeDelayedMessageCapability,
+    FakeMessageCapability,
     build_forward_message,
     build_plugin,
     wait_for_background_tasks,
@@ -33,11 +35,11 @@ def test_source_trigger_waits_for_real_message_and_only_queues_planner(tmp_path:
     """
 
     async def scenario() -> None:
-        plugin = build_plugin(tmp_path, trigger_source_planner=True)
+        plugin = build_plugin(tmp_path)
         await plugin.on_load()
         plugin.ctx.message = FakeDelayedMessageCapability(build_forward_message())
 
-        await plugin.trigger_source_planner_for_forward_message(message=build_forward_message())
+        await plugin.observe_source_message(message=build_forward_message())
         await wait_for_background_tasks(plugin)
 
         assert plugin.ctx.message.calls == [
@@ -55,35 +57,103 @@ def test_source_trigger_waits_for_real_message_and_only_queues_planner(tmp_path:
     asyncio.run(scenario())
 
 
-def test_source_trigger_switch_and_source_whitelist_are_independent(tmp_path: Path) -> None:
-    """验证显式关闭 source 触发开关或群不在 source 白名单时完全忽略消息。
+def test_source_trigger_always_fires_for_qualifying_source_message(tmp_path: Path) -> None:
+    """验证入口提示固化开启：没有任何触发开关时，合格源消息照常触发本群 Planner。
 
-    默认开启的插件在显式传入 ``False`` 后收到合法 source 消息时不应查询消息
-    或触发 Planner；即使开关启用，非 source 群也应保持相同行为。该测试防止
-    关闭配置失效，也防止 target 或任意群绕过 source 白名单触发。
+    源群白名单命中且消息可查询到后必须出现一次 planner 事件；该测试防止
+    删掉源群触发开关判定时把整条入口提示一起删掉。
 
     Args:
-        tmp_path: pytest 提供的隔离状态目录，用于分别加载两个插件实例。
+        tmp_path: pytest 提供的隔离状态目录，用于保存永久触发防重键。
     """
 
     async def scenario() -> None:
-        disabled_plugin = build_plugin(tmp_path / "disabled", trigger_source_planner=False)
-        await disabled_plugin.on_load()
-        await disabled_plugin.trigger_source_planner_for_forward_message(message=build_forward_message())
-        await wait_for_background_tasks(disabled_plugin)
-        assert disabled_plugin.ctx.message.calls == []
-        assert disabled_plugin.ctx.events == []
-        await disabled_plugin.on_unload()
+        plugin = build_plugin(tmp_path)
+        await plugin.on_load()
+        plugin.ctx.message = FakeDelayedMessageCapability(build_forward_message())
 
-        non_source_plugin = build_plugin(tmp_path / "non-source", trigger_source_planner=True)
-        await non_source_plugin.on_load()
-        await non_source_plugin.trigger_source_planner_for_forward_message(
+        await plugin.observe_source_message(message=build_forward_message())
+        await wait_for_background_tasks(plugin)
+
+        assert plugin.ctx.message.calls == [
+            ("forward-message", "source-stream", False),
+            ("forward-message", "source-stream", False),
+        ]
+        assert plugin.ctx.events == [("planner", "source-stream")]
+        await plugin.on_unload()
+
+    asyncio.run(scenario())
+
+
+def test_source_trigger_requires_source_whitelist(tmp_path: Path) -> None:
+    """验证固化开启后仍只认 source 白名单：非 source 群不查询、不触发。
+
+    该测试防止入口提示固化开启被误读为「任意群都触发」。
+
+    Args:
+        tmp_path: pytest 提供的隔离状态目录，用于保存永久触发防重键。
+    """
+
+    async def scenario() -> None:
+        plugin = build_plugin(tmp_path / "non-source")
+        await plugin.on_load()
+        await plugin.observe_source_message(
             message=build_forward_message(group_id="30001", stream_id="other-stream")
         )
-        await wait_for_background_tasks(non_source_plugin)
-        assert non_source_plugin.ctx.message.calls == []
-        assert non_source_plugin.ctx.events == []
-        await non_source_plugin.on_unload()
+        await wait_for_background_tasks(plugin)
+        assert plugin.ctx.message.calls == []
+        assert plugin.ctx.events == []
+        await plugin.on_unload()
+
+    asyncio.run(scenario())
+
+
+def test_source_trigger_does_not_fire_after_unload(tmp_path: Path) -> None:
+    """验证卸载后入口提示停摆：`_is_unloading` 仍拦住新的触发安排。
+
+    删掉源群触发开关判定后，卸载守卫是仅剩的停止条件；卸载后
+    再收到合格源消息不得查询消息或触发 Planner。
+
+    Args:
+        tmp_path: pytest 提供的隔离状态目录，用于保存永久触发防重键。
+    """
+
+    async def scenario() -> None:
+        plugin = build_plugin(tmp_path)
+        await plugin.on_load()
+        await plugin.on_unload()
+
+        await plugin.observe_source_message(message=build_forward_message())
+        await wait_for_background_tasks(plugin)
+
+        assert plugin.ctx.message.calls == []
+        assert plugin.ctx.events == []
+
+    asyncio.run(scenario())
+
+
+def test_message_ready_polling_aborts_during_unload(tmp_path: Path) -> None:
+    """验证等待窗口轮询守卫只删配置检查、保留卸载中止（task 1.7 的 seam）。
+
+    轮询期间卸载（`stop()` 置 `_is_unloading`）后再进入就绪判定，必须立即
+    返回 ``False`` 且不查询消息——「消息不可见就放弃并记录 warning」的结果
+    不变。
+
+    Args:
+        tmp_path: pytest 提供的隔离状态目录，用于保存永久触发防重键。
+    """
+
+    async def scenario() -> None:
+        plugin = build_plugin(tmp_path)
+        await plugin.on_load()
+        observation = SourceForwardMessageParser.parse(build_forward_message())
+        assert observation is not None
+        plugin.ctx.message = FakeMessageCapability({})
+
+        await plugin.runtime.source_trigger.stop()
+
+        assert await plugin.runtime.source_trigger._wait_until_message_ready(observation) is False
+        assert plugin.ctx.message.calls == []
 
     asyncio.run(scenario())
 
@@ -101,10 +171,10 @@ def test_source_trigger_skips_self_and_known_forward_echoes(tmp_path: Path) -> N
     """
 
     async def scenario() -> None:
-        plugin = build_plugin(tmp_path, trigger_source_planner=True)
+        plugin = build_plugin(tmp_path)
         await plugin.on_load()
 
-        await plugin.trigger_source_planner_for_forward_message(
+        await plugin.observe_source_message(
             message=build_forward_message(sender_id="99999", self_id="99999")
         )
         echo_job = ForwardJob(
@@ -118,7 +188,7 @@ def test_source_trigger_skips_self_and_known_forward_echoes(tmp_path: Path) -> N
             sharing_reason="测试回声",
         )
         await plugin.runtime.state.record_target_sent(echo_job, "10001", "forward-message")
-        await plugin.trigger_source_planner_for_forward_message(message=build_forward_message(self_id=""))
+        await plugin.observe_source_message(message=build_forward_message(self_id=""))
         await wait_for_background_tasks(plugin)
 
         assert plugin.ctx.message.calls == []
@@ -140,11 +210,11 @@ def test_source_trigger_is_permanently_deduplicated_across_reload(tmp_path: Path
     """
 
     async def scenario() -> None:
-        first_plugin = build_plugin(tmp_path, trigger_source_planner=True)
+        first_plugin = build_plugin(tmp_path)
         await first_plugin.on_load()
         message = build_forward_message()
-        await first_plugin.trigger_source_planner_for_forward_message(message=message)
-        await first_plugin.trigger_source_planner_for_forward_message(message=message)
+        await first_plugin.observe_source_message(message=message)
+        await first_plugin.observe_source_message(message=message)
         await wait_for_background_tasks(first_plugin)
         assert first_plugin.ctx.events == [("planner", "source-stream")]
         await first_plugin.on_unload()
@@ -155,9 +225,9 @@ def test_source_trigger_is_permanently_deduplicated_across_reload(tmp_path: Path
         assert "source-stream" not in state_payload["triggered_keys"][0]
         assert "forward-message" not in state_payload["triggered_keys"][0]
 
-        reloaded_plugin = build_plugin(tmp_path, trigger_source_planner=True)
+        reloaded_plugin = build_plugin(tmp_path)
         await reloaded_plugin.on_load()
-        await reloaded_plugin.trigger_source_planner_for_forward_message(message=message)
+        await reloaded_plugin.observe_source_message(message=message)
         await wait_for_background_tasks(reloaded_plugin)
         assert reloaded_plugin.ctx.message.calls == []
         assert reloaded_plugin.ctx.events == []

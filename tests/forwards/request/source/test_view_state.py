@@ -7,21 +7,18 @@ from repeater_plugin.forwards.request.source.models import (
     ViewEligibilityStatus,
     ViewObservationKind,
 )
-from repeater_plugin.forwards.request.source.view_policy import (
-    needs_additional_view,
-)
 from repeater_plugin.forwards.request.source.view_state import (
     ViewEligibilityStore,
 )
 
 
 def test_view_eligibility_follows_current_context_and_classifies_failures() -> None:
-    """验证查看资格严格跟随当前上下文且失败计数按末尾分类计算。
+    """验证查看资格严格跟随当前上下文且失败分类只取最后一次可见结果。
 
     成功结果在同一上下文中重复同步后仍应有效但不重复报告为新结果；下一轮
-    上下文移除该结果后资格必须立即消失。两个连续可重试故障应计为两次，
-    后接可修正错误后计数应清零。该测试防止重新引入时间过期或旧索引残留，
-    也防止不同失败类型拼接成降级资格。
+    上下文移除该结果后资格必须立即消失。两次连续可重试故障与后接可修正
+    错误都只反映最后一次失败分类，不再累计计数。该测试防止重新引入时间
+    过期或旧索引残留，也防止不同失败类型拼接成降级资格。
     """
 
     store = ViewEligibilityStore()
@@ -69,7 +66,7 @@ def test_view_eligibility_follows_current_context_and_classifies_failures() -> N
     )
     failed_lookup = store.lookup("stream-1", "message-2")
     assert failed_lookup.status is ViewEligibilityStatus.MISSING
-    assert failed_lookup.retryable_failure_count == 2
+    assert failed_lookup.last_observation_kind is ViewObservationKind.RETRYABLE_FAILURE
 
     store.sync_context(
         "stream-1",
@@ -89,7 +86,6 @@ def test_view_eligibility_follows_current_context_and_classifies_failures() -> N
         ],
     )
     corrected_lookup = store.lookup("stream-1", "message-2")
-    assert corrected_lookup.retryable_failure_count == 0
     assert corrected_lookup.last_observation_kind is ViewObservationKind.CORRECTABLE_FAILURE
 
 
@@ -131,7 +127,7 @@ def test_nested_view_completeness_requires_root_and_every_discovered_path() -> N
     根层先暴露两条路径，其中第二条继续暴露更深路径。各路径尚未全部成功时
     查看资格仍应为 ``READY``，但 ``content_complete`` 必须保持 ``False``；
     覆盖全部路径后才变为 ``True``，裁剪根层后又应回到不完整。该测试防止
-    可选继续查看被误改成强制门槛，也防止任意单层成功被宣称为完整内容。
+    任意单层成功被宣称为完整内容。
     """
 
     store = ViewEligibilityStore()
@@ -169,7 +165,6 @@ def test_nested_view_completeness_requires_root_and_every_discovered_path() -> N
     root_lookup = store.lookup("stream-1", "nested-message")
     assert root_lookup.status is ViewEligibilityStatus.READY
     assert root_lookup.content_complete is False
-    assert needs_additional_view(root_lookup, retryable_failure_threshold=3) is False
 
     store.sync_context("stream-1", [root, first_branch, second_branch])
     assert store.lookup("stream-1", "nested-message").content_complete is False
@@ -181,3 +176,34 @@ def test_nested_view_completeness_requires_root_and_every_discovered_path() -> N
     trimmed_lookup = store.lookup("stream-1", "nested-message")
     assert trimmed_lookup.status is ViewEligibilityStatus.READY
     assert trimmed_lookup.content_complete is False
+
+
+def test_view_eligibility_lookup_carries_no_failure_counters() -> None:
+    """验证查看资格查询不再携带连续失败计数状态。
+
+    删除 ``view_failure_fallback_threshold`` 后请求路径首次查看失败即用摘要
+    降级（design D2），资格查询只保留最后一次失败分类这副产物；连续失败计数、
+    重试分支与无读取方的失败文本整体删除。该测试防止旧阈值语义的计数状态机
+    随查询对象回流。
+    """
+
+    store = ViewEligibilityStore()
+    store.sync_context(
+        "stream-1",
+        [
+            ViewToolObservation(
+                call_id=f"retryable-call-{index}",
+                message_id="message-1",
+                content="查看异常",
+                kind=ViewObservationKind.RETRYABLE_FAILURE,
+            )
+            for index in range(2)
+        ],
+    )
+
+    lookup = store.lookup("stream-1", "message-1")
+    assert lookup.status is ViewEligibilityStatus.MISSING
+    assert lookup.last_observation_kind is ViewObservationKind.RETRYABLE_FAILURE
+    assert not hasattr(lookup, "last_failure_content")
+    assert not hasattr(lookup, "retryable_failure_count")
+    assert not hasattr(lookup, "empty_content_failure_count")

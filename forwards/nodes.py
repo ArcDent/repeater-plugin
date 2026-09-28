@@ -23,10 +23,15 @@ from .forward_segments import (
     normalize_forward_nodes,
 )
 
-# 段类型 → 注入摘要占位文案的唯一来源（forwards/texts.py 直接引用，不另起
-# 副本）；键集同时是「按图片重建的段类型」判定集。发送转换里媒体段取不到
-# 字节与可用引用时不再降级为占位文本，而是整段不产出（design D5）。
+# 段类型 → 注入摘要占位文案的唯一来源（forwards/texts.py 与 forwards/summary.py
+# 直接引用，不另起副本）；键集同时是「按图片重建的段类型」判定集。发送转换里
+# 媒体段取不到字节与可用引用时不再降级为占位文本，而是整段不产出（design D5）。
 SEGMENT_PLACEHOLDERS: dict[str, str] = {"image": "[图片]", "emoji": "[表情]"}
+
+# 嵌套转发段在注入摘要里的占位文案（forwards/texts.py 与 forwards/summary.py
+# 共用的唯一来源）。`forward` 段不进 SEGMENT_PLACEHOLDERS：该表的键集同时是
+# 「按图片重建的段类型」判定集，嵌套转发段在发送侧递归展开为内层 node。
+NESTED_FORWARD_PLACEHOLDER = "[嵌套转发]"
 
 # 段内 data 视为文件引用的形态：协议端可解析的 URI 前缀，或含路径分隔符的
 # 本地路径；其余（如主程序处理后写入的中文描述文本）不是引用，不得当 file 发出。
