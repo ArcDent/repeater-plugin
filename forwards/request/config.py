@@ -63,8 +63,6 @@ class ForwardRuntimeConfig:
     source_groups: tuple[str, ...] = ()
     target_groups: tuple[str, ...] = ()
     dedup_ttl_seconds: float = 1800.0
-    view_failure_fallback_threshold: int = 2
-    trigger_source_planner: bool = True
     trigger_target_planner: bool = True
 
 
@@ -102,11 +100,6 @@ def adapt_forward_config(source: Any) -> ForwardRuntimeConfig:
         source_groups=tuple(GroupIdList.normalize(raw_source_groups)),
         target_groups=tuple(GroupIdList.normalize(raw_target_groups)),
         dedup_ttl_seconds=_float_field(forward, "dedup_ttl_seconds", 1800.0),
-        view_failure_fallback_threshold=max(
-            _int_field(forward, "view_failure_fallback_threshold", 2),
-            1,
-        ),
-        trigger_source_planner=bool(getattr(forward, "trigger_source_planner", True)),
         trigger_target_planner=bool(getattr(forward, "trigger_target_planner", True)),
     )
 
@@ -125,23 +118,5 @@ def _float_field(source: Any, name: str, default: float) -> float:
 
     try:
         return float(getattr(source, name, default))
-    except (TypeError, ValueError):
-        return default
-
-
-def _int_field(source: Any, name: str, default: int) -> int:
-    """读取整数字段并安全转换。
-
-    Args:
-        source: 配置节对象。
-        name: 字段名称。
-        default: 缺失或不可转换时的回退值。
-
-    Returns:
-        可用作阈值比较的整数。
-    """
-
-    try:
-        return int(getattr(source, name, default))
     except (TypeError, ValueError):
         return default

@@ -16,7 +16,7 @@ from .authorization import (
     ForwardInvocationGate,
 )
 from .history import VIEW_FORWARD_TOOL_NAME, PlannerHistoryParser, ViewToolObservation
-from .models import ViewEligibilityLookup
+from .models import ViewEligibilityLookup, ViewEligibilityStatus
 from .output_items import (
     OutputItemToolCall,
     append_output_item_call,
@@ -24,7 +24,6 @@ from .output_items import (
     replace_first_assistant_text,
     replace_output_item_call,
 )
-from .view_policy import needs_additional_view
 from .view_state import ViewEligibilityStore
 
 
@@ -59,7 +58,7 @@ class ViewBeforeForwardCoordinator:
 
         Args:
             config_provider: 返回当前 ``ForwardRuntimeConfig`` 的无参数
-                回调，用于读取启用状态和查看失败降级阈值。
+                回调，用于读取启用状态。
             view_eligibility: 当前 Planner 可见上下文的查看资格索引。
             invocation_gate: 清洗模型参数并签发一次性会话凭据的正式入口。
             preflight: 在真实查看前验证 source、消息、target 与防重状态的异步
@@ -150,9 +149,9 @@ class ViewBeforeForwardCoordinator:
         """改写 Planner 工具调用以串联真实查看和原始转发请求。
 
         首次遇到单独出现且尚无查看资格的转发调用时，将整批调用替换成一个
-        ``view_forward_message``。下一续轮只有在精确查看结果仍可见时才继续：
-        成功或达到既有降级阈值会恢复原请求，可重试故障会再次查看，其他
-        失败则恢复原请求交给最终处理器返回安全错误。多工具或结构异常响应
+        ``view_forward_message``。下一续轮只要精确查看结果仍可见就恢复原请求：
+        成功时处理器使用全文，失败时首次即用摘要降级；其他结构异常或结果
+        缺失不会重排，交回 Host 与最终处理器处理。多工具或结构异常响应
         不会被重排。
 
         Args:
@@ -315,7 +314,11 @@ class ViewBeforeForwardCoordinator:
         response: str,
         tool_calls: Any,
     ) -> tuple[str, Any]:
-        """根据已捕获查看结果推进一条待续接请求。
+        """根据已捕获查看结果恢复一条待续接请求。
+
+        查看结果（成功或失败）一进入当前上下文就恢复原转发请求：成功时处理器
+        使用全文，失败时**首次即用摘要降级**，插件不再发起第二次系统查看。
+        结果缺失或已被上下文裁剪时释放 pending，原样交回 Host 处理。
 
         Args:
             session_id: 待续接请求所属的 Planner 聊天流 ID。
@@ -324,8 +327,8 @@ class ViewBeforeForwardCoordinator:
             tool_calls: 本轮模型原始工具调用列表。
 
         Returns:
-            尚未看到精确查看结果时原样返回并放弃旧 pending；需要继续查看
-            时返回新的查看调用；其他已分类结果返回恢复后的原转发调用。
+            已看到精确查看结果（含失败）时返回恢复后的原转发调用；结果缺失
+            时原样返回。
         """
 
         if pending.restored_call_id:
@@ -340,21 +343,6 @@ class ViewBeforeForwardCoordinator:
             return response, tool_calls
 
         lookup = self._view_eligibility.lookup(session_id, pending.message_id)
-        if self._needs_another_view(lookup):
-            self._invocation_gate.revoke_calls(tool_calls)
-            view_call = self._build_tool_call(
-                VIEW_FORWARD_TOOL_NAME,
-                {"msg_id": pending.message_id},
-            )
-            pending.view_call_id = view_call["id"]
-            pending.view_result_seen = False
-            self._logger.info(
-                "系统查看尚未达到成功或降级条件，继续查看: stream=%s msg_id=%s",
-                session_id,
-                pending.message_id,
-            )
-            return "完整内容尚未取得，继续执行系统查看。", [view_call]
-
         self._invocation_gate.revoke_calls(tool_calls)
         restored_call = self._build_tool_call(
             FORWARD_TOOL_NAME,
@@ -378,7 +366,11 @@ class ViewBeforeForwardCoordinator:
         pending: PendingDirectForward,
         output_items: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """根据最新 Context Item 历史推进一条待续接转发请求。
+        """根据最新 Context Item 历史恢复一条待续接转发请求。
+
+        与旧版聊天历史路径同口径：查看结果（成功或失败）一进入当前上下文
+        就恢复原转发请求，失败由请求处理器首次即用摘要降级，不再发起第二次
+        系统查看。混合工具输出不被重排；单独调用被替换为带新凭据的恢复调用。
 
         Args:
             session_id: 待续接请求所属的 Planner 聊天流 ID。
@@ -387,8 +379,7 @@ class ViewBeforeForwardCoordinator:
                 授权校验清除失效的内部凭据。
 
         Returns:
-            当前轮应交回 Host 的 Item 列表。混合工具输出不被重排；单独调用
-            会被替换为下一次查看或带新凭据的恢复调用。
+            当前轮应交回 Host 的 Item 列表。
         """
 
         if pending.restored_call_id:
@@ -414,26 +405,6 @@ class ViewBeforeForwardCoordinator:
             (item for item in output_items if isinstance(item, dict) and isinstance(item.get("meta"), dict)),
             pending.output_item_template,
         )
-        if self._needs_another_view(lookup):
-            self._invocation_gate.revoke_output_items(output_items)
-            view_call_id = f"cross-forward-auto-view-{uuid4().hex}"
-            updated_items = self._replace_or_append_output_item_call(
-                output_items,
-                replacement_index,
-                VIEW_FORWARD_TOOL_NAME,
-                {"msg_id": pending.message_id},
-                call_id=view_call_id,
-                template_item=template_item,
-            )
-            pending.view_call_id = view_call_id
-            pending.view_result_seen = False
-            self._logger.info(
-                "系统查看尚未达到成功或降级条件，继续查看: stream=%s msg_id=%s",
-                session_id,
-                pending.message_id,
-            )
-            return replace_first_assistant_text(updated_items, "完整内容尚未取得，继续执行系统查看。")
-
         self._invocation_gate.revoke_output_items(output_items)
         restored_call_id = f"cross-forward-auto-request-{uuid4().hex}"
         restored_arguments = self._invocation_gate.authorize_arguments(
@@ -457,22 +428,23 @@ class ViewBeforeForwardCoordinator:
         )
         return replace_first_assistant_text(restored_items, "已完成转发前查看，继续执行原转发请求。")
 
-    def _needs_another_view(self, lookup: ViewEligibilityLookup) -> bool:
-        """判断当前查看状态是否需要系统继续调用查看工具。
+    @staticmethod
+    def _needs_another_view(lookup: ViewEligibilityLookup) -> bool:
+        """判断当前查看状态是否需要系统调用查看工具。
+
+        只有「当前上下文完全没有查看结果」时才需要系统查看：任何一次查看
+        失败（消息在等待窗口内不可见或内容取不到）都由请求处理器首次即用
+        摘要降级，不再有连续失败计数与系统内部重试轮次。
 
         Args:
             lookup: ``ViewEligibilityStore.lookup`` 返回的当前上下文状态。
 
         Returns:
-            已成功查看、达到 fallback 阈值或出现不可自动重试的失败时返回
-            ``False``；完全缺失、可重试故障未达阈值或首次空内容返回
-            ``True``。
+            既无成功结果也无任何失败观察时返回 ``True``；已成功查看或已出现
+            任意失败观察时返回 ``False``。
         """
 
-        return needs_additional_view(
-            lookup,
-            self.config.view_failure_fallback_threshold,
-        )
+        return lookup.status is not ViewEligibilityStatus.READY and lookup.last_observation_kind is None
 
     @staticmethod
     def _extract_single_forward_output_request(

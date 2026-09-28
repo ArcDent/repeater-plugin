@@ -14,7 +14,12 @@ from typing import Any
 
 from ..repeats import clamp_non_negative
 from .decision import DECIDE_FORWARD_TOOL_NAME
-from .nodes import SEGMENT_PLACEHOLDERS, ForwardNode, extract_at_qq
+from .nodes import (
+    NESTED_FORWARD_PLACEHOLDER,
+    SEGMENT_PLACEHOLDERS,
+    ForwardNode,
+    extract_at_qq,
+)
 from .source import ForwardSource
 
 _UNKNOWN_SOURCE = "未知来源群"
@@ -71,7 +76,7 @@ def _segment_summary(segment: dict[str, Any]) -> str:
     if segment_type in SEGMENT_PLACEHOLDERS:
         return SEGMENT_PLACEHOLDERS[segment_type]
     if segment_type == "forward":
-        return "[嵌套转发]"
+        return NESTED_FORWARD_PLACEHOLDER
     return ""
 
 

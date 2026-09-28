@@ -231,8 +231,9 @@ class ForwardingRuntime:
         """统计合格 source 消息，再交给 Planner 触发服务独立筛选。
 
         调试统计只在环境变量显式开启且转发域启用时登记 source 白名单中的
-        唯一外部合并转发，并排除已经持久化的插件转发回声；该过程不依赖
-        ``trigger_source_planner``。随后无论统计结果如何，都按原路径调用
+        唯一外部合并转发，并排除已经持久化的插件转发回声；该过程不承担
+        Planner 触发筛选，触发由 source 触发服务按 ``_is_unloading`` 与
+        永久防重自行判定。随后无论统计结果如何，都按原路径调用
         source 触发服务。
 
         Args:
@@ -487,8 +488,8 @@ class ForwardingRuntime:
         Args:
             msg_id: source Planner 请求分享的合并转发消息 ID。
             sharing_reason: Planner 给出的分享理由，可为空。
-            content_summary: 连续可重试故障达到配置阈值或连续两次返回
-                空内容时使用的忠实摘要，可为空。
+            content_summary: 查看失败（消息不可见或内容取不到）时使用的
+                忠实摘要，可为空。
             invocation_context: Runner 传入的完整调用参数。运行时只消费
                 EARLY Hook 签发的一次性凭据，不信任其中模型可写的
                 ``platform``、``group_id``、``stream_id`` 或 ``chat_id``。

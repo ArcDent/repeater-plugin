@@ -20,7 +20,6 @@ from .source.models import (
     ViewEligibilityStatus,
     ViewObservationKind,
 )
-from .source.view_policy import EMPTY_CONTENT_FALLBACK_THRESHOLD
 from .source.view_state import ViewEligibilityStore
 from .target.delivery import ForwardDeliveryService
 
@@ -95,8 +94,8 @@ class RequestService:
         Args:
             msg_id: source Planner 请求分享的合并转发消息 ID。
             sharing_reason: Planner 对“为何值得分享”的简短说明，可为空。
-            content_summary: 连续可重试失败达到阈值或连续两次返回空内容时
-                使用的忠实摘要，可为空。
+            content_summary: 查看失败（消息不可见或内容取不到）时使用的
+                忠实摘要，可为空。
             source_stream_id: 已由一次性授权绑定的真实 Planner 会话 ID。
 
         Returns:
@@ -468,11 +467,12 @@ class RequestService:
     ) -> str | dict[str, Any]:
         """验证 source Planner 的内容查看资格，并在明确条件下允许降级。
 
-        当前上下文中的有效成功查看始终优先且不按时间过期。参数或消息错误
-        要求修正，非合并转发和未知错误会阻止任务；可重试故障只有连续次数
-        达到配置阈值才允许降级，空内容则允许一次诊断重试。查看结果已被
-        上下文裁剪时必须重新查看，不能按过期使用摘要。返回的文本只证明
-        source 侧已具备分享判断依据，不会注入 target 上下文。
+        当前上下文中的有效成功查看始终优先且不按时间过期（查看成功用全文）。
+        参数或消息错误要求修正，非合并转发和未知错误会阻止任务；查看失败
+        （消息在等待窗口内不可见或内容取不到）**首次即允许降级**，不再计数、
+        不再要求重试。查看结果已被上下文裁剪时必须重新查看，不能按过期使用
+        摘要。返回的文本只证明 source 侧已具备分享判断依据，不会注入 target
+        上下文。
 
         Args:
             source_stream_id: 源消息所属聊天流 ID。
@@ -481,9 +481,9 @@ class RequestService:
             message: Host 源消息，用于读取 ``processed_plain_text`` 预览。
 
         Returns:
-            可用时返回用于证明 source 查看资格的非空文本；尚应继续尝试
-            查看时返回 ``{"success": False, "content": ...}``，阻止创建
-            转发任务。
+            可用时返回用于证明 source 查看资格的非空文本；当前上下文完全
+            没有查看结果时返回 ``{"success": False, "content": ...}``，要求
+            Planner 在紧接续轮查看后再调用。
         """
 
         lookup = self._view_eligibility.lookup(
@@ -505,44 +505,22 @@ class RequestService:
             )
         if observation_kind is ViewObservationKind.UNKNOWN_FAILURE:
             return self.failure(
-                "view_forward_message 返回了无法安全分类的失败；为避免误转发，当前不会累计次数或开放降级。"
+                "view_forward_message 返回了无法安全分类的失败；为避免误转发，也不会开放摘要降级。"
             )
 
-        failure_threshold = self.config.view_failure_fallback_threshold
-        continuation_instruction = self._build_view_continuation_instruction(
-            source_message_id,
-        )
         fallback_reason = ""
-        if (
-            observation_kind is ViewObservationKind.RETRYABLE_FAILURE
-            and lookup.retryable_failure_count >= failure_threshold
-        ):
-            fallback_reason = f"view_forward_message 已连续发生 {lookup.retryable_failure_count} 次可重试故障"
-        elif (
-            observation_kind is ViewObservationKind.EMPTY_CONTENT_FAILURE
-            and lookup.empty_content_failure_count >= EMPTY_CONTENT_FALLBACK_THRESHOLD
-        ):
-            fallback_reason = f"view_forward_message 已连续 {lookup.empty_content_failure_count} 次返回空内容"
+        if observation_kind is ViewObservationKind.RETRYABLE_FAILURE:
+            fallback_reason = "view_forward_message 未取得完整内容（消息在等待窗口内不可见）"
+        elif observation_kind is ViewObservationKind.EMPTY_CONTENT_FAILURE:
+            fallback_reason = "view_forward_message 未取得内容（返回空内容）"
 
         if not fallback_reason:
-            if observation_kind is ViewObservationKind.RETRYABLE_FAILURE:
-                retry_detail = (
-                    "当前连续记录到 "
-                    f"{lookup.retryable_failure_count} 次 view_forward_message 可重试故障，"
-                    f"尚未达到允许降级的配置阈值 {failure_threshold} 次；"
-                    f"{continuation_instruction}"
-                )
-            elif observation_kind is ViewObservationKind.EMPTY_CONTENT_FAILURE:
-                retry_detail = (
-                    "view_forward_message 首次返回空内容；请再进行一次诊断查看。"
-                    "若仍为空，插件才允许使用摘要或消息预览降级。"
-                    f"{continuation_instruction}"
-                )
-            else:
-                retry_detail = (
-                    f"当前 Planner 上下文中尚无成功的 view_forward_message 完整内容。{continuation_instruction}"
-                )
-            return self.failure(retry_detail)
+            continuation_instruction = self._build_view_continuation_instruction(
+                source_message_id,
+            )
+            return self.failure(
+                f"当前 Planner 上下文中尚无成功的 view_forward_message 完整内容。{continuation_instruction}"
+            )
 
         expanded_content = str(content_summary or "").strip()
         if expanded_content:
