@@ -2,8 +2,9 @@
 # 字段含义与取值范围见 config.py，术语见 CONTEXT.md。
 
 [plugin]
+# 插件总开关，关闭后复读与表情回应两个域全部停用（不再拦截、不发送、不贴表情）
 enabled = true
-config_version = "1.4.0"
+config_version = "1.5.0"
 
 # 协议端 HTTP 上报的接收端点。协议端需要新增一个 HTTP 上报目标指向这里
 # （好友申请插件已占 18080，本插件默认 18081）。
@@ -97,39 +98,3 @@ group_blacklist = []
 ignore_reactors = []
 # 忽略这些 QQ 发出的消息（不进复读链），与上面的回应者名单是两个概念
 ignore_senders = []
-
-# 跨群转发（默认关闭）。源群出现合并转发后，每个目标群独立掷一次骰决定是否自动转发；
-# 转发域不复用上面的 [scope] 白黑名单，源群与目标群各自由本段列表指定。
-[forward]
-# 转发域总开关，默认关闭 = 装了但不动
-enabled = false
-# 只处理这些群里的合并转发；留空则没有源群
-source_groups = []
-# 自动转发的候选目标群，列表顺序即投递顺序；与源群相同的项被跳过
-target_groups = []
-# 每个目标群独立掷骰的两个权重（转发 / 沉默），按比例恰好命中一个。
-# 默认 30 / 70 = 30% 转发；只有比例意义，同比例放大等价；两权重全 0 视为沉默不掷骰
-weight_send = 30
-weight_silence = 70
-# 同一条转发源消息在此窗口内只参与一次掷骰，0 = 不防重
-dedup_ttl_seconds = 1800
-# 源群冷却：至少一个目标群命中转发后写入，冷却期内该群新到的合并转发不掷骰；全沉默不写冷却，0 = 不限
-cooldown_seconds = 60
-# 目标群冷却：该群命中转发后写入，冷却期内不再参与掷骰；与源群冷却分开计时，0 = 不限
-target_cooldown_seconds = 60
-# 命中转发后发送前的随机等待区间（秒），与 [repeat]、[behavior] 两域延迟互相独立
-delay_min_seconds = 0.5
-delay_max_seconds = 2.0
-# 自动转发投递成功后是否触发目标群 Planner 针对该转发发言（软约束，Planner 仍可沉默）
-trigger_target_planner = true
-# 转发内容注入文本的长度上限，超长按上限截断并带省略标记
-inject_max_chars = 800
-# 转发模式：direct = 掷骰命中即直发目标群（默认，升级后行为不变）；
-# planner = 命中后把富摘要交给目标群 Planner 决策是否转发，经决策 Tool 回路执行
-mode = "direct"
-# 自动转发路径开关：关闭后源群合并转发不再掷骰、不投递，请求转发路径不受影响
-auto_enabled = true
-# 请求转发路径开关：关闭后转发 Tool 与源群 Planner 入口提示不再生效，自动转发路径不受影响
-request_enabled = true
-# 等待转发卡片摘要就绪的上限（秒）：超时仍未就绪则记 warning 并放弃本次，不掷骰、不写冷却、不投递
-summary_timeout_seconds = 10

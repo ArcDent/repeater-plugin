@@ -124,6 +124,9 @@ def test_components_dict_form_is_tolerated():
     {"type": "image", "data": "base64...", "hash": "abc"},
     {"type": "face", "data": "76"},
     {"type": "emoji", "data": "[表情包]", "hash": "abc"},
+    # 合并转发段：转发域退役后本插件只剩复读与表情回应，含 forward 段的消息
+    # 仍必须整条排除出复读链（非文本段即非候选），这是剩余域的输入边界样例。
+    {"type": "forward", "data": [{"user_id": "20002", "content": [{"type": "text", "data": "转发内容"}]}]},
 ])
 def test_message_with_non_text_segment_is_rejected(segment):
     message = _message(segments=[{"type": "text", "data": "草"}, segment])

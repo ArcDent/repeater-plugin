@@ -1,9 +1,8 @@
 """复读插件 — 配置模型。
 
-覆盖三个行为域：**复读**（**复读链**达标后按概率**复读**或**打断**）、
-**表情回应**（按概率**跟风**或**反义回应**）与**跨群转发**（源群**合并转发**
-按目标群权重**自动转发**，并可响应**请求转发**）。字段默认值须与 config.toml
-逐项一致（项目铁律）。术语见 CONTEXT.md。
+覆盖两个行为域：**复读**（**复读链**达标后按**出口权重**掷骰选中**复读**、
+**打断**或沉默）与**表情回应**（按概率**跟风**或**反义回应**）。字段默认值
+须与 config.toml 逐项一致（项目铁律）。术语见 CONTEXT.md。
 """
 
 from __future__ import annotations
@@ -23,13 +22,13 @@ class PluginSection(PluginConfigBase):
         default=True,
         description="是否启用本插件。",
         json_schema_extra={
-            "hint": "插件总开关，关闭后不再监听表情回应，也不再贴任何表情。",
+            "hint": "插件总开关，关闭后复读与表情回应两个域全部停用（不再拦截、不发送、不贴表情）。",
             "label": "启用插件",
             "order": 0,
         },
     )
     config_version: str = Field(
-        default="1.4.0",
+        default="1.5.0",
         json_schema_extra={"disabled": True, "hidden": True, "label": "配置版本", "order": 99},
     )
 
@@ -515,172 +514,6 @@ class ScopeSection(PluginConfigBase):
     )
 
 
-class ForwardSection(PluginConfigBase):
-    __ui_label__: ClassVar[str] = "跨群转发"
-    __ui_order__: ClassVar[int] = 9
-
-    enabled: bool = Field(
-        default=False,
-        json_schema_extra={
-            "hint": (
-                "跨群转发独立开关：源群出现合并转发后按目标群权重自动转发，"
-                "并可响应麦麦的转发请求。默认关闭，与复读 / 表情回应两域并列。"
-            ),
-            "label": "启用跨群转发",
-            "order": 0,
-        },
-    )
-    source_groups: list[str] = Field(
-        default_factory=list,
-        json_schema_extra={
-            "hint": "只处理这些 QQ 群内的合并转发；留空则没有源群，转发域不工作。",
-            "label": "源群列表",
-            "order": 1,
-            "placeholder": "请输入群号",
-        },
-    )
-    target_groups: list[str] = Field(
-        default_factory=list,
-        json_schema_extra={
-            "hint": "自动转发的候选目标群，列表顺序即投递顺序；与源群相同的项被跳过。留空则无目标群。",
-            "label": "目标群列表",
-            "order": 2,
-            "placeholder": "请输入群号",
-        },
-    )
-    weight_send: int = Field(
-        default=30, ge=0, le=1000,
-        json_schema_extra={
-            "hint": (
-                "每个目标群独立掷一次骰的两个权重：转发 / 沉默，按比例恰好命中一个出口。"
-                "默认 30 / 70 = 30% 转发；只有比例意义，同比例放大等价（如 60 / 140）。"
-                "两权重全为 0 时该目标群视为沉默、不掷骰。"
-            ),
-            "label": "转发权重",
-            "order": 3,
-            "step": 5,
-        },
-    )
-    weight_silence: int = Field(
-        default=70, ge=0, le=1000,
-        json_schema_extra={
-            "hint": "沉默出口的权重：命中则不向该目标群转发。与转发权重按比例决定同一次掷骰的出口。",
-            "label": "沉默权重",
-            "order": 4,
-            "step": 5,
-        },
-    )
-    dedup_ttl_seconds: int = Field(
-        default=1800, ge=0, le=604800,
-        json_schema_extra={
-            "hint": "同一条转发源消息（按消息 ID）在此窗口内只参与一次掷骰。0 = 不防重。",
-            "label": "防重窗口（秒）",
-            "order": 5,
-            "step": 60,
-        },
-    )
-    cooldown_seconds: int = Field(
-        default=60, ge=0, le=86400,
-        json_schema_extra={
-            "hint": (
-                "源群冷却：至少一个目标群命中转发后写入，冷却期内该群新到的合并转发不掷骰；"
-                "掷骰全为沉默时不写冷却。0 = 不限。"
-            ),
-            "label": "源群冷却（秒）",
-            "order": 6,
-            "step": 5,
-        },
-    )
-    target_cooldown_seconds: int = Field(
-        default=60, ge=0, le=86400,
-        json_schema_extra={
-            "hint": "目标群冷却：该群命中转发后写入，冷却期内不再参与掷骰；与源群冷却分开计时。0 = 不限。",
-            "label": "目标群冷却（秒）",
-            "order": 7,
-            "step": 5,
-        },
-    )
-    delay_min_seconds: float = Field(
-        default=0.5, ge=0.0, le=300.0,
-        json_schema_extra={
-            "hint": "命中转发后发送前的最短等待秒数，与复读 / 表情回应两域的延迟互相独立。",
-            "label": "转发发送延迟下限（秒）",
-            "order": 8,
-            "step": 0.1,
-        },
-    )
-    delay_max_seconds: float = Field(
-        default=2.0, ge=0.0, le=300.0,
-        json_schema_extra={
-            "hint": "命中转发后发送前的最大等待秒数，实际等待在最小 / 最大之间随机取；小于最小延迟时按最小延迟处理。",
-            "label": "转发发送延迟上限（秒）",
-            "order": 9,
-            "step": 0.1,
-        },
-    )
-    trigger_target_planner: bool = Field(
-        default=True,
-        json_schema_extra={
-            "hint": (
-                "自动转发投递成功后，是否对该目标群触发一次要求针对这条转发发言的 Planner 主动任务。"
-                "软约束：Planner 仍可沉默，插件不检测也不补发。"
-            ),
-            "label": "触发目标群 Planner",
-            "order": 10,
-        },
-    )
-    inject_max_chars: int = Field(
-        default=800, ge=1, le=4096,
-        json_schema_extra={
-            "hint": "转发内容注入文本的长度上限，超长按上限截断并带省略标记。",
-            "label": "注入文本长度上限",
-            "order": 11,
-            "step": 100,
-        },
-    )
-    mode: str = Field(
-        default="direct",
-        json_schema_extra={
-            "hint": (
-                "转发模式：direct = 掷骰命中即直发目标群，不经 LLM；"
-                "planner = 命中后把该转发的富摘要交给目标群 Planner，由它调用决策 Tool 决定转发与否。"
-                "非法值按 direct 处理并记 warning。"
-            ),
-            "label": "转发模式",
-            "order": 12,
-            "placeholder": "direct",
-        },
-    )
-    auto_enabled: bool = Field(
-        default=True,
-        json_schema_extra={
-            "hint": "自动转发路径开关：关闭后源群合并转发不再掷骰、不投递，请求转发路径不受影响。",
-            "label": "启用自动转发",
-            "order": 13,
-        },
-    )
-    request_enabled: bool = Field(
-        default=True,
-        json_schema_extra={
-            "hint": "请求转发路径开关：关闭后转发 Tool 与源群 Planner 入口提示都不再生效，自动转发路径不受影响。",
-            "label": "启用请求转发",
-            "order": 14,
-        },
-    )
-    summary_timeout_seconds: int = Field(
-        default=10, ge=1, le=300,
-        json_schema_extra={
-            "hint": (
-                "等待转发卡片摘要就绪的上限（秒）：超时仍未就绪则记 warning 并放弃本次，"
-                "不掷骰、不写冷却、不投递。"
-            ),
-            "label": "摘要就绪超时（秒）",
-            "order": 15,
-            "step": 1,
-        },
-    )
-
-
 class RepeaterConfig(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     webhook: WebhookSection = Field(default_factory=WebhookSection)
@@ -691,4 +524,3 @@ class RepeaterConfig(PluginConfigBase):
     behavior: BehaviorSection = Field(default_factory=BehaviorSection)
     context: ContextSection = Field(default_factory=ContextSection)
     scope: ScopeSection = Field(default_factory=ScopeSection)
-    forward: ForwardSection = Field(default_factory=ForwardSection)

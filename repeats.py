@@ -72,10 +72,8 @@ def normalize_repeat_text(text: Any) -> str:
 def message_segments(raw_message: Any) -> list[Any] | None:
     """从序列化 raw_message 字段里取出段列表。
 
-    **跨域共用**（forwards 域的转发节点解析直接引用本函数，不另起副本，
-    对齐 reactions.GroupCooldown 的跨域共用写法）。hook 侧把它序列化为普通
-    列表；带 "components" 列表的 dict 形态做防御式容忍（防主程序形态漂移）。
-    其余一律按形态不认识处理。
+    hook 侧把它序列化为普通列表；带 "components" 列表的 dict 形态做防御式
+    容忍（防主程序形态漂移）。其余一律按形态不认识处理。
     """
     if isinstance(raw_message, list):
         return raw_message
@@ -369,8 +367,7 @@ def _interrupt_pool(interrupt_texts: Sequence[Any] | None) -> tuple[list[str], b
 def clamp_non_negative(value: Any) -> float:
     """非负 clamp：负数 / 非数字 / None 一律按 0，正数原样返回。
 
-    **跨域共用**（复读域的**出口权重**归一与 forwards 域的转发权重归一、
-    截断上限容错共用本口径，forwards 域直接引用而不另起副本）。
+    供 `normalize_exit_weights` 归一**出口权重**时直接使用（`decide_repeat` 经它间接使用）。
     """
     try:
         number = float(value)
