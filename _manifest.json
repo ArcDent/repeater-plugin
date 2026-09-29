@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "arcdent.repeater-plugin",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "name": "复读插件",
-  "description": "群内复读链接龙达标后，麦麦按出口权重掷骰：复读原文、发打断文本唱反调或沉默；有人给消息贴表情回应后，麦麦按概率跟着贴同款或语义相反的表情；源群出现合并转发后，麦麦按转发权重掷骰自动转发到目标群，或响应对话请求执行请求转发",
+  "description": "群内复读链接龙达标后，麦麦按出口权重掷骰：复读原文、发打断文本唱反调或沉默；有人给消息贴表情回应后，麦麦按概率跟着贴同款或语义相反的表情",
   "author": {
     "name": "arcdent",
     "url": "https://github.com/arcdent"
@@ -29,16 +29,9 @@
   ],
   "capabilities": [
     "maisaka.context.append",
-    "maisaka.proactive.trigger",
     "chat.get_stream_by_group_id",
-    "chat.get_group_streams",
-    "chat.open_session",
-    "message.get_by_id",
-    "send.forward",
     "config.get",
-    "chat.receive.before_process",
-    "maisaka.planner.before_request",
-    "maisaka.planner.after_response"
+    "chat.receive.before_process"
   ],
   "i18n": {
     "default_locale": "zh-CN",

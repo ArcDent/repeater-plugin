@@ -2,6 +2,25 @@
 
 本项目变更记录，格式遵循 Keep a Changelog，语义化版本见 `_manifest.json`。
 
+## [0.9.0] - 2026-09-29
+
+### Removed
+
+- **BREAKING：跨群转发域完整移除**：删除 `forwards/` 子包（转发源消息解析、节点转换、自动路径掷骰、摘要就绪、决策票、状态与文案，以及整包移植的请求转发链路）、`forward_detector` Hook、`request_cross_group_forward` 与 `decide_forward_delivery` 两个 Tool、三个 `maisaka.planner.*` Hook 及转发专属的摘要轮询、投递编舞、目标群可用性校验、转发内容注入、转发留痕注入与强制发言。复读与表情回应两个行为域不受影响，行为不变。
+- **BREAKING：删除 `[forward]` 配置段**：`ForwardSection` 模型与全部 WebUI 字段、默认 `config.toml` 的 `[forward]` 段一并删除；旧 `config.toml` 里保留的 `[forward]` 段不影响加载，但不再有任何效果。
+- **BREAKING：manifest 不再声明七项转发专属能力**（`maisaka.proactive.trigger`、`chat.get_group_streams`、`chat.open_session`、`message.get_by_id`、`send.forward`、`maisaka.planner.before_request`、`maisaka.planner.after_response`）。
+- 转发专属测试（`tests/test_plugin_forward.py`、`tests/test_forwards_*.py` 与 `tests/forwards/**`）随实现退役；新增 `tests/test_forward_retirement.py` 作为退役回归，断言组件、配置与能力面不再含转发项，且普通合并转发进入消息路径不产生任何转发副作用。
+
+### Changed
+
+- `plugin.config_version` 1.4.0 → 1.5.0（删除整个 `[forward]` 段，主程序按结构版本重建 `config.toml` 骨架并保留剩余两域的用户值）；manifest 版本 0.8.0 → 0.9.0；`pyrightconfig.json` 的检查范围不再包含 `forwards`。
+- 转发域的持久化账本、日志与既有线上数据不在本次清理范围：插件不再读写转发状态，历史数据由部署者按需处理。
+
+### 部署注意
+
+- 转发功能不再由本插件提供，改由独立插件承担：同级新项目 `maimai-courier-plugin`（「麦麦搬运喵」）——该插件**尚未验收、当前无可部署版本**，本插件不对其行为作任何承诺；升级后请先确认不再需要旧转发能力，再按该插件自己的文档部署。
+- 旧 `[forward]` 配置不再生效、无需迁移；升级后请检查插件组件清单与日志中不再出现转发 Hook / Tool / 后台任务，确认退役生效。
+
 ## [0.8.0] - 2026-09-27
 
 ### Removed
