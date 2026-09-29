@@ -7,9 +7,8 @@ import re
 from pathlib import Path
 
 import pytest
-from repeater_plugin.forwards.request.config import adapt_forward_config
 
-from config import ForwardSection, RepeaterConfig
+from config import RepeaterConfig
 
 try:
     import tomllib
@@ -74,7 +73,6 @@ def test_all_sections_present():
         "behavior",
         "context",
         "scope",
-        "forward",
     ):
         assert getattr(config, section) is not None
 
@@ -100,10 +98,10 @@ def test_context_section_accepts_overrides():
     assert cfg.context.self_display_name == "麦麦"
 
 
-def test_config_version_updated_to_1_4_0():
-    """config_version 是配置结构版本：删除两个跨群转发字段时从 1.3.0 升到 1.4.0。"""
+def test_config_version_updated_to_1_5_0():
+    """config_version 是配置结构版本：删除整个跨群转发域时从 1.4.0 升到 1.5.0。"""
     cfg = RepeaterConfig()
-    assert cfg.plugin.config_version == "1.4.0"
+    assert cfg.plugin.config_version == "1.5.0"
 
 
 def test_repeat_section_defaults():
@@ -144,104 +142,6 @@ def test_scope_ignore_senders_defaults_empty():
     assert cfg.scope.ignore_senders == []
 
 
-# ---- 跨群转发域配置（design D6）----
-
-def test_forward_section_defaults():
-    """[forward] 节默认值与 design D6 表逐项一致（独立字面量，不引自实现）。
-
-    转发域默认关闭（enabled=False）：升级后不配置即是「装了但不动」。
-    """
-    cfg = RepeaterConfig()
-    assert cfg.forward.enabled is False
-    assert cfg.forward.mode == "direct"
-    assert cfg.forward.auto_enabled is True
-    assert cfg.forward.request_enabled is True
-    assert cfg.forward.summary_timeout_seconds == 10
-    assert cfg.forward.source_groups == []
-    assert cfg.forward.target_groups == []
-    assert cfg.forward.weight_send == 30
-    assert cfg.forward.weight_silence == 70
-    assert cfg.forward.dedup_ttl_seconds == 1800
-    assert cfg.forward.cooldown_seconds == 60
-    assert cfg.forward.target_cooldown_seconds == 60
-    assert cfg.forward.delay_min_seconds == 0.5
-    assert cfg.forward.delay_max_seconds == 2.0
-    assert cfg.forward.trigger_target_planner is True
-    assert cfg.forward.inject_max_chars == 800
-
-
-def test_forward_section_no_legacy_trigger_source_planner():
-    """删字段回归：入口提示固化开启，`trigger_source_planner` 不再存在（BREAKING）。
-
-    源群 Planner 入口提示自本版起随 `request_enabled` 固化开启，不再有独立
-    开关；旧 `config.toml` 残留该行时由配置层忽略（见兼容用例）。
-    """
-    cfg = RepeaterConfig()
-    assert not hasattr(cfg.forward, "trigger_source_planner")
-
-
-def test_forward_section_no_legacy_view_failure_threshold():
-    """删字段回归：查看失败降级阈值不再存在，字段数收敛为 16（BREAKING）。
-
-    查看失败（消息在等待窗口内不可见或内容取不到）自本版起首次即用摘要
-    降级，不再有可配置的连续失败计数。字段数 18 → 16 一并钉死：本地测试
-    替身不保留 pydantic 的 `model_fields`，退化为注解清单（与
-    `test_config_toml_forward_key_order_mirrors_model_order` 同口径）。
-    """
-    cfg = RepeaterConfig()
-    assert not hasattr(cfg.forward, "view_failure_fallback_threshold")
-    model_fields = getattr(ForwardSection, "model_fields", None)
-    names = (
-        list(model_fields)
-        if isinstance(model_fields, dict)
-        else [name for name in ForwardSection.__annotations__ if not name.startswith("__")]
-    )
-    assert len(names) == 16
-
-
-def test_forward_section_is_exported():
-    """seam：`config.ForwardSection` 是模块导出类，根配置挂载的是同一个类。"""
-    assert isinstance(RepeaterConfig().forward, ForwardSection)
-
-
-def test_forward_list_fields_are_independent_per_instance():
-    """source/target 群列表是可变列表，两个实例不得共享同一份默认值。"""
-    first, second = RepeaterConfig(), RepeaterConfig()
-    first.forward.source_groups.append("10001")
-    first.forward.target_groups.append("20002")
-    assert second.forward.source_groups == []
-    assert second.forward.target_groups == []
-
-
-def test_forward_delay_window_is_ordered():
-    """转发延迟区间语义与其余延迟字段一致：最小不超过最大。"""
-    cfg = RepeaterConfig()
-    assert cfg.forward.delay_min_seconds <= cfg.forward.delay_max_seconds
-
-
-def test_forward_config_rejects_negative_numbers():
-    """负权重 / 负数冷却不得生效：数值字段以 ge 下界声明非负，真实 SDK 的 pydantic
-    校验层直接拒绝（本机对真实 maibot_sdk 实测为 ValidationError，ValidationError
-    是 ValueError 子类）；fake SDK 对齐这条校验，防止「负值悄悄按负值生效」在本地
-    测试里被放行。运行时另有非负 clamp 兜底（forwards.auto，第 2 组）。
-    """
-    with pytest.raises(ValueError):
-        RepeaterConfig(forward={"weight_send": -5})
-    with pytest.raises(ValueError):
-        RepeaterConfig(forward={"cooldown_seconds": -1})
-    with pytest.raises(ValueError):
-        RepeaterConfig(forward={"delay_min_seconds": -0.5})
-
-
-def test_forward_summary_timeout_rejects_out_of_range():
-    """摘要就绪超时以 ge=1, le=300 声明：0 与 301 都必须被配置校验拒绝（与
-    repeat 域数值字段的 ge= 口径同构）。"""
-    with pytest.raises(ValueError):
-        RepeaterConfig(forward={"summary_timeout_seconds": 0})
-    with pytest.raises(ValueError):
-        RepeaterConfig(forward={"summary_timeout_seconds": 301})
-
-
 @pytest.mark.skipif(tomllib is None, reason="需要 Python 3.11+ 的 tomllib")
 def test_config_toml_repeat_defaults_match_design():
     """[repeat] 节与 [plugin].config_version 的 toml 默认值与 design D2 表逐项一致（独立字面量）；scope.ignore_senders 的默认空列表一并在此钉死（与 config.py 默认同口径，防 toml 侧漂移）。"""
@@ -249,7 +149,7 @@ def test_config_toml_repeat_defaults_match_design():
         raw = tomllib.load(fp)
     repeat = raw.get("repeat")
     assert isinstance(repeat, dict), "config.toml 缺少 [repeat] 节"
-    assert raw["plugin"]["config_version"] == "1.4.0"
+    assert raw["plugin"]["config_version"] == "1.5.0"
     assert repeat["enabled"] is True
     assert repeat["window_seconds"] == 120
     assert repeat["threshold"] == 3
@@ -265,106 +165,6 @@ def test_config_toml_repeat_defaults_match_design():
     assert repeat["max_text_length"] == 200
     assert repeat["max_chains"] == 2000
     assert raw["scope"]["ignore_senders"] == []
-
-
-@pytest.mark.skipif(tomllib is None, reason="需要 Python 3.11+ 的 tomllib")
-def test_config_toml_forward_defaults_match_design():
-    """[forward] 节的 toml 默认值与 design D6 表逐项一致（独立字面量，防 toml 侧漂移）。
-
-    字段全集一并在此钉死：config.toml 多写废弃键或漏写新键都会红。
-    """
-    with CONFIG_TOML.open("rb") as fp:
-        raw = tomllib.load(fp)
-    forward = raw.get("forward")
-    assert isinstance(forward, dict), "config.toml 缺少 [forward] 节"
-    assert set(forward) == {
-        "enabled",
-        "mode",
-        "auto_enabled",
-        "request_enabled",
-        "source_groups",
-        "target_groups",
-        "weight_send",
-        "weight_silence",
-        "dedup_ttl_seconds",
-        "summary_timeout_seconds",
-        "cooldown_seconds",
-        "target_cooldown_seconds",
-        "delay_min_seconds",
-        "delay_max_seconds",
-        "trigger_target_planner",
-        "inject_max_chars",
-    }
-    assert forward["enabled"] is False
-    assert forward["mode"] == "direct"
-    assert forward["auto_enabled"] is True
-    assert forward["request_enabled"] is True
-    assert forward["source_groups"] == []
-    assert forward["target_groups"] == []
-    assert forward["weight_send"] == 30
-    assert forward["weight_silence"] == 70
-    assert forward["dedup_ttl_seconds"] == 1800
-    assert forward["summary_timeout_seconds"] == 10
-    assert forward["cooldown_seconds"] == 60
-    assert forward["target_cooldown_seconds"] == 60
-    assert forward["delay_min_seconds"] == 0.5
-    assert forward["delay_max_seconds"] == 2.0
-    assert forward["trigger_target_planner"] is True
-    assert forward["inject_max_chars"] == 800
-
-
-def test_config_toml_forward_new_keys_have_chinese_comments():
-    """[forward] 段四个新字段各自紧邻一行中文注释（部署时改配置能看懂取值含义）。
-
-    只做文本行扫描、不用 tomllib，故不挂 skipif：Python 3.10 下同样可收集。
-    """
-    text = CONFIG_TOML.read_text(encoding="utf-8")
-    lines = text.splitlines()
-    start = lines.index("[forward]")
-    end = next(
-        (i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("[")),
-        len(lines),
-    )
-    section = lines[start + 1 : end]
-    for key in ("mode", "auto_enabled", "request_enabled", "summary_timeout_seconds"):
-        key_idx = next(
-            (i for i, line in enumerate(section) if re.match(rf"\s*{key}\s*=", line)),
-            None,
-        )
-        assert key_idx is not None, f"[forward] 段缺少 {key} 行"
-        comment_lines = []
-        cursor = key_idx - 1
-        while cursor >= 0 and section[cursor].lstrip().startswith("#"):
-            comment_lines.append(section[cursor])
-            cursor -= 1
-        assert comment_lines, f"[forward].{key} 上一行不是注释"
-        assert any(re.search(r"[\u4e00-\u9fff]", comment) for comment in comment_lines), (
-            f"[forward].{key} 的注释不含中文: {comment_lines!r}"
-        )
-
-
-def test_config_toml_forward_key_order_mirrors_model_order():
-    """[forward] 段的 toml 行序与 `ForwardSection` 的字段声明序一致（声明序即 webui `order` 编号序）。
-
-    文本行扫描即可，不用 tomllib：测试替身不保留 `json_schema_extra`，
-    `order` 在运行时不可读，声明序是等价且可读的口径。
-    """
-    text = CONFIG_TOML.read_text(encoding="utf-8")
-    lines = text.splitlines()
-    start = lines.index("[forward]")
-    end = next(
-        (i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("[")),
-        len(lines),
-    )
-    toml_order = [
-        match.group(1)
-        for line in lines[start + 1 : end]
-        if (match := re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", line))
-    ]
-    model_order = [
-        name for name in ForwardSection.__annotations__ if not name.startswith("__")
-    ]
-    assert toml_order == model_order
 
 
 @pytest.mark.skipif(tomllib is None, reason="需要 Python 3.11+ 的 tomllib")
@@ -386,9 +186,12 @@ def test_config_toml_matches_model_defaults():
 
 
 LEGACY_FORWARD_TOML = """
-# 旧版 config.toml 的 [forward] 段：含两个已删除字段的残留行。
+# 旧版 config.toml 残留：v0.8.0 的整段 [forward]（含两个已删字段）与自定义复读设置。
 [forward]
 enabled = true
+mode = "direct"
+auto_enabled = true
+request_enabled = true
 source_groups = ["10001"]
 target_groups = ["20001"]
 weight_send = 30
@@ -402,53 +205,45 @@ trigger_source_planner = false
 trigger_target_planner = true
 view_failure_fallback_threshold = 5
 inject_max_chars = 600
-mode = "direct"
-auto_enabled = true
-request_enabled = true
 summary_timeout_seconds = 10
+
+[repeat]
+window_seconds = 90
+weight_repeat = 90
+weight_interrupt = 10
+weight_silence = 0
 """
 
 
 @pytest.mark.skipif(tomllib is None, reason="需要 Python 3.11+ 的 tomllib")
-def test_legacy_config_residual_forward_fields_load_without_error():
-    """旧配置残留两行已删除字段时，加载必须成功且行为与默认一致。
+def test_legacy_config_residual_forward_section_loads_without_forward_domain():
+    """旧配置整段 [forward] 残留时：加载成功、转发域不进有效配置、剩余域值保留。
 
-    真实 SDK 的 pydantic 基类按未知字段忽略（design D4）；本地测试替身会把
-    未知关键字写成不被生产代码读取的惰性属性。因此本用例同时断言「解析加载
-    不抛异常」「旧配置里的有效字段照常生效」「派生出的运行时视图与不含残留
-    行的同值配置逐字段相等」，把「残留被忽略」钉在可观测行为上。
+    替身与真实 SDK 同口径（pydantic 默认 ``extra="ignore"``）：未知键直接丢弃，
+    不落成实例属性。本用例据此把「残留被忽略」钉在实例面（``hasattr`` 为假）
+    与剩余域值上；声明面（模型字段集合不含 forward）由
+    test_forward_retirement.py 的配置面断言覆盖。
     """
     assert tomllib is not None
-    legacy_raw = tomllib.loads(LEGACY_FORWARD_TOML)
-    legacy_cfg = RepeaterConfig(**legacy_raw)
+    legacy_cfg = RepeaterConfig(**tomllib.loads(LEGACY_FORWARD_TOML))
 
-    assert legacy_cfg.forward.enabled is True
-    assert legacy_cfg.forward.source_groups == ["10001"]
-    assert legacy_cfg.forward.inject_max_chars == 600
-    assert legacy_cfg.forward.trigger_target_planner is True
-
-    modern_cfg = RepeaterConfig(
-        forward={
-            "enabled": True,
-            "source_groups": ["10001"],
-            "target_groups": ["20001"],
-            "cooldown_seconds": 0,
-            "target_cooldown_seconds": 0,
-            "inject_max_chars": 600,
-        }
-    )
-    assert adapt_forward_config(legacy_cfg) == adapt_forward_config(modern_cfg)
+    assert not hasattr(legacy_cfg, "forward")
+    assert legacy_cfg.repeat.window_seconds == 90
+    assert legacy_cfg.repeat.weight_repeat == 90
+    assert legacy_cfg.repeat.weight_interrupt == 10
+    assert legacy_cfg.plugin.config_version == "1.5.0"
 
 
 def test_manifest_version_matches_changelog_head():
-    """manifest version 与最新 CHANGELOG 条目标题一致（0.8.0：删两个转发配置字段 + 占位观测）。
+    """manifest version 与最新 CHANGELOG 条目标题一致（0.9.0：完整移除跨群转发域）。
 
     仓库没有独立的插件版本常量，manifest 的 version 与 CHANGELOG 首条标题是
-    两个独立来源，互为校验；写错任一侧都会红。
+    两个独立来源，互为校验；写错任一侧都会红。本版 CHANGELOG 条目由第 5 组
+    补写，补上之前本用例是已知红。
     """
     with MANIFEST_JSON.open("r", encoding="utf-8") as fp:
         manifest = json.load(fp)
-    assert manifest["version"] == "0.8.0"
+    assert manifest["version"] == "0.9.0"
     changelog = (MANIFEST_JSON.parent / "CHANGELOG.md").read_text(encoding="utf-8")
     head = re.search(r"^## \[([^\]]+)\]", changelog, flags=re.MULTILINE)
     assert head is not None, "CHANGELOG.md 缺少 '## [x.y.z]' 形式的版本条目"
@@ -458,16 +253,14 @@ def test_manifest_version_matches_changelog_head():
 def test_manifest_declares_injection_capabilities():
     """The manifest must declare every capability the injection path consumes.
 
-    注入能力改用包含断言：repeat-and-rebrand 起 capabilities 还声明了复读
-    观测的 chat.receive.before_process（完整集合由 test_plugin.py 的
-    manifest 断言钉死）。
+    注入能力用包含断言：repeat-and-rebrand 起 capabilities 还声明了复读观测的
+    chat.receive.before_process（完整集合由 test_plugin.py 的源码派生断言与
+    test_forward_retirement.py 的整集合等值断言钉死，这里不重复计数）。
     """
     with MANIFEST_JSON.open("r", encoding="utf-8") as fp:
         manifest = json.load(fp)
     capabilities = manifest.get("capabilities")
     assert isinstance(capabilities, list), "_manifest.json 缺少 capabilities 数组"
-    # 本次升级不新增能力，数量保持 11（test_plugin.py 另有消费集合与声明的双向校验）
-    assert len(capabilities) == 11
     assert REQUIRED_CAPABILITIES <= set(capabilities), (
         f"manifest capabilities 漂移: 缺 {REQUIRED_CAPABILITIES - set(capabilities)}"
     )

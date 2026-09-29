@@ -139,7 +139,6 @@ def make_plugin(protocol_responses: dict[str, Any] | None = None) -> RepeaterPlu
     plugin._runner = None
     plugin._site = None
     plugin._tasks = set()
-    plugin._forward_tasks = set()
     plugin._flush_loop_task = None
     plugin._self_qq = ""
     plugin._emoji_action_supported = True
@@ -1288,15 +1287,15 @@ def test_interrupt_outlet_injection_payloads():
 
 MANIFEST_JSON = Path(__file__).resolve().parent.parent / "_manifest.json"
 PLUGIN_PY = Path(__file__).resolve().parent.parent / "plugin.py"
-PLUGIN_ROOT = PLUGIN_PY.parent
-# 能力消费面按整包统计：请求转发链路（forwards/**）直接用 `self._ctx.*` 调
-# capability，只扫 plugin.py 会漏掉 send.forward / chat.open_session 这类声明，
-# 而 Host 授权层缺声明一律拒绝（2026-09-05 事故的同类漂移）。
-PLUGIN_SOURCES = [PLUGIN_PY, *sorted((PLUGIN_ROOT / "forwards").rglob("*.py"))]
+# 能力消费面按生产源码整包统计：转发域退役后运行包只剩 plugin.py 一个模块，
+# 声明漏一个就与 manifest 双向比对失败（Host 授权层缺声明一律拒绝，2026-09-05
+# 事故的同类漂移）。
+PLUGIN_SOURCES = [PLUGIN_PY]
 
 # ctx.logger rides the logging channel, not the capability authorization layer.
 _NON_CAPABILITY_PROXIES = {"logger"}
-# plugin.py 用 self.ctx；forwards/request 的运行时用 self._ctx。
+# plugin.py 用 self.ctx；`_ctx` 是包内历史上用过的 ctx 别名，一并计入扫描面，
+# 免得将来引入别名后这条漂移检查悄悄漏计。
 _CTX_ACCESSORS = {"ctx", "_ctx"}
 
 
@@ -1370,8 +1369,8 @@ def test_manifest_declares_every_consumed_capability():
 
     2026-09-05 线上事故：复读发送走 ctx.send.text 但 manifest 未声明，
     Host 授权层逐次以 E_CAPABILITY_DENIED 拒绝；当时本文件用硬编码等值
-    断言，清单跟着代码一起漏。改为从整包源码（plugin.py + forwards/**）
-    派生消费集合再比对，漏声明与死声明双向都拦。
+    断言，清单跟着代码一起漏。改为从生产源码整包（退役转发域后即
+    plugin.py）派生消费集合再比对，漏声明与死声明双向都拦。
     """
     with MANIFEST_JSON.open("r", encoding="utf-8") as fp:
         manifest = json.load(fp)

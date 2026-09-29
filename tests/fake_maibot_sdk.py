@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-from pathlib import Path
 from typing import Any
 
 CONFIG_RELOAD_SCOPE_SELF = "self"
@@ -68,20 +67,35 @@ class PluginConfigBase:
 
     kwargs 里的 dict 覆盖值自动转为对应嵌套 section（对齐真实 maibot_sdk 的
     pydantic 语义，如 ``RepeaterConfig(context={"enabled": True})``），并按
-    ``Field(ge=/le=)`` 声明校验数值边界。
+    ``Field(ge=/le=)`` 声明校验数值边界；未在注解里声明的键按 pydantic 默认的
+    ``extra="ignore"`` 直接丢弃（旧配置残留的 [forward] 段走这条路径）。
     """
 
     def __init__(self, **kwargs: Any) -> None:
-        annotations: dict[str, Any] = getattr(self.__class__, "__annotations__", {})
+        declared = config_field_names(type(self))
         for key, value in kwargs.items():
+            if key not in declared:
+                continue
             default = getattr(type(self), key, None)
             if isinstance(default, PluginConfigBase) and isinstance(value, dict):
                 value = type(default)(**value)
             _check_field_bounds(type(self), key, value)
             setattr(self, key, value)
-        for key in annotations:
+        for key in declared:
             if key not in kwargs:
                 setattr(self, key, copy.deepcopy(getattr(type(self), key, None)))
+
+
+def config_field_names(model: type) -> list[str]:
+    """配置模型的字段名：真实 SDK（pydantic）读 `model_fields`，本替身退化为注解清单。
+
+    两者都只反映**声明面**；替身构造时也只接受这里列出的键（未知键按真实
+    pydantic 的 ``extra="ignore"`` 丢弃），`hasattr` 断言因此与真实 SDK 同口径。
+    """
+    fields = getattr(model, "model_fields", None)
+    if isinstance(fields, dict):
+        return list(fields)
+    return [name for name in model.__annotations__ if not name.startswith("__")]
 
 
 def Field(
@@ -156,20 +170,17 @@ class MaiBotPlugin:
 class FakeSendCapability:
     """ctx.send 替身（design D8）：记录每次调用供断言，不做真实校验。
 
-    对齐真实 SDK 的 SendCapability.text / forward 签名（maibot_sdk/capabilities/
-    send.py）。raise_on_text 置为异常实例时每次 text 调用都抛出（失败注入）；
-    text_result 控制 text 返回值（True/False，或 SendResult 形态的 dict），默认
-    成功 True。forward 的失败注入用 fail_forward_next，或用 forward_result
-    覆盖返回值；未覆盖时按 return_details 生成与真实 SDK 同形的结果。
+    对齐真实 SDK 的 SendCapability.text 签名（maibot_sdk/capabilities/send.py）。
+    raise_on_text 置为异常实例时每次 text 调用都抛出（失败注入）；text_result
+    控制 text 返回值（True/False，或 SendResult 形态的 dict），默认成功 True。
+    `send.forward` 随转发域退役：不再提供该入口，转发发送改由协议端调用记录
+    （`FakePluginContext.host_calls`）与插件 `protocol_calls` 观察。
     """
 
     def __init__(self) -> None:
         self.text_calls: list[dict[str, Any]] = []
         self.raise_on_text: BaseException | None = None
         self.text_result: Any = True
-        self.forward_calls: list[dict[str, Any]] = []
-        self.fail_forward_next = False
-        self.forward_result: Any = None
 
     async def text(
         self,
@@ -186,44 +197,16 @@ class FakeSendCapability:
             raise self.raise_on_text
         return self.text_result
 
-    async def forward(
-        self,
-        messages: list[dict[str, Any]],
-        stream_id: str,
-        *,
-        return_details: bool = False,
-        **kwargs: Any,
-    ) -> Any:
-        self.forward_calls.append(
-            {
-                "messages": messages,
-                "stream_id": stream_id,
-                "return_details": return_details,
-                **kwargs,
-            }
-        )
-        if self.fail_forward_next:
-            return {"sent": False, "message_id": None, "error": "模拟转发发送失败"}
-        if self.forward_result is not None:
-            return self.forward_result
-        if return_details:
-            return {"sent": True, "message_id": f"forward-{len(self.forward_calls)}"}
-        return True
-
 
 class FakeMaisakaContextCapability:
     """ctx.maisaka.context 替身（对齐 maibot_sdk/capabilities/maisaka.py 的 append 签名）。
 
-    记录每次调用的全部参数供断言；fail_next 置 True 时返回
-    ``{"success": False}``（注入失败语义是不抛异常、返回失败信封）。传入
-    ``events`` 时额外追加 ``context.append:<source_kind>`` 时间线标记，供跨替身
-    断言调用顺序（与 tests/forwards/request/support.py 同款写法）。
+    记录每次调用的全部参数供断言：两域注入测试据此核对 source_kind 与文案；
+    转发退役回归据此断言「没有任何 forward / forward_action 注入」。
     """
 
-    def __init__(self, events: list[str] | None = None) -> None:
+    def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
-        self.fail_next = False
-        self.events = events
 
     async def append(
         self,
@@ -245,23 +228,18 @@ class FakeMaisakaContextCapability:
                 **kwargs,
             }
         )
-        if self.events is not None:
-            self.events.append(f"context.append:{source_kind}")
-        return {"success": not self.fail_next, "index": len(self.calls) - 1}
+        return {"success": True, "index": len(self.calls) - 1}
 
 
 class FakeMaisakaProactiveCapability:
     """ctx.maisaka.proactive 替身（对齐真实 SDK 的 trigger 签名）。
 
-    fail_next 置 True 时返回 ``{"success": False, "error": ...}``，供
-    「强制发言触发失败」路径断言；传入 ``events`` 时追加 ``proactive.trigger``
-    时间线标记。
+    转发域退役后本插件不再调用主动任务（manifest 已撤销授权），保留为**记录型
+    tripwire**：任何一层重新触发源 / 目标群 Planner 都会落进 calls 并被断言抓到。
     """
 
-    def __init__(self, events: list[str] | None = None) -> None:
+    def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
-        self.fail_next = False
-        self.events = events
 
     async def trigger(
         self,
@@ -283,54 +261,31 @@ class FakeMaisakaProactiveCapability:
                 **kwargs,
             }
         )
-        if self.events is not None:
-            self.events.append("proactive.trigger")
-        if self.fail_next:
-            return {"success": False, "error": "模拟主动任务失败"}
         return {"success": True, "queued": True, "task_id": f"task-{len(self.calls)}"}
 
 
 class FakeMaisakaCapability:
-    """ctx.maisaka 替身：context / proactive 两个子能力入口（同真实 SDK 的组合结构）。"""
+    """ctx.maisaka 替身：context / proactive 两个子能力入口（同真实 SDK 的组合结构）。
 
-    def __init__(self, events: list[str] | None = None) -> None:
-        self.context = FakeMaisakaContextCapability(events)
-        self.proactive = FakeMaisakaProactiveCapability(events)
+    只为生产实际使用的一层入口留替身（`context.append` / `proactive.trigger`）；
+    无消费者的顶层快捷转发方法不保留。
+    """
 
-    async def append_context(
-        self,
-        stream_id: str,
-        segments: list[dict[str, Any]],
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        return await self.context.append(stream_id, segments, **kwargs)
-
-    async def trigger_proactive(
-        self,
-        stream_id: str,
-        intent: str,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        return await self.proactive.trigger(stream_id, intent, **kwargs)
+    def __init__(self) -> None:
+        self.context = FakeMaisakaContextCapability()
+        self.proactive = FakeMaisakaProactiveCapability()
 
 
 class FakeMessageCapability:
     """ctx.message 替身（对齐真实 SDK message.get_by_id 签名）。
 
-    results 按消息 ID 预置返回值，未命中回落 default_result（默认 None，
-    对齐 before_process 时消息尚未落库的时序）；sequences 按消息 ID 预置
-    「第 N 次调用返回什么」的队列（就绪轮询测试用：前两次 None、第三次就绪），
-    队列耗尽后回落 results / default_result；fail_next 时返回 None。
+    转发域退役后本插件不再查询消息（摘要就绪轮询已删、manifest 已撤销
+    `message.get_by_id` 授权），保留为**记录型 tripwire**：任何重新查询都会落进
+    calls 并被断言抓到。
     """
 
-    def __init__(self, sequences: dict[Any, list[Any]] | None = None) -> None:
+    def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
-        self.results: dict[str, Any] = {}
-        self.default_result: Any = None
-        self.fail_next = False
-        self.sequences: dict[str, list[Any]] = {
-            str(message_id): list(values) for message_id, values in (sequences or {}).items()
-        }
 
     async def get_by_id(
         self,
@@ -350,32 +305,24 @@ class FakeMessageCapability:
                 **kwargs,
             }
         )
-        if self.fail_next:
-            return None
-        queue = self.sequences.get(str(message_id))
-        if queue:
-            return queue.pop(0)
-        return self.results.get(str(message_id), self.default_result)
+        return None
 
 
 class FakeChatCapability:
     """ctx.chat 替身（对齐真实 SDK 的 chat capability 三个方法签名）。
 
-    group_streams 是预设的群聊流列表（返回副本，防调用方原地改写）；calls 记录
-    每次调用（method + 参数）供「缓存新鲜时不重复查询」类断言；fail_next 时
-    查询返回 None、open_session 也返回 None（不可达语义，由调用方决定放行或
-    记 warning）。
+    `group_streams` 是预设的群聊流列表（返回副本，防调用方原地改写）；
+    `get_stream_by_group_id` 按群号首匹配（与 Host 会话列表口径一致）；
+    `get_group_streams` / `open_session` 在转发域退役后已无生产消费者，保留为
+    **记录型 tripwire**：任何群列表刷新或建流调用都会落进 calls 并被断言抓到。
     """
 
     def __init__(self) -> None:
         self.group_streams: list[dict[str, Any]] = []
         self.calls: list[dict[str, Any]] = []
-        self.fail_next = False
 
-    async def get_group_streams(self, platform: str = "qq") -> list[dict[str, Any]] | None:
+    async def get_group_streams(self, platform: str = "qq") -> list[dict[str, Any]]:
         self.calls.append({"method": "get_group_streams", "platform": platform})
-        if self.fail_next:
-            return None
         return [dict(stream) for stream in self.group_streams]
 
     async def get_stream_by_group_id(
@@ -386,8 +333,6 @@ class FakeChatCapability:
         self.calls.append(
             {"method": "get_stream_by_group_id", "group_id": str(group_id), "platform": platform}
         )
-        if self.fail_next:
-            return None
         for stream in self.group_streams:
             if str(stream.get("group_id") or "") == str(group_id):
                 return dict(stream)
@@ -402,8 +347,6 @@ class FakeChatCapability:
         user_id: str = "",
         **kwargs: Any,
     ) -> dict[str, Any] | None:
-        """按群号建流并追加进预设列表（真实 SDK 的 open_session 成功解包形态）。"""
-
         self.calls.append(
             {
                 "method": "open_session",
@@ -413,31 +356,20 @@ class FakeChatCapability:
                 "user_id": str(user_id),
             }
         )
-        if self.fail_next:
-            return None
-        session_id = f"opened-{group_id or user_id}"
-        stream = {
-            "platform": platform,
-            "group_id": str(group_id),
-            "user_id": str(user_id),
-            "stream_id": session_id,
-            "session_id": session_id,
-            "is_group_session": chat_type == "group",
-            "chat_type": chat_type,
-        }
-        self.group_streams.append(stream)
-        return dict(stream)
+        return None
 
 
 class FakeConfigCapability:
-    """ctx.config 替身（对齐真实 SDK 的 ``config.get(key, default)`` 签名）。"""
+    """ctx.config 替身（对齐真实 SDK 的 ``config.get(key, default)`` 签名）。
+
+    调用不计数也不记录：生产读配置不产生可观测副作用，转发退役回归只断言
+    「没有转发面调用」，不需要 config.get 的次数。
+    """
 
     def __init__(self) -> None:
         self.values: dict[str, Any] = {}
-        self.get_calls = 0
 
     async def get(self, key: str, default: Any = None) -> Any:
-        self.get_calls += 1
         return self.values.get(key, default)
 
 
@@ -445,7 +377,7 @@ class FakeLogger:
     """logging.Logger 接口形态的替身：记录 (level, 文本) 便于断言。
 
     warning 等方法按标准 logging 签名收 *args/**kwargs：生产侧调用点既有
-    %-style 参数形态（forwards/request 包），也有 exc_info= 形态，替身必须兼容。
+    %-style 参数形态，也有 exc_info= 形态，替身必须兼容。
     """
 
     def __init__(self) -> None:
@@ -470,46 +402,27 @@ class FakeLogger:
         return [message for lvl, message in self.records if lvl == level]
 
 
-class FakePluginPaths:
-    """ctx.paths 替身：请求转发状态与调试统计文件落在 data_dir 下。"""
-
-    def __init__(self, data_dir: Any) -> None:
-        self.data_dir = Path(data_dir)
-        self.runtime_dir = self.data_dir / "runtime"
-
-
 class FakePluginContext:
-    """PluginContext 替身：装配本插件在转发域消费的全部 capability 面。
+    """记录型 PluginContext 替身：装配本插件消费的 capability 面并记录每次调用。
 
-    plugin.py 的转发域接线与 `forwards.request.ForwardingRuntime` 共用同一只
-    ctx（logger / config / paths / chat / message / send / maisaka /
-    call_host_method）。`call_host_method("cap.call")` 走真实 SDK 的受限原始
-    通道形态，这里把 ``send.forward`` 调用转给 `self.send.forward` 并用
-    host_calls 记录每次原始调用。
+    logger / config / chat / message / send / maisaka 与真实 SDK 同形，
+    `call_host_method` 走真实 SDK 的受限原始通道形态并原样记录。消费者是
+    `tests/test_forward_retirement.py`（据此断言这些调用全部为零）与
+    `tests/test_fake_maibot_sdk.py`（证明「发生了就一定被记到」）；两域行为测试
+    用 `tests/test_plugin.py` 内的本地替身，不经这里。
     """
 
-    def __init__(self, data_dir: Any, events: list[str] | None = None) -> None:
+    def __init__(self) -> None:
         self.logger = FakeLogger()
         self.config = FakeConfigCapability()
-        self.paths = FakePluginPaths(data_dir)
         self.chat = FakeChatCapability()
         self.message = FakeMessageCapability()
         self.send = FakeSendCapability()
-        self.events: list[str] = [] if events is None else events
-        self.maisaka = FakeMaisakaCapability(self.events)
+        self.maisaka = FakeMaisakaCapability()
         self.host_calls: list[dict[str, Any]] = []
-        self.host_call_result: Any = None
 
     async def call_host_method(self, method: str, **kwargs: Any) -> Any:
         self.host_calls.append({"method": method, **kwargs})
-        if self.host_call_result is not None:
-            return self.host_call_result
-        payload = kwargs.get("payload")
-        if isinstance(payload, dict) and payload.get("capability") == "send.forward":
-            args = dict(payload.get("args") or {})
-            messages = args.pop("messages", [])
-            stream_id = args.pop("stream_id", "")
-            return await self.send.forward(messages, stream_id, **args)
         return {"success": True}
 
 
