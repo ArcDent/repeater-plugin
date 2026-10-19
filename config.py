@@ -1,8 +1,6 @@
 """复读插件 — 配置模型。
 
-覆盖两个行为域：**复读**（**复读链**达标后按**出口权重**掷骰选中**复读**、
-**打断**或沉默）与**表情回应**（按概率**跟风**或**反义回应**）。字段默认值
-须与 config.toml 逐项一致（项目铁律）。术语见 CONTEXT.md。
+覆盖复读与表情回应两个行为域。字段默认值须与 config.toml 逐项一致（项目铁律）。
 """
 
 from __future__ import annotations
@@ -22,7 +20,7 @@ class PluginSection(PluginConfigBase):
         default=True,
         description="是否启用本插件。",
         json_schema_extra={
-            "hint": "插件总开关，关闭后复读与表情回应两个域全部停用（不再拦截、不发送、不贴表情）。",
+            "hint": "插件总开关，关闭后复读与表情回应全部停用。",
             "label": "启用插件",
             "order": 0,
         },
@@ -83,8 +81,7 @@ class ProtocolSection(PluginConfigBase):
         default="",
         json_schema_extra={
             "hint": (
-                "协议端 OneBot HTTP 地址，如 http://maim-bot-snowluma:3000。"
-                "贴表情动作 set_msg_emoji_like 直调该地址，不填则插件不做任何动作。"
+                "协议端 OneBot HTTP 地址。不填时复读整体停用（不拦截、不发送），贴表情也无法执行。"
             ),
             "label": "OneBot HTTP 地址",
             "order": 0,
@@ -121,10 +118,7 @@ class BandwagonSection(PluginConfigBase):
     probability: float = Field(
         default=0.25, ge=0.0, le=1.0,
         json_schema_extra={
-            "hint": (
-                "有人给他人消息贴表情时，麦麦决定回应的概率（回应骰）。"
-                "回应后若表情命中反义映射，再掷反义概率决定贴反义还是同款。0 = 从不回应。"
-            ),
+            "hint": "有人给他人消息贴表情时麦麦决定回应的概率，0 = 从不回应。",
             "label": "回应概率（他人消息）",
             "order": 0,
             "step": 0.05,
@@ -134,8 +128,7 @@ class BandwagonSection(PluginConfigBase):
         default=0.12, ge=0.0, le=1.0,
         json_schema_extra={
             "hint": (
-                "有人给麦麦自己发的消息贴表情时，麦麦决定回应的概率。"
-                "建议低于他人消息的概率，自己给自己的消息点赞观感较差。"
+                "有人给麦麦自己的消息贴表情时的回应概率，建议低于他人消息的概率。"
             ),
             "label": "回应概率（麦麦自己的消息）",
             "order": 1,
@@ -159,11 +152,7 @@ class OppositeSection(PluginConfigBase):
     probability: float = Field(
         default=0.35, ge=0.0, le=1.0,
         json_schema_extra={
-            "hint": (
-                "回应骰掷中后，命中反义映射的表情贴出相反表情（而非同款）的概率。"
-                "先按跟风概率决定是否回应，回应后才掷本概率决定反义还是同款，"
-                "掷不中贴同款；填 0 则命中反义映射的表情也只会贴同款。"
-            ),
+            "hint": "回应骰掷中后，命中反义映射的表情贴出相反表情的概率；掷不中贴同款，0 = 只贴同款。",
             "label": "反义回应概率",
             "order": 1,
             "step": 0.05,
@@ -172,11 +161,7 @@ class OppositeSection(PluginConfigBase):
     include_defaults: bool = Field(
         default=True,
         json_schema_extra={
-            "hint": (
-                "是否加载内置反义映射（👍↔👎、❤↔💔、😂↔😭、😄↔😡、✅↔❌、"
-                "🔥↔❄、⬆↔⬇、😍↔🤢、😈↔😇、🤮↔😋、🥶↔🥵、☀↔🌧、🚀↔🐢、"
-                "😊↔😠、🎉↔😢、➕↔➖）。"
-            ),
+            "hint": "是否加载内置反义映射（16 对，见 docs/emoji-id-reference.md）。",
             "label": "使用内置反义映射",
             "order": 2,
         },
@@ -220,7 +205,7 @@ class RepeatSection(PluginConfigBase):
     window_seconds: int = Field(
         default=120, ge=1, le=3600,
         json_schema_extra={
-            "hint": "滚动窗口：窗口内归一后相同的复读文本按口径累积，早于窗口的历史消息随滚动失效。",
+            "hint": "滚动窗口：窗口内归一后相同的复读文本按口径累积，窗口外的历史消息失效。",
             "label": "滚动窗口（秒）",
             "order": 1,
             "step": 10,
@@ -229,7 +214,7 @@ class RepeatSection(PluginConfigBase):
     threshold: int = Field(
         default=3, ge=2, le=50,
         json_schema_extra={
-            "hint": "窗口内计数达到该值时复读链达标，取得一次决策资格；掷骰后（含沉默出口）链即终结。",
+            "hint": "窗口内计数达到该值时复读链达标，取得一次决策资格。",
             "label": "达标阈值",
             "order": 2,
             "step": 1,
@@ -247,10 +232,8 @@ class RepeatSection(PluginConfigBase):
         default=85, ge=0, le=1000,
         json_schema_extra={
             "hint": (
-                "三个出口权重是复读链达标后一次掷骰的三个面，按比例恰好命中一个出口："
-                "复读 / 打断 / 沉默，三者严格互斥。默认 85 / 15 / 0 = 85% 复读、15% 打断、从不沉默。"
-                "三个数只有比例意义，同比例放大等价（如 170 / 30 / 0 与默认分布相同）；"
-                "想恢复偶尔沉默，给沉默权重填正数即可。"
+                "三个出口权重是一次掷骰的三个面（复读 / 打断 / 沉默），按比例恰好命中一个、严格互斥。"
+                "默认 85 / 15 / 0 = 85% 复读、15% 打断、从不沉默；只有比例意义，同比例放大等价。"
             ),
             "label": "复读权重",
             "order": 4,
@@ -260,10 +243,7 @@ class RepeatSection(PluginConfigBase):
     weight_interrupt: int = Field(
         default=15, ge=0, le=1000,
         json_schema_extra={
-            "hint": (
-                "打断出口的权重：命中则从打断文本池随机取一条发出，绝不附带复读文本。"
-                "与复读 / 沉默权重按比例决定同一次掷骰的出口，只有比例意义。"
-            ),
+            "hint": "打断出口的权重：命中则从打断文本池随机取一条发出，绝不附带复读文本。",
             "label": "打断权重",
             "order": 5,
             "step": 5,
@@ -272,11 +252,7 @@ class RepeatSection(PluginConfigBase):
     weight_silence: int = Field(
         default=0, ge=0, le=1000,
         json_schema_extra={
-            "hint": (
-                "沉默出口的权重：命中则不出声，触发消息放行进主程序消息链。"
-                "默认 0 = 从不沉默（链达标必出声，冷却压制期除外）；"
-                "与复读 / 打断权重按比例决定同一次掷骰的出口，只有比例意义。"
-            ),
+            "hint": "沉默出口的权重：命中则不出声，触发消息放行进主程序消息链。0 = 从不沉默。",
             "label": "沉默权重",
             "order": 6,
             "step": 5,
@@ -294,10 +270,7 @@ class RepeatSection(PluginConfigBase):
     delay_min_seconds: float = Field(
         default=0.3, ge=0.0, le=300.0,
         json_schema_extra={
-            "hint": (
-                "复读 / 打断出口命中后发送前的最短等待秒数，避免命中即瞬间发出显得机械；"
-                "与「节奏与限流」里表情回应的延迟互相独立。"
-            ),
+            "hint": "复读 / 打断发送前的最短等待秒数，与表情回应的延迟互相独立。",
             "label": "复读发送延迟下限（秒）",
             "order": 8,
             "step": 0.1,
@@ -306,10 +279,7 @@ class RepeatSection(PluginConfigBase):
     delay_max_seconds: float = Field(
         default=1.5, ge=0.0, le=300.0,
         json_schema_extra={
-            "hint": (
-                "复读 / 打断出口命中后发送前的最大等待秒数，实际等待在最小 / 最大之间随机取；"
-                "小于最小延迟时按最小延迟处理。"
-            ),
+            "hint": "复读 / 打断发送前的最大等待秒数，实际等待在最小 / 最大之间随机取。",
             "label": "复读发送延迟上限（秒）",
             "order": 9,
             "step": 0.1,
@@ -318,10 +288,7 @@ class RepeatSection(PluginConfigBase):
     chain_ttl_seconds: int = Field(
         default=1800, ge=0, le=604800,
         json_schema_extra={
-            "hint": (
-                "链终结标记的保留时长：掷骰后同一复读文本在此时长内不再触发新一轮，"
-                "过期后重新累积可再达标。0 = 不做链终结。"
-            ),
+            "hint": "掷骰后同一复读文本在此时长内不再触发新一轮。0 = 不做链终结。",
             "label": "链终结保留时长（秒）",
             "order": 10,
             "step": 60,
@@ -330,10 +297,7 @@ class RepeatSection(PluginConfigBase):
     cooldown_seconds: int = Field(
         default=120, ge=0, le=86400,
         json_schema_extra={
-            "hint": (
-                "复读专用的群冷却，独立于「节奏与限流」里表情回应的群冷却，互不牵扯。"
-                "冷却期内链达标不掷骰、不消耗决策资格。0 = 不限。"
-            ),
+            "hint": "复读专用的群冷却，与表情回应的群冷却互相独立。0 = 不限。",
             "label": "复读群冷却（秒）",
             "order": 11,
             "step": 5,
@@ -417,10 +381,7 @@ class ContextSection(PluginConfigBase):
     enabled: bool = Field(
         default=False,
         json_schema_extra={
-            "hint": (
-                "实验性功能总开关：开启后表情回应（含麦麦自己的）去重、聚合后"
-                "注入聊天历史，同时拦截主程序消息链上的表情回应通知消息。默认关闭。"
-            ),
+            "hint": "实验性开关：开启后表情回应去重、聚合后注入聊天历史，默认关闭。",
             "label": "启用上下文注入",
             "order": 0,
         },

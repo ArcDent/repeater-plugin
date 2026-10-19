@@ -2,7 +2,7 @@
 
 ## Purpose
 
-让麦麦参与群聊复读：滚动窗口内同一文本被多人接龙达阈值后，按概率复读原文、发打断文本唱反调、或保持沉默；配套链终结防护与门禁冷却。作用对象是普通文本消息，与**表情回应**跟风能力并列。
+让麦麦参与群聊复读：滚动窗口内同一文本被多人接龙达阈值后，按出口权重掷一次骰，在复读原文、发打断文本唱反调与保持沉默中选中一个；配套链终结防护与门禁冷却。作用对象是普通文本消息，与**表情回应**跟风能力并列。
 
 ## Requirements
 
@@ -116,7 +116,7 @@
 
 ### Requirement: 门禁与冷却
 
-复读功能 MUST 复用现有 `scope.group_whitelist`/`group_blacklist` 群白黑名单（黑名单优先）。`scope.ignore_senders` 名单内发送者的消息 MUST NOT 进入复读链。复读 MUST 使用独立于贴表情的群冷却（`repeat.cooldown_seconds`）：冷却期内链达标不消耗决策资格、不掷骰；冷却结束后同文本新发送者加入链可触发决策。沉默权重为 0 时，复读群冷却的压制期 MUST 是触发消息进入主程序消息链的唯一放行口。`plugin.enabled` 关闭时复读功能 MUST 整体停用；`repeat.enabled` 关闭时 MUST 仅停用复读（表情回应跟风不受影响），复读侧的 **planner 拦截**与两路**复读注入**随 `repeat.enabled` 一并停用，且 MUST NOT 受表情回应域 `context.enabled` 开关约束。
+复读功能 MUST 复用现有 `scope.group_whitelist`/`group_blacklist` 群白黑名单（黑名单优先）。`scope.ignore_senders` 名单内发送者的消息 MUST NOT 进入复读链。复读 MUST 使用独立于贴表情的群冷却（`repeat.cooldown_seconds`）：冷却期内链达标不消耗决策资格、不掷骰；冷却结束后同文本新发送者加入链可触发决策。沉默权重为 0 时，复读群冷却的压制期 MUST 是触发消息进入主程序消息链的唯一放行口。`plugin.enabled` 关闭时复读功能 MUST 整体停用；`repeat.enabled` 关闭时 MUST 仅停用复读（表情回应跟风不受影响），复读侧的 **planner 拦截**与两路**复读注入**随 `repeat.enabled` 一并停用，且 MUST NOT 受表情回应域 `context.enabled` 开关约束。`protocol.base_url` 未配置时复读 MUST 同样整体放行（不进链、不掷骰、不拦截、不注入、不写冷却）：复读发不出去时拦截只会让触发消息消失。
 
 #### Scenario: 黑名单群不触发
 - **WHEN** 黑名单群内出现达标复读链
@@ -145,6 +145,10 @@
 #### Scenario: 复读开关关闭不拦截不注入
 - **WHEN** `repeat.enabled=false`，一条本可触发复读出口的消息到达主程序消息链
 - **THEN** 该消息不被拦截，也不产生任何复读注入，即使 `context.enabled` 为 true
+
+#### Scenario: 协议端未配置时整体放行
+- **WHEN** `protocol.base_url` 为空，群内出现本可达标的复读链
+- **THEN** 消息全部照常进入主程序消息链，不拦截、不注入、不写复读冷却；未配置期间的消息不计入复读链
 
 ### Requirement: planner 拦截
 

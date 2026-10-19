@@ -14,9 +14,8 @@ from typing import Any
 from repeater_plugin.repeats import REPEAT
 
 from config import RepeaterConfig
-from plugin import RepeaterPlugin
+from plugin import RepeaterPlugin, create_plugin
 from reactions import BANDWAGON, OPPOSITE, ReactionEvent
-from tests.fake_maibot_sdk import FakeSendCapability
 
 THUMBS_UP = str(ord("👍"))
 THUMBS_DOWN = str(ord("👎"))
@@ -94,7 +93,6 @@ class FakeCtx:
         self.config = FakeConfig()
         self.chat = FakeChat()
         self.maisaka = FakeMaisaka()
-        self.send = FakeSendCapability()
 
 
 class FakeRequest:
@@ -140,8 +138,7 @@ def make_plugin(protocol_responses: dict[str, Any] | None = None) -> RepeaterPlu
     plugin._site = None
     plugin._tasks = set()
     plugin._flush_loop_task = None
-    plugin._self_qq = ""
-    plugin._emoji_action_supported = True
+    plugin._detected_self_qq = ""  # 有效 QQ = 配置值（上面的 BOT_QQ）或启动探测值
     # 主程序配置与聊天流替身：与 event() 默认 group_id="10001" 对齐。
     plugin.ctx.config.values["bot.nickname"] = "麦麦"
     plugin.ctx.chat.streams["10001"] = {
@@ -179,37 +176,6 @@ def event(**overrides: Any) -> ReactionEvent:
 
 def actions_of(plugin: RepeaterPlugin) -> list[str]:
     return [name for name, _ in plugin.protocol_calls]  # type: ignore[attr-defined]
-
-
-# ---- fake ctx.send 替身（design D8）----
-
-def test_fake_send_records_text_calls():
-    """替身契约：记录每次 (text, stream_id) 调用，容忍 return_details 透传。"""
-    send = FakeSendCapability()
-    asyncio.run(send.text("草", "stream-10001"))
-    asyncio.run(send.text("停！", "stream-20002", return_details=True))
-    assert send.text_calls == [
-        {"text": "草", "stream_id": "stream-10001", "return_details": False},
-        {"text": "停！", "stream_id": "stream-20002", "return_details": True},
-    ]
-    assert asyncio.run(send.text("草", "stream-10001")) is True
-
-
-def test_fake_send_supports_failure_injection():
-    send = FakeSendCapability()
-    send.raise_on_text = RuntimeError("boom")
-    try:
-        asyncio.run(send.text("草", "stream-10001"))
-    except RuntimeError as exc:
-        assert str(exc) == "boom"
-    else:
-        raise AssertionError("raise_on_text 应让 text() 抛出注入的异常")
-    # 调用先记录再抛：断言「只尝试一次」时仍能在记录里看到这次调用
-    assert len(send.text_calls) == 1
-
-    send.raise_on_text = None
-    send.text_result = False
-    assert asyncio.run(send.text("草", "stream-10001")) is False
 
 
 # ---- 复读检测（chat.receive.before_process observe Hook）----
@@ -302,6 +268,36 @@ def test_repeat_switch_off_messages_do_not_join_chain():
     mid, final = asyncio.run(scenario())
     assert mid == []
     assert final == ["草"]
+
+
+def test_repeat_passes_through_when_protocol_base_url_missing():
+    """protocol.base_url 未配置：复读整体放行——不拦截、不写冷却、不注入、不进链。
+
+    拦截触发消息是为了防双重发言（ADR 0006），前提是复读发得出去；地址没填时
+    拦了只会让触发消息白白消失，所以与 repeat.enabled=false 同口径放行。
+    """
+    plugin = make_plugin()
+    plugin.config.protocol.base_url = ""
+    plugin.config.repeat.cooldown_seconds = 120
+
+    async def scenario() -> tuple[list[str], list[str]]:
+        actions = []
+        for sender in ("20002", "20003", "20004"):
+            result = await plugin.handle_repeat_message(message=group_message("草", sender))
+            actions.append(result["action"])
+        await drain_spawned(plugin)
+        # 补上地址后只来一个新发送者：若未配置期间的消息进了链，此时计数已满会触发
+        plugin.config.protocol.base_url = "http://protocol.test:3000"
+        result = await plugin.handle_repeat_message(message=group_message("草", "20005"))
+        actions.append(result["action"])
+        await drain_spawned(plugin)
+        return actions, sent_texts(plugin)
+
+    actions, texts = asyncio.run(scenario())
+    assert actions == ["continue"] * 4
+    assert texts == []
+    assert plugin.ctx.maisaka.context.calls == []
+    assert not plugin._repeat_cooldown.is_cooling_down("10001", 120, time.time())
 
 
 def test_blacklisted_group_does_not_trigger_repeat():
@@ -511,7 +507,7 @@ def test_handler_cancelled_error_propagates(monkeypatch):
     """CancelledError 照常上抛：不吞、不记 warning（design D1 兜底的例外）。"""
     plugin = make_plugin()
 
-    async def cancelled_processor(message: Any) -> bool:
+    def cancelled_processor(message: Any) -> bool:
         raise asyncio.CancelledError()
 
     monkeypatch.setattr(plugin, "_process_repeat_message", cancelled_processor)
@@ -781,8 +777,6 @@ def test_direct_send_carries_group_id_and_text_segment():
         {"group_id": 10001, "message": [{"type": "text", "data": {"text": "草"}}]},
         {"group_id": 10001, "message": [{"type": "text", "data": {"text": "停！"}}]},
     ]
-    # 直发彻底替代标准发送链：全程不出现 ctx.send.text
-    assert plugin.ctx.send.text_calls == []
 
 
 def test_silence_outlet_sends_nothing():
@@ -1025,8 +1019,6 @@ def test_direct_send_success_choreography_order(monkeypatch):
     # 行为文本注入仍在直发之后（历史顺序：先触发消息后行为文本）
     assert protocol_pos < second_append
     assert events[-1] == "append"
-    # 直发通路彻底替代标准发送链：全程不出现 ctx.send.text
-    assert plugin.ctx.send.text_calls == []
 
 
 def test_direct_send_waits_for_slow_trigger_injection(monkeypatch):
@@ -1155,7 +1147,6 @@ def test_direct_send_unreachable_stops_after_trigger_injection():
     # 止步于触发消息注入：恰好一条 append（触发消息），无行为文本注入
     assert len(plugin.ctx.maisaka.context.calls) == 1
     assert any("直发失败" in t for t in plugin.ctx.logger.texts("warning"))
-    assert plugin.ctx.send.text_calls == []
 
 
 def test_trigger_injection_stream_missing_still_direct_sends():
@@ -1171,7 +1162,10 @@ def test_trigger_injection_stream_missing_still_direct_sends():
 
     assert asyncio.run(scenario()) == ["草"]
     assert plugin.ctx.maisaka.context.calls == []  # 两路注入都因无 stream 跳过
-    assert any("取不到群" in t for t in plugin.ctx.logger.texts("warning"))
+    assert any(
+        t.startswith("未写入 Maisaka 上下文:") and "原因=取不到 stream" in t
+        for t in plugin.ctx.logger.texts("warning")
+    )
 
 
 def test_append_failure_does_not_block_direct_send_or_intercept():
@@ -1196,7 +1190,11 @@ def test_append_failure_does_not_block_direct_send_or_intercept():
     assert texts == ["草"]  # 注入失败不阻断直发
     calls = plugin.ctx.maisaka.context.calls
     assert [c["source_kind"] for c in calls] == ["repeat_trigger", "repeat"]
-    failed = [t for t in plugin.ctx.logger.texts("warning") if "注入上下文失败" in t]
+    failed = [
+        t
+        for t in plugin.ctx.logger.texts("warning")
+        if t.startswith("未写入 Maisaka 上下文:") and "原因=回执失败" in t
+    ]
     assert len(failed) == 2  # 两路注入各失败一次，无重试
 
 
@@ -1222,7 +1220,11 @@ def test_append_exception_does_not_block_direct_send_or_intercept():
     assert trigger_result["action"] == "abort"
     assert texts == ["草"]
     assert attempted == ["repeat_trigger", "repeat"]  # 各试一次，次数定格
-    failed = [t for t in plugin.ctx.logger.texts("warning") if "注入上下文异常" in t]
+    failed = [
+        t
+        for t in plugin.ctx.logger.texts("warning")
+        if t.startswith("未写入 Maisaka 上下文:") and "原因=调用异常 append 内部异常" in t
+    ]
     assert len(failed) == 2
 
 
@@ -1283,6 +1285,28 @@ def test_interrupt_outlet_injection_payloads():
     assert "草" not in behavior_call["visible_text"]  # 绝不附带复读文本
 
 
+# ---- 组件声明（Host 组件注册表据此登记并派发 Hook）----
+
+def test_components_are_exactly_the_two_before_process_hooks():
+    """组件面恰为两个 blocking Hook：通知 guard 在前（early）、复读检测在后（late）。
+
+    guard 先观察会话并 abort 表情回应通知，复读检测随后才看到其余消息（ADR
+    0003/0006）；元数据里的 handler_name 必须指向真实可调用的方法，Host 按它派发。
+    """
+    plugin = create_plugin()
+    components = {component["name"]: component for component in plugin.get_components()}
+
+    assert set(components) == {"emoji_reaction_notify_guard", "repeat_detector"}
+    for component in components.values():
+        metadata = component["metadata"]
+        assert component["type"] == "HOOK_HANDLER"
+        assert metadata["hook"] == "chat.receive.before_process"
+        assert metadata["mode"] == "blocking"
+        assert callable(getattr(plugin, metadata["handler_name"], None))
+    assert components["emoji_reaction_notify_guard"]["metadata"]["order"] == "early"
+    assert components["repeat_detector"]["metadata"]["order"] == "late"
+
+
 # ---- Manifest（repeat-and-rebrand 改名与新 capability 声明）----
 
 MANIFEST_JSON = Path(__file__).resolve().parent.parent / "_manifest.json"
@@ -1300,7 +1324,11 @@ _CTX_ACCESSORS = {"ctx", "_ctx"}
 
 
 def _ctx_call_capabilities(source: str) -> set[str]:
-    """Collect `self.<ctx|_ctx>...<method>()` call sites as capability names."""
+    """Collect `self.<ctx|_ctx>...<method>()` call sites as capability names.
+
+    三段式直调（`self.ctx.call_host_method(...)` 这类 Host 受限原始通道）同样
+    计入：它不在 manifest 里，一出现就让双向比对判红，不能绕过能力声明。
+    """
     tree = ast.parse(source)
     used: set[str] = set()
 
@@ -1317,7 +1345,7 @@ def _ctx_call_capabilities(source: str) -> set[str]:
         if not isinstance(node, ast.Call):
             continue
         parts = dotted(node.func)
-        if parts is None or len(parts) < 4 or parts[0] != "self":
+        if parts is None or len(parts) < 3 or parts[0] != "self":
             continue
         if parts[1] not in _CTX_ACCESSORS or parts[2] in _NON_CAPABILITY_PROXIES:
             continue
@@ -1453,7 +1481,7 @@ def test_ignored_reactor_is_skipped():
 
 def test_own_reaction_is_skipped():
     plugin = make_plugin()
-    plugin._self_qq = BOT_QQ
+    plugin.config.protocol.self_qq = BOT_QQ
     assert asyncio.run(plugin._evaluate(event(reactor_qq=BOT_QQ))) is None
 
 
@@ -1480,7 +1508,7 @@ def test_cooldown_blocks_second_reaction_in_group():
 def test_opposite_branch_queries_message_author():
     """两级决策下反义表情也要过回应骰，回应骰需要知道原作者是谁。"""
     plugin = make_plugin()
-    plugin._self_qq = BOT_QQ
+    plugin.config.protocol.self_qq = BOT_QQ
     plugin.config.opposite.probability = 1.0
 
     decision = asyncio.run(plugin._evaluate(event(emoji_id=THUMBS_UP)))
@@ -1492,7 +1520,7 @@ def test_opposite_branch_queries_message_author():
 
 def test_bandwagon_on_other_message_uses_main_probability():
     plugin = make_plugin({"get_msg": {"status": "ok", "data": {"sender": {"user_id": "30003"}}}})
-    plugin._self_qq = BOT_QQ
+    plugin.config.protocol.self_qq = BOT_QQ
     plugin.config.bandwagon.probability = 1.0
     plugin.config.bandwagon.self_message_probability = 0.0
 
@@ -1505,7 +1533,7 @@ def test_bandwagon_on_other_message_uses_main_probability():
 
 def test_bandwagon_on_own_message_uses_self_probability():
     plugin = make_plugin({"get_msg": {"status": "ok", "data": {"sender": {"user_id": BOT_QQ}}}})
-    plugin._self_qq = BOT_QQ
+    plugin.config.protocol.self_qq = BOT_QQ
     plugin.config.bandwagon.probability = 1.0
     plugin.config.bandwagon.self_message_probability = 0.0
 
@@ -1514,7 +1542,7 @@ def test_bandwagon_on_own_message_uses_self_probability():
 
 def test_unknown_author_degrades_to_other_message():
     plugin = make_plugin({"get_msg": {"status": "failed", "retcode": 1404}})
-    plugin._self_qq = BOT_QQ
+    plugin.config.protocol.self_qq = BOT_QQ
     plugin.config.bandwagon.probability = 1.0
     plugin.config.bandwagon.self_message_probability = 0.0
 
@@ -1524,7 +1552,7 @@ def test_unknown_author_degrades_to_other_message():
 
 def test_author_lookup_skipped_when_self_qq_unknown():
     plugin = make_plugin()
-    plugin._self_qq = ""
+    plugin.config.protocol.self_qq = ""
     plugin.config.bandwagon.probability = 1.0
 
     decision = asyncio.run(plugin._evaluate(event(emoji_id=OTHER_EMOJI)))
@@ -1534,7 +1562,7 @@ def test_author_lookup_skipped_when_self_qq_unknown():
 
 def test_author_is_cached_across_reports():
     plugin = make_plugin({"get_msg": {"status": "ok", "data": {"sender": {"user_id": "30003"}}}})
-    plugin._self_qq = BOT_QQ
+    plugin.config.protocol.self_qq = BOT_QQ
     plugin.config.bandwagon.probability = 0.0  # 不触发，槽位保持空闲
 
     asyncio.run(plugin._evaluate(event(emoji_id=OTHER_EMOJI, reactor_qq="20002")))
@@ -1546,7 +1574,7 @@ def test_disabled_opposite_falls_back_to_bandwagon():
     plugin = make_plugin()
     plugin.config.opposite.enabled = False
     plugin._rebuild_runtime()
-    plugin._self_qq = ""
+    plugin.config.protocol.self_qq = ""
     plugin.config.bandwagon.probability = 1.0
 
     decision = asyncio.run(plugin._evaluate(event(emoji_id=THUMBS_UP)))
@@ -1581,7 +1609,7 @@ def test_send_carries_set_flag_and_numeric_message_id():
 def test_slot_breaks_self_reaction_loop():
     """麦麦贴完后，同一条消息的后续上报（含麦麦自己那次）一律不再处理。"""
     plugin = make_plugin()
-    plugin._self_qq = ""  # 认不出自己，只靠表情槽断环
+    plugin.config.protocol.self_qq = ""  # 认不出自己，只靠表情槽断环
     plugin.config.opposite.probability = 1.0
 
     asyncio.run(plugin._on_reaction(event(reactor_qq="20002")))
@@ -1589,6 +1617,54 @@ def test_slot_breaks_self_reaction_loop():
 
     asyncio.run(plugin._on_reaction(event(reactor_qq=BOT_QQ)))
     asyncio.run(plugin._on_reaction(event(reactor_qq="20003")))
+    assert actions_of(plugin).count("set_msg_emoji_like") == 1
+
+
+def _slow_author_lookup(plugin: RepeaterPlugin, author: str = "30003") -> None:
+    """让 get_msg 真的挂起一拍（模拟协议端 RTT），暴露查原作者期间的并发窗口。"""
+    calls = plugin.protocol_calls  # type: ignore[attr-defined]
+
+    async def slow_call(action_name: str, params: dict[str, Any]) -> Any:
+        calls.append((action_name, params))
+        if action_name == "get_msg":
+            await asyncio.sleep(0)
+            return {"status": "ok", "retcode": 0, "data": {"sender": {"user_id": author}}}
+        return {"status": "ok", "retcode": 0, "data": {}}
+
+    plugin._call_protocol = slow_call  # type: ignore[assignment]
+
+
+def test_concurrent_reports_on_same_message_react_once():
+    """同一条消息的两条上报并发到达：查原作者（get_msg）期间第二条也过了预检，
+    占槽前的同步复查必须挡下它——一条被回应消息至多一个表情槽（CONTEXT.md）。"""
+    plugin = make_plugin()
+    _slow_author_lookup(plugin)
+
+    async def scenario() -> None:
+        await asyncio.gather(
+            plugin._on_reaction(event(message_id="777", reactor_qq="20002")),
+            plugin._on_reaction(event(message_id="777", reactor_qq="20003")),
+        )
+
+    asyncio.run(scenario())
+    assert actions_of(plugin).count("get_msg") == 2  # 两条都过了预检：并发窗口真实存在
+    assert actions_of(plugin).count("set_msg_emoji_like") == 1
+
+
+def test_concurrent_reports_in_cooling_group_react_once():
+    """同群两条消息的上报并发到达且群冷却开启：冷却期内只贴出一个表情回应。"""
+    plugin = make_plugin()
+    plugin.config.behavior.cooldown_seconds = 600
+    _slow_author_lookup(plugin)
+
+    async def scenario() -> None:
+        await asyncio.gather(
+            plugin._on_reaction(event(message_id="801")),
+            plugin._on_reaction(event(message_id="802")),
+        )
+
+    asyncio.run(scenario())
+    assert actions_of(plugin).count("get_msg") == 2
     assert actions_of(plugin).count("set_msg_emoji_like") == 1
 
 
@@ -1714,7 +1790,6 @@ def test_webhook_signature_is_enforced_when_secret_set():
 def test_startup_checks_fill_self_qq():
     plugin = make_plugin({"get_login_info": {"status": "ok", "data": {"user_id": BOT_QQ}}})
     plugin.config.protocol.self_qq = ""
-    plugin._self_qq = ""
     asyncio.run(plugin._startup_checks())
     assert plugin._self_qq == BOT_QQ
 
@@ -1722,7 +1797,6 @@ def test_startup_checks_fill_self_qq():
 def test_startup_checks_warn_when_self_qq_unavailable():
     plugin = make_plugin({"get_login_info": {"status": "ok", "data": {}}})
     plugin.config.protocol.self_qq = ""
-    plugin._self_qq = ""
     asyncio.run(plugin._startup_checks())
     assert any("取不到麦麦自己的 QQ 号" in text for text in plugin.ctx.logger.texts("warning"))
 
@@ -1749,6 +1823,34 @@ def test_config_update_rebuilds_opposite_map():
     plugin.config.opposite.enabled = False
     asyncio.run(plugin.on_config_update("self", {}, "1"))
     assert plugin._opposite_map == {}
+
+
+def test_reload_with_cleared_self_qq_falls_back_to_detected():
+    """配置的 self_qq 清空后热重载：有效 QQ 回到启动自检探测到的值，不再沿用旧配置。"""
+    plugin = make_plugin({"get_login_info": {"status": "ok", "data": {"user_id": 50005}}})
+    plugin.config.protocol.self_qq = "11111"
+    plugin._rebuild_runtime()
+    asyncio.run(plugin._startup_checks())
+    assert plugin._self_qq == "11111"  # 配置值优先于探测值
+
+    plugin.config.protocol.self_qq = ""
+    plugin._rebuild_runtime()  # 配置热重载的运行时重建
+    assert plugin._self_qq == "50005"
+
+
+def test_reload_resets_missing_action_flag():
+    """1404 停用贴表情后热重载：重建运行时复位停用标记，下一次上报重新判定。
+
+    部署者为此换了协议端地址并热重载时，不用重启就能恢复；协议端确实不支持时，
+    重载后第一次贴表情会再失败一次、再记一条 error。
+    """
+    plugin = make_plugin({"set_msg_emoji_like": {"status": "failed", "retcode": 1404}})
+    asyncio.run(plugin._on_reaction(event(message_id="1001")))
+    assert plugin._emoji_action_supported is False
+
+    plugin._rebuild_runtime()  # 配置热重载的运行时重建
+    asyncio.run(plugin._on_reaction(event(message_id="1002")))
+    assert actions_of(plugin).count("set_msg_emoji_like") == 2
 
 
 def test_on_unload_cancels_pending_tasks():
@@ -1850,7 +1952,6 @@ def test_injection_display_name_falls_back_to_config():
 def test_injection_no_display_name_omits_name():
     plugin = make_plugin()
     plugin.ctx.config.values["bot.nickname"] = ""
-    plugin._bot_display_name = ""
     enable_injection(plugin)
     asyncio.run(plugin._on_reaction(event(message_id="1001", reactor_qq=BOT_QQ)))
     text = plugin.ctx.maisaka.context.calls[0]["visible_text"]
@@ -1876,19 +1977,31 @@ def test_injection_ignored_reactor_skipped_but_self_injected():
 
 
 def test_injection_unknown_stream_skipped():
+    """取不到 stream：不写入，记 warning「未写入 … 原因=取不到 stream」，字段序同成功日志。"""
     plugin = make_plugin()
     plugin.ctx.chat.streams["10001"] = None
     enable_injection(plugin)
     asyncio.run(plugin._on_reaction(event(message_id="1001")))
     assert plugin.ctx.maisaka.context.calls == []
+    expected = (
+        "未写入 Maisaka 上下文: kind=reaction text='[表情回应] 20002 给某条消息(id=1001)贴了 👍', "
+        "group=10001, msg=1001, emoji=128077, responders=1, 原因=取不到 stream"
+    )
+    assert plugin.ctx.logger.texts("warning") == [expected]
 
 
 def test_injection_append_failure_logs_warning():
+    """回执失败：记 warning「未写入 … 原因=回执失败 …」，已取到的 stream 附在末尾。"""
     plugin = make_plugin()
     enable_injection(plugin)
     plugin.ctx.maisaka.context.fail_next = True
     asyncio.run(plugin._on_reaction(event(message_id="1001")))
-    assert any("注入" in t for t in plugin.ctx.logger.texts("warning"))
+    expected = (
+        "未写入 Maisaka 上下文: kind=reaction text='[表情回应] 20002 给某条消息(id=1001)贴了 👍', "
+        "group=10001, msg=1001, emoji=128077, responders=1, "
+        "原因=回执失败 {'success': False, 'index': 0}, stream=stream-10001"
+    )
+    assert plugin.ctx.logger.texts("warning") == [expected]
 
 
 def test_injection_removed_reaction_not_injected():
@@ -1967,8 +2080,8 @@ def test_injection_display_name_resolved_once_until_rebuild():
     """bot.nickname is resolved once per runtime rebuild (design D6).
 
     An empty nickname must not trigger a config.get on every injection;
-    _rebuild_runtime (the config-reload path) resets the flag so the next
-    injection resolves the display name again.
+    _rebuild_runtime (the config-reload path) resets it to unresolved so the
+    next injection resolves the display name again.
     """
     plugin = make_plugin()
     plugin.ctx.config.values["bot.nickname"] = ""
@@ -1977,7 +2090,7 @@ def test_injection_display_name_resolved_once_until_rebuild():
     asyncio.run(plugin._on_reaction(event(message_id="1002")))
     assert plugin.ctx.config.get_calls == 1
 
-    plugin._rebuild_runtime()  # config reload resets the one-shot flag
+    plugin._rebuild_runtime()  # config reload resets the one-shot resolution
     asyncio.run(plugin._on_reaction(event(message_id="1003")))
     assert plugin.ctx.config.get_calls == 2
 

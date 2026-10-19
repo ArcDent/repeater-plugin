@@ -1,18 +1,12 @@
-"""复读插件 — 复读域纯逻辑层（reactions.py 的表情回应域之外的另一个域）。
+"""复读插件 — 复读域纯逻辑层。
 
-不依赖 maibot_sdk 的纯函数与纯内存状态：**复读文本**的宽松归一、序列化
-SessionMessage dict 的消息资格判定、**复读链**状态机（滚动窗口计数、
-**链终结**、LRU 上界）、三出口决策（**复读** / **打断** / 沉默）。编排逻辑在
-plugin.py；术语见 CONTEXT.md，消息形态与防御式规则见 ADR 0005 与 change
-design（D1–D5）。
+不依赖 maibot_sdk 的纯函数与纯内存状态：复读文本宽松归一、消息资格判定、
+复读链状态机、三出口决策。编排逻辑在 plugin.py，术语见 CONTEXT.md。
 
-序列化消息形态取自主程序 hook 侧（REFERENCE/MaiBot/src/plugin_runtime/
-host/message_utils.py）：顶层 message_id、message_info.group_info.group_id
-（私聊为 None）、message_info.user_info 的 user_id / user_nickname /
-user_cardname（发送者显示名三级回落的来源）、raw_message 为段列表，其中
-文本段是 {"type": "text", "data": <str>}。形态不认识时返回 None 而非抛
-异常——hook 每条群消息都过，解析失败必须便宜且安静（调用方打 debug，
-design D4）。
+序列化消息形态取自主程序 hook 侧（message_utils.py）：顶层 message_id、
+message_info.group_info.group_id（私聊为 None）、user_info 三字段、raw_message
+段列表（文本段 {"type": "text", "data": <str>}）。形态不认识时返回 None 而非
+抛异常——hook 每条群消息都过，解析失败必须便宜且安静。
 """
 
 from __future__ import annotations
@@ -22,9 +16,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .reactions import GroupCooldown
-
-# 内置打断文本变体池，与配置默认值同源（design D6）。配置池为空时回落到这里。
+# 内置打断文本变体池，与配置默认值同源；配置池为空时回落到这里。
 DEFAULT_INTERRUPT_TEXTS: tuple[str, ...] = (
     "打断！",
     "够了！",
@@ -39,14 +31,11 @@ INTERRUPT = "interrupt"
 
 @dataclass(frozen=True)
 class RepeatCandidate:
-    """一条可能进入**复读链**的群消息。
+    """一条可能进入复读链的群消息。
 
-    text 是原始文本（发送时的样子）：首尾空白与大小写原样保留——归一
-    只用于链键控，**复读**发回去的永远是原始文本。message_id 与
-    sender_display_name 是**触发消息**上下文打包（change design D3）：
-    拦截命中后的触发消息注入要附 message_id、visible_text 要呈现发送者，
-    显示名按 群名片 → 昵称 → QQ 号 三级回落（对齐主程序 planner 侧惯例），
-    永不为空（QQ 号兜底）。
+    text 是原始文本，归一只用于链键控，复读发回去的永远是原始文本。
+    message_id 与 sender_display_name 是触发消息上下文打包：注入与文案直接
+    取候选字段，显示名按 群名片 → 昵称 → QQ 号 三级回落，永不为空。
     """
 
     group_id: str
@@ -57,12 +46,8 @@ class RepeatCandidate:
 
 
 def normalize_repeat_text(text: Any) -> str:
-    """**复读文本**比对用的宽松归一。
-
-    只做三级：去首尾空白、连续空白折叠为单个空格、casefold 大小写不敏感——
-    全半角与 emoji 刻意不动（design Risks）。归一产物只用于链键控；
-    **复读**发回去的始终是原始文本。
-    """
+    """复读文本比对用的宽松归一：去首尾空白、连续空白折叠、casefold——
+    全半角与 emoji 刻意不动。归一产物只用于链键控，发送用原始文本。"""
     if text is None:
         return ""
     raw = text if isinstance(text, str) else str(text)
@@ -70,11 +55,7 @@ def normalize_repeat_text(text: Any) -> str:
 
 
 def message_segments(raw_message: Any) -> list[Any] | None:
-    """从序列化 raw_message 字段里取出段列表。
-
-    hook 侧把它序列化为普通列表；带 "components" 列表的 dict 形态做防御式
-    容忍（防主程序形态漂移）。其余一律按形态不认识处理。
-    """
+    """从序列化 raw_message 字段里取出段列表；带 components 的 dict 形态做防御式容忍。"""
     if isinstance(raw_message, list):
         return raw_message
     if isinstance(raw_message, dict):
@@ -90,18 +71,11 @@ def extract_repeat_candidate(
     self_qq: str = "",
     max_text_length: int = 200,
 ) -> RepeatCandidate | None:
-    """判定一条序列化 SessionMessage 能否进入**复读链**。
+    """判定一条序列化 SessionMessage 能否进入复读链；仅纯文本合格。
 
-    仅纯文本消息合格（仅含 text 段且拼接 trim 非空）。通知消息、私聊、
-    麦麦自己的消息、命令消息（文本以 "/" 开头）、超长文本、带任何非文本段
-    （@/reply/image/face/表情包/...）的消息一律返回 None。防御式设计：
-    形态异常或漂移时返回 None 而非抛异常（design D4）——hook 每条群消息都
-    过，解析失败必须便宜，由调用方打 debug。
-
-    通过判定的候选同时打包**触发消息**上下文（message_id 与
-    sender_display_name，change design D3）：链达标的这条消息就是触发
-    消息，拦截后的注入与直发编舞直接取候选字段，调用方无需二次解析
-    消息 dict。
+    通知、私聊、麦麦自己、"/" 命令、超长、含任何非文本段（@/图片/表情包等）
+    一律返回 None；形态异常也返回 None 而非抛异常（调用方打 debug）。通过的
+    候选同时打包触发消息上下文（message_id 与显示名）。
     """
     if not isinstance(message, dict):
         return None
@@ -166,17 +140,13 @@ def extract_repeat_candidate(
 ACCUMULATE = "accumulate"  # 链仍在累积，尚未达标
 TRIGGER = "trigger"  # 已达标，取得一次决策资格（链随之终结）
 TERMINATED = "terminated"  # 终结标记仍在生效，不触发
-SUPPRESSED = "suppressed"  # 已达标但被复读群冷却压制：条目照常累积，不写标记不消耗资格，资格保留待冷却结束
+SUPPRESSED = "suppressed"  # 达标但被群冷却压制：照常累积，不写标记不消耗资格
 
 
 @dataclass(frozen=True)
 class RepeatRecordResult:
-    """RepeatState.record 的结果。
-
-    status 区分继续累积（ACCUMULATE）/ 已达标待决策（TRIGGER）/ 已终结不触发
-    （TERMINATED）/ 已达标但被群冷却压制（SUPPRESSED）。TRIGGER 时 text 携带
-    链内最后一条原始文本（非归一产物）交给决策掷骰；其余状态为空。
-    """
+    """RepeatState.record 的结果：status 区分四种状态；TRIGGER 时 text 携带链内
+    最后一条原始文本交决策掷骰，其余状态为空。"""
 
     status: str
     group_id: str
@@ -186,32 +156,22 @@ class RepeatRecordResult:
 
 @dataclass
 class _ChainRecord:
-    """单链账本：窗口内条目 + 最后一条原始文本。
-
-    entries 每条记录一个（sender_qq, ts），窗口过期在每次写入时惰性清理；
-    last_ts 兼作 max_chains 上界的 LRU 时钟（design D2）。
-    """
+    """单链账本：窗口内条目 + 最近一次写入时刻（last_ts 兼作 LRU 时钟）。"""
 
     entries: list[tuple[str, float]] = field(default_factory=list)
-    last_text: str = ""
     last_ts: float = 0.0
 
 
 class RepeatState:
-    """**复读链**状态机，纯内存态（design D2/D3）。
+    """复读链状态机，纯内存态；链按（group_id, 归一文本）键控。
 
-    链按（group_id, 归一文本）键控。**链终结**标记存独立 dict、按
-    chain_ttl_seconds 过期；链条目按 window_seconds 过期——两者独立演进。
-    record() 刻意是**纯同步方法**、无 await 点：窗口清理 → 计数 → 达标判定 →
-    资格消耗（写终结标记）在一次调用内原子完成，同一事件循环上并发调度的
-    observe handler 不可能在同一链上双触发（design D3，**表情槽**「先占槽
-    再发」防护在复读域的对等物）。
+    链终结标记按 chain_ttl_seconds 过期，链条目按 window_seconds 过期，两者
+    独立演进。record() 刻意是纯同步方法、无 await 点：清理 → 计数 → 达标判定 →
+    资格消耗（写终结标记）一次调用内原子完成，并发 handler 不可能在同一链上
+    双触发。复读群冷却不在本类，由调用方算好后经 suppress_trigger 传入。
 
-    群冷却存储（mark_group / is_cooling_down）是 reactions.ReactionState 同名
-    机制在复读域的对等物：独立实例、独立计时，与表情回应的冷却绝不共享。
-
-    退化的零值边界：window_seconds=0 只保留同一时间戳写入的条目；
-    chain_ttl_seconds=0 完全不做链终结（对齐去重窗口 0 即停用的惯例）。
+    零值边界：window_seconds=0 只保留同一时间戳的条目；chain_ttl_seconds=0
+    完全不做链终结。
     """
 
     def __init__(
@@ -229,7 +189,6 @@ class RepeatState:
         self.max_chains = max(int(max_chains), 1)
         self._chains: dict[tuple[str, str], _ChainRecord] = {}
         self._terminated: dict[tuple[str, str], float] = {}
-        self._group_cooldown = GroupCooldown()
 
     def record(
         self,
@@ -240,19 +199,12 @@ class RepeatState:
         *,
         suppress_trigger: bool = False,
     ) -> RepeatRecordResult:
-        """记录一条**复读文本**消息，可能取得一次决策资格。
+        """记录一条复读文本消息，可能取得一次决策资格。
 
-        单次同步调用：窗口清理 → 计数（默认按不同**发送者**人头，关
-        distinct_senders 后逐条）→ 达标判定 → 写终结标记。资格一旦授出即
-        被消耗，与后续掷骰结果无关——沉默口径同样终结（沉默出口也消耗资格）。
-        标记生效期间，后续**发送者**只续记录（只续记录不触发），不再取得
-        新资格。
-
-        suppress_trigger=True 即复读群冷却**冷却压制**：消息照常累积，但
-        达标的链不写终结标记、不消耗资格——压制结束后下一条 record 会发现
-        链已达标，直接授出资格（冷却结束后新发送者的消息到达时，链已达标
-        的直接取得资格）。压制路径同在一次同步调用内，design D3 的原子性
-        保证原样成立。生效中的终结标记仍优先于压制：已消耗的资格不回来。
+        资格一旦授出即被消耗，与掷骰结果无关——沉默同样终结。标记生效期间
+        后续发送者只续记录、不取得新资格。suppress_trigger=True（群冷却压制）
+        时消息照常累积，但达标链不写标记不消耗资格，压制结束后下一条 record
+        直接授出资格；生效中的终结标记仍优先于压制，已消耗的资格不回来。
         """
         gid = str(group_id or "").strip()
         sender = str(sender_qq or "").strip()
@@ -265,12 +217,12 @@ class RepeatState:
         marker_ts = self._terminated.get(key)
         if marker_ts is not None:
             if self.chain_ttl_seconds > 0 and now - marker_ts <= self.chain_ttl_seconds:
-                self._write_entry(key, sender, raw, now)
+                self._write_entry(key, sender, now)
                 self._evict_overflow()
                 return RepeatRecordResult(TERMINATED, gid, sender, "")
             self._terminated.pop(key, None)  # 标记已过期
 
-        self._write_entry(key, sender, raw, now)
+        self._write_entry(key, sender, now)
         chain = self._chains[key]
         if self.distinct_senders:
             count = len({entry_sender for entry_sender, _ in chain.entries})
@@ -289,17 +241,7 @@ class RepeatState:
             return RepeatRecordResult(TRIGGER, gid, sender, raw)
         return RepeatRecordResult(ACCUMULATE, gid, sender, "")
 
-    def is_cooling_down(self, group_id: str, cooldown_seconds: float, now: float) -> bool:
-        """复读专用群冷却判定（与表情回应的群冷却分开计时，各自实例）。"""
-        return self._group_cooldown.is_cooling_down(group_id, cooldown_seconds, now)
-
-    def mark_group(self, group_id: str, now: float) -> None:
-        """记录一次复读/打断出口命中，作为复读群冷却的起点。"""
-        self._group_cooldown.mark_group(group_id, now)
-
-    def _write_entry(
-        self, key: tuple[str, str], sender_qq: str, text: str, now: float
-    ) -> None:
+    def _write_entry(self, key: tuple[str, str], sender_qq: str, now: float) -> None:
         """先做窗口清理，再追加条目并刷新 LRU 字段。"""
         chain = self._chains.get(key)
         if chain is None:
@@ -308,7 +250,6 @@ class RepeatState:
         cutoff = now - self.window_seconds
         chain.entries = [entry for entry in chain.entries if entry[1] >= cutoff]
         chain.entries.append((sender_qq, now))
-        chain.last_text = text
         chain.last_ts = now
 
     def _evict_overflow(self) -> None:
@@ -323,11 +264,9 @@ class RepeatState:
 
 @dataclass(frozen=True)
 class RepeatDecision:
-    """一条已取得资格的链该做的事：kind 为 REPEAT 时携带原始**复读文本**，
-    kind 为 INTERRUPT 时携带一条**打断文本**、绝不携带**复读文本**。沉默用
-    None 表示，对齐 reactions.decide_reaction。used_default_pool 标记
-    **打断文本**取自内置回落池（空池回落），调用方据此打日志即可，无需从
-    配置文本里再推一遍空池事实。"""
+    """一条已取得资格的链该做的事：REPEAT 携带原始复读文本，INTERRUPT 携带
+    一条打断文本、绝不携带复读文本；沉默用 None 表示。used_default_pool 标记
+    打断文本取自内置回落池，调用方据此打日志即可。"""
 
     kind: str
     text: str
@@ -336,21 +275,17 @@ class RepeatDecision:
 
 
 def behavior_kind_label(kind: str) -> str:
-    """决策出口 → 中文标签的**唯一映射来源**：日志与注入文案共用，
-    plugin.py 不得自带副本（AGENTS.md「不往 plugin.py 里塞可测逻辑」）。"""
+    """决策出口 → 中文标签的唯一映射来源，日志与注入文案共用，plugin.py 不自带副本。"""
     return "复读" if kind == REPEAT else "打断"
 
 
 def build_trigger_visible_text(candidate: RepeatCandidate) -> str:
-    """**触发消息**注入的可见文案（change design D3）：呈现发送者显示名与
-    原始文本。显示名已由 extract_repeat_candidate 按 群名片 → 昵称 → QQ 号
-    三级回落打包进候选，此处只取用。"""
+    """触发消息注入的可见文案：呈现发送者显示名与原始文本。"""
     return f"[复读触发] {candidate.sender_display_name}：{candidate.text}"
 
 
 def build_behavior_visible_text(decision: RepeatDecision) -> str:
-    """**行为文本**注入的可见文案（change design D3）：标签区分复读/打断，
-    文案风格对齐 reactions.build_reaction_visible_text。"""
+    """行为文本注入的可见文案：标签区分复读/打断。"""
     return f"[{behavior_kind_label(decision.kind)}] {decision.text}"
 
 
@@ -365,10 +300,7 @@ def _interrupt_pool(interrupt_texts: Sequence[Any] | None) -> tuple[list[str], b
 
 
 def clamp_non_negative(value: Any) -> float:
-    """非负 clamp：负数 / 非数字 / None 一律按 0，正数原样返回。
-
-    供 `normalize_exit_weights` 归一**出口权重**时直接使用（`decide_repeat` 经它间接使用）。
-    """
+    """非负 clamp：负数 / 非数字 / None 一律按 0，正数原样返回。"""
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -381,12 +313,10 @@ def normalize_exit_weights(
     weight_interrupt: Any,
     weight_silence: Any,
 ) -> tuple[tuple[float, float, float], float]:
-    """**出口权重**非负归一：返回 clamp 后的（复读, 打断, 沉默）三元组与其总和。
+    """出口权重非负归一：返回 clamp 后的（复读, 打断, 沉默）三元组与其总和。
 
-    三个权重各自按非负数 clamp：负数 / 非数字 / None 一律按 0（口径对齐
-    reactions.clamp_probability 的垃圾值处理，但只按 0 不设 [0,1] 上界——
-    权重只有比例意义，上界由配置模型约束）。单个权重非法不影响其余权重。
-    总和为 0 表示必落沉默，decide_repeat 据此直接不掷骰（ADR 0007）。
+    负数 / 非数字 / None 一律按 0，不设上界——权重只有比例意义，上界由配置
+    模型约束。总和为 0 表示必落沉默，decide_repeat 据此直接不掷骰。
     """
     repeat = clamp_non_negative(weight_repeat)
     interrupt = clamp_non_negative(weight_interrupt)
@@ -404,19 +334,13 @@ def decide_repeat(
     roll: Callable[[], float] = random.random,
     choice: Callable[[Sequence[str]], str] = random.choice,
 ) -> RepeatDecision | None:
-    """对一条已取得资格的**复读链**做**三出口决策**（出口权重口径，ADR 0007）。
+    """对一条已取得资格的复读链做三出口决策（ADR 0007）。
 
-    三个权重先各自非负归一（负数 / 非数字 / None 按 0，见
-    normalize_exit_weights）；归一后求和，总和为 0 时出口必为沉默，直接返回
-    None 不掷骰。否则只掷一次骰：把 roll()（[0,1)）乘总和得到数轴落点，按
-    **复读 → 打断 → 沉默** 的固定顺序与累加阈值比较，命中即返回——落点 <
-    复读权重 → REPEAT（发链内最后一条原始**复读文本**）；落点 < 复读权重 +
-    打断权重 → INTERRUPT（从池内随机发一条**打断文本**，绝不带**复读文本**）；
-    其余 → 沉默（None，什么都不发）。三出口严格互斥；权重只有比例意义，
-    同比例放大命中分布不变。
-
-    interrupt_texts 为空（或全空白）时回落内置默认池不抛异常，回落事实记在
-    决策结果的 used_default_pool 上，由调用方打日志（design D5）。
+    权重先各自非负归一，总和为 0 时必落沉默、直接返回 None 不掷骰。否则只掷
+    一次骰：roll() 乘总和得数轴落点，按 复读 → 打断 → 沉默 的固定顺序与累加
+    阈值比较——落点 < 复读权重 → REPEAT（发原始复读文本）；< 复读 + 打断权重 →
+    INTERRUPT（池内随机一条打断文本）；其余 → 沉默。三出口严格互斥，同比例
+    放大权重分布不变。空池回落内置默认池，事实记在 used_default_pool 上。
     """
     (repeat_weight, interrupt_weight, silence_weight), total = normalize_exit_weights(
         weight_repeat, weight_interrupt, weight_silence
