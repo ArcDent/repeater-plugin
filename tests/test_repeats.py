@@ -454,30 +454,6 @@ def test_unsuppressed_trigger_still_consumes_qualification():
     assert state.record("10001", "C", "草", now + 2).status == TERMINATED
 
 
-def test_group_repeat_cooldown_marks_and_expires():
-    """复读专用群冷却：与 reactions.ReactionState 的表情群冷却互不相干。"""
-    state = RepeatState()
-    now = time.time()
-    assert state.is_cooling_down("10001", 120.0, now) is False
-    state.mark_group("10001", now)
-    assert state.is_cooling_down("10001", 120.0, now + 119.9) is True
-    assert state.is_cooling_down("10001", 120.0, now + 120.0) is False
-
-
-def test_group_repeat_cooldown_zero_disables():
-    state = RepeatState()
-    now = time.time()
-    state.mark_group("10001", now)
-    assert state.is_cooling_down("10001", 0.0, now) is False
-
-
-def test_group_repeat_cooldown_scoped_per_group():
-    state = RepeatState()
-    now = time.time()
-    state.mark_group("10001", now)
-    assert state.is_cooling_down("10002", 120.0, now) is False
-
-
 # ---- normalize_exit_weights（出口权重非负归一，ADR 0007 / design D1）----
 
 def test_normalize_exit_weights_negative_garbage_none_become_zero():

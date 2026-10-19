@@ -1,9 +1,6 @@
-"""复读插件。
+"""复读插件：复读链达标后按出口权重掷骰选中复读、打断或沉默，表情回应按概率跟风或贴反义。
 
-聚合两个群聊行为：群内**复读链**达标后，麦麦按概率**复读**（把链内最后一条的
-**复读文本**原样发出），或按概率唱反调**打断**；有人给某条消息贴了**表情回应**
-后，麦麦按概率**跟风**贴同款，或按概率贴**反义回应**。术语见 CONTEXT.md，
-通路与取舍见 docs/adr/。
+术语见 CONTEXT.md，取舍见 docs/adr/。
 """
 
 from __future__ import annotations
@@ -24,6 +21,7 @@ from .config import RepeaterConfig
 from .reactions import (
     OPPOSITE,
     Decision,
+    GroupCooldown,
     InjectionAggregate,
     InjectionState,
     ReactionEvent,
@@ -57,14 +55,11 @@ from .repeats import (
 )
 
 _PROTOCOL_TIMEOUT_SECONDS = 10
-# 「群 → 活跃聊天流」观察表的上界：群数量级远小于它，只为防御无限增长。
+# 「群 → 活跃聊天流」观察表上界，防御无限增长。
 _OBSERVED_STREAM_IDS_LIMIT = 200
-# Resident flush-loop tick (design.md D2): hardcoded on purpose — far below
-# the default 30s merge window, so worst-case injection lag is window + tick.
+# 兜底 flush 心跳远小于默认聚合窗口，注入最坏延迟 ≈ 窗口 + tick。
 _INJECTION_FLUSH_TICK_SECONDS = 5
-# 注入文本的日志预览长度：Maisaka 上下文写入日志统一「kind → text → 定位 →
-# 回执」字段序（对齐 smart_poke_plugin 的 `text='…', index=…, stream=…` 风格），
-# 超限截断带省略号，免得长文本把单行日志撑爆。
+# 注入日志里 text 的预览截断长度，超限加省略号。
 _LOG_TEXT_PREVIEW_CHARS = 60
 
 
@@ -80,13 +75,14 @@ class RepeaterPlugin(MaiBotPlugin):
     _site: web.BaseSite | None
     _state: ReactionState
     _repeat_state: RepeatState
+    _reaction_cooldown: GroupCooldown
+    _repeat_cooldown: GroupCooldown
     _opposite_map: dict[str, str]
-    _self_qq: str
+    _detected_self_qq: str
     _tasks: set[asyncio.Task]
     _emoji_action_supported: bool
     _injection_state: InjectionState | None
-    _bot_display_name: str
-    _bot_display_name_resolved: bool
+    _bot_display_name: str | None
     _stream_ids: dict[str, str]
     _flush_loop_task: asyncio.Task | None
     _observed_stream_ids: dict[str, str]
@@ -96,8 +92,7 @@ class RepeaterPlugin(MaiBotPlugin):
         self._site = None
         self._tasks = set()
         self._flush_loop_task = None
-        self._self_qq = ""
-        self._emoji_action_supported = True
+        self._detected_self_qq = ""
         self._rebuild_runtime()
         if self._injection_state is not None:
             self._bot_display_name = await self._fetch_bot_display_name()
@@ -121,14 +116,14 @@ class RepeaterPlugin(MaiBotPlugin):
         self._tasks.clear()
         await self._stop_webhook()
         if pending:
-            # 等取消真正落地：卸载返回后不得再有存活的后台任务。
+            # 等取消落地，卸载返回后不留存活的后台任务。
             await asyncio.gather(*pending, return_exceptions=True)
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             return
         del config_data, version
-        # 重建内存运行时（反义映射与各状态容器），随后按新配置重启上报监听。
+        # 重建内存运行时，按新配置重启上报监听。
         self._rebuild_runtime()
         self._ensure_flush_loop()
         await self._stop_webhook()
@@ -160,20 +155,17 @@ class RepeaterPlugin(MaiBotPlugin):
             chain_ttl_seconds=float(repeat.chain_ttl_seconds),
             max_chains=int(repeat.max_chains),
         )
-        configured_self_qq = str(self.config.protocol.self_qq or "").strip()
-        if configured_self_qq:
-            self._self_qq = configured_self_qq
+        # 两域群冷却各持一个实例、分开计时，随重建清零。
+        self._reaction_cooldown = GroupCooldown()
+        self._repeat_cooldown = GroupCooldown()
+        # 1404 停用标记随重建复位，下一次上报重新判定。
+        self._emoji_action_supported = True
         context = self.config.context
         self._stream_ids = {}
-        # **群 → 活跃聊天流**的被动观察表：hook 每条消息都带主程序按路由口径算好
-        # 的 `session_id`，比 `get_stream_by_group_id` 的「列表首匹配」可信得多
-        # （同一群在 chat_sessions 里可能有新旧多个 session，首匹配可能是陈旧会话）。
-        # 与其他状态容器同生命周期：随重建清空，下一次群消息到达即重新学到。
+        # hook 上报的「群 → 活跃聊天流」观察表，随重建清空。
         self._observed_stream_ids = {}
-        self._bot_display_name = ""
-        # One-shot resolution flag (design.md D6): display-name lookups stop
-        # once resolved; only a rebuild (config reload) resets it.
-        self._bot_display_name_resolved = False
+        # None = 尚未解析；解析一次（即使为空）即停止重复查询，仅重建时复位。
+        self._bot_display_name = None
         self._injection_state = (
             InjectionState(
                 dedup_ttl_seconds=float(context.dedup_ttl_seconds),
@@ -183,6 +175,11 @@ class RepeaterPlugin(MaiBotPlugin):
             if context.enabled and self.config.plugin.enabled
             else None
         )
+
+    @property
+    def _self_qq(self) -> str:
+        """麦麦自己的 QQ：配置 `protocol.self_qq` 优先，否则取启动探测值；每次现算，不存派生值。"""
+        return str(self.config.protocol.self_qq or "").strip() or self._detected_self_qq
 
     # ---- Webhook 服务 ----
 
@@ -239,13 +236,12 @@ class RepeaterPlugin(MaiBotPlugin):
             if event is not None:
                 self._spawn(self._on_reaction(event))
             elif str(payload.get("group_id") or "").strip():
-                # 群聊事件却解析不出来 = 形态未知。ADR 0001 要求打日志附原始体，
-                # 便于按实测补解析分支。
+                # 群聊事件却解析不出来 = 形态未知，打日志附原始体便于补解析分支。
                 self.ctx.logger.warning(
                     f"表情回应上报形态不认识，已忽略: {json.dumps(payload, ensure_ascii=False)[:300]}"
                 )
             else:
-                # 私聊等无 group_id 的表情回应：本插件只做群聊，静默忽略。
+                # 私聊等无 group_id 的上报，本插件只做群聊，静默忽略。
                 self.ctx.logger.debug(
                     f"忽略非群聊的表情回应上报: notice_type={payload.get('notice_type')}"
                 )
@@ -276,20 +272,13 @@ class RepeaterPlugin(MaiBotPlugin):
                 if self._injection_state is not None:
                     await self._inject_reaction(event)
             except Exception as exc:
-                # 注入失败不得拖垮行为路径：记日志后照常走跟风/反义决策。
+                # 注入失败不拖垮行为路径。
                 self.ctx.logger.warning(f"注入表情回应上下文异常: {exc}")
+            # 返回时表情槽与群冷却已在 _claim_reaction 同步段占好。
             decision = await self._evaluate(event)
             if decision is None:
                 return
-            now = time.time()
-            # 先占表情槽再发，避免同一条消息的并发上报重复贴。
-            self._state.take_slot(event.message_id, now)
-            self._state.mark_group(event.group_id, now)
-            # 表情回应路径取 behavior 段延迟区间（change design D3：延迟按域
-            # 取值，与复读段互不牵扯）。
             behavior = self.config.behavior
-            # 归一逻辑在 _delay 内部（docstring：high < low 按 low、high <= 0
-            # 不等待），调用点只传区间字段即可。
             await self._delay(behavior.delay_min_seconds, behavior.delay_max_seconds)
             await self._send_reaction(event, decision)
         except asyncio.CancelledError:
@@ -298,7 +287,11 @@ class RepeaterPlugin(MaiBotPlugin):
             self.ctx.logger.warning(f"处理表情回应失败: {exc}")
 
     async def _evaluate(self, event: ReactionEvent) -> Decision | None:
-        """门禁 + 掷骰。返回 None 表示这次不做任何事。"""
+        """门禁 → 查原作者 → 同步段内复查、掷骰并占槽；返回 None 表示不做任何事。
+
+        查原作者（get_msg）是唯一 await 点；真正的判定在其后的 `_claim_reaction`
+        同步段完成，await 前的槽位/冷却预检只为尽早挡掉、省一次查询。
+        """
         if not self.config.plugin.enabled or event.removed:
             return None
         if not self._emoji_action_supported:
@@ -310,20 +303,35 @@ class RepeaterPlugin(MaiBotPlugin):
         ignored = qq_set(scope.ignore_reactors)
         if event.reactor_qq and event.reactor_qq in ignored:
             return None
-        # 麦麦自己贴的表情不触发跟风；表情槽是这条环路的兜底防护。
+        # 麦麦自己贴的表情不触发跟风。
         if self._self_qq and event.reactor_qq == self._self_qq:
             return None
 
         now = time.time()
-        if self._state.is_slot_taken(event.message_id, now):
-            return None
-        if self._state.is_cooling_down(event.group_id, self.config.behavior.cooldown_seconds, now):
+        if self._reaction_blocked(event, now):
             return None
 
-        # 回应骰需要知道原作者是谁（self 消息用独立概率），反义表情也不例外：
-        # 反义分支只是回应后的第二次掷骰，不能绕过回应骰。
+        # 回应骰需要知道原作者是谁（self 消息用独立概率），反义表情也不例外。
         is_self_message = await self._is_self_message(event.message_id, now)
+        return self._claim_reaction(event, is_self_message)
 
+    def _reaction_blocked(self, event: ReactionEvent, now: float) -> bool:
+        """这条消息的表情槽已占，或本群表情回应冷却未过。"""
+        if self._state.is_slot_taken(event.message_id, now):
+            return True
+        return self._reaction_cooldown.is_cooling_down(
+            event.group_id, self.config.behavior.cooldown_seconds, now
+        )
+
+    def _claim_reaction(self, event: ReactionEvent, is_self_message: bool) -> Decision | None:
+        """同步段：复查表情槽与群冷却 → 掷骰 → 掷中即占槽、写冷却。
+
+        刻意是同步方法：查原作者的 await 之后不再有 await 点，同一条消息的并发
+        上报只有一条能贴出表情回应（与复读域 record 的同步原子段同构）。
+        """
+        now = time.time()
+        if self._reaction_blocked(event, now):
+            return None
         bandwagon = self.config.bandwagon
         decision = decide_reaction(
             event,
@@ -334,11 +342,14 @@ class RepeaterPlugin(MaiBotPlugin):
             opposite_probability=self.config.opposite.probability,
             roll=random.random,
         )
-        if decision is not None:
-            self.ctx.logger.info(
-                f"表情回应触发 group={event.group_id} msg={event.message_id} "
-                f"reactor={event.reactor_qq or '未知'} {decision.reason}"
-            )
+        if decision is None:
+            return None
+        self._state.take_slot(event.message_id, now)
+        self._reaction_cooldown.mark_group(event.group_id, now)
+        self.ctx.logger.info(
+            f"表情回应触发 group={event.group_id} msg={event.message_id} "
+            f"reactor={event.reactor_qq or '未知'} {decision.reason}"
+        )
         return decision
 
     # ---- 上下文注入（实验性）----
@@ -355,42 +366,28 @@ class RepeaterPlugin(MaiBotPlugin):
             return
 
         now = time.time()
-        if not self._bot_display_name_resolved:
-            # Resolved once per runtime rebuild (design.md D6): bot.nickname
-            # rarely changes, so injections must not re-query it; the flag
-            # is reset only by _rebuild_runtime (config reload path).
-            self._bot_display_name = await self._fetch_bot_display_name()
-        display = build_reactor_display(event.reactor_qq, self._self_qq, self._bot_display_name)
+        bot_display_name = self._bot_display_name
+        if bot_display_name is None:
+            # 每次重建只解析一次，注入路径不再重复查询。
+            bot_display_name = self._bot_display_name = await self._fetch_bot_display_name()
+        display = build_reactor_display(event.reactor_qq, self._self_qq, bot_display_name)
         if self._injection_state.record(event, display, now) == "skip":
             return
         await self._flush_due_aggregates()
 
     async def _flush_due_aggregates(self) -> None:
-        """Flush every aggregate whose merge window has elapsed.
-
-        Shared by the event-driven path in _inject_reaction and the resident
-        flush loop. due() removes aggregates synchronously (no await point),
-        which is what keeps the two trigger paths from double-delivering
-        (design.md D3).
-        """
+        """到期聚合全部 flush；due() 同步移除聚合，事件路径与兜底循环不会重复投递。"""
         state = self._injection_state
         if state is None:
             return
         now = time.time()
         for aggregate in state.due(now):
-            # The aggregate belongs to its own group: flush must not borrow the
-            # triggering event's group (crosses groups under concurrency).
+            # flush 用聚合自己的群，不得借用触发事件的群。
             await self._flush_aggregate(aggregate.group_id, aggregate)
         state.prune(now)
 
     def _ensure_flush_loop(self) -> None:
-        """Ensure the resident flush loop is running while injection is on.
-
-        The loop re-reads self._injection_state every tick, so a config
-        reload that keeps injection enabled reuses the running loop instead
-        of stacking a duplicate; a reload that turns injection off lets the
-        loop exit on its own at the next tick.
-        """
+        """注入开启时确保兜底 flush 循环存活；循环每 tick 重读注入状态，重载复用不堆叠。"""
         if self._injection_state is None:
             return
         task = self._flush_loop_task
@@ -399,14 +396,9 @@ class RepeaterPlugin(MaiBotPlugin):
         self._flush_loop_task = self._spawn(self._injection_flush_loop())
 
     async def _injection_flush_loop(self) -> None:
-        """Resident fallback flush loop (design.md D2).
+        """兜底 flush 循环：事件驱动 flush 依赖后续上报，这里保证静默期的到期聚合仍按时注入。
 
-        Event-driven flush depends on later reports arriving; this loop
-        guarantees an aggregate whose merge window elapsed during a silent
-        period is still injected within window + tick. The tick is hardcoded
-        (not a config item). Each iteration re-reads self._injection_state so
-        a config reload switches to the fresh state, and the loop exits by
-        itself once injection is turned off.
+        每 tick 重读注入状态，注入关闭时循环自行退出；tick 硬编码不设配置。
         """
         while True:
             await asyncio.sleep(_INJECTION_FLUSH_TICK_SECONDS)
@@ -415,8 +407,7 @@ class RepeaterPlugin(MaiBotPlugin):
             try:
                 await self._flush_due_aggregates()
             except Exception as exc:
-                # One failed tick must not kill the resident loop (BLE001-style
-                # broad catch is intentional here, same as other task bodies).
+                # 单次失败不杀循环，宽捕获有意（BLE001 口径）。
                 self.ctx.logger.warning(f"兜底 flush 表情回应聚合失败: {exc}")
 
     async def _flush_aggregate(
@@ -425,52 +416,25 @@ class RepeaterPlugin(MaiBotPlugin):
         state = self._injection_state
         if state is None:
             return
-        stream_id = await self._get_stream_id(group_id)
-        if not stream_id:
-            # The aggregate was already removed by due(); roll its dedup keys
-            # back so the same reports can re-aggregate and retry once the
-            # stream becomes available (design.md D4).
-            state.rollback(aggregate)
-            self.ctx.logger.debug(f"取不到群 {group_id} 的 stream，跳过注入")
-            return
         text = build_reaction_visible_text(aggregate.message_id, aggregate.emoji_id, aggregate.responders)
-        try:
-            response = await self.ctx.maisaka.context.append(
-                stream_id=stream_id,
-                segments=[{"type": "text", "data": text}],
-                visible_text=text,
-                source_kind="reaction",
-                message_id=aggregate.message_id,
-            )
-        except Exception as exc:
+        written = await self._append_context(
+            group_id,
+            text,
+            "reaction",
+            aggregate.message_id,
+            log_extra=f"emoji={aggregate.emoji_id}, responders={len(aggregate.responders)}, ",
+        )
+        if not written:
+            # 注入失败时回滚聚合的去重键，同批上报可重新聚合重试。
             state.rollback(aggregate)
-            self.ctx.logger.warning(f"注入表情回应上下文调用失败: {exc}")
-            return
-        if not (isinstance(response, dict) and response.get("success")):
-            state.rollback(aggregate)
-            self.ctx.logger.warning(f"注入表情回应上下文失败: {response}")
             return
         state.mark_injected(aggregate.message_id, time.time())
-        self.ctx.logger.info(
-            f"已写入 Maisaka 上下文: kind=reaction text='{_log_preview(text)}', "
-            f"group={group_id}, msg={aggregate.message_id}, "
-            f"emoji={aggregate.emoji_id}, responders={len(aggregate.responders)}, "
-            f"index={response.get('index')}, stream={stream_id}"
-        )
 
     async def _get_stream_id(self, group_id: str) -> str:
-        """群号 → 聊天流 ID；优先 hook 观察到的**活跃聊天流**，其次能力查询（design.md D6）。
+        """群号 → 聊天流 ID：优先 hook 观察到的活跃聊天流，其次能力查询（可缓存）。
 
-        主程序按路由口径算出的 `session_id`（hook 每条消息都带）比
-        `get_stream_by_group_id` 的「会话列表首匹配」可信：同一群在
-        `chat_sessions` 里可能有新旧多个 session，首匹配可能是陈旧会话，注入会
-        落在没人读的死会话里（2026-09-27 线上实测：麦麦回复「未找到目标
-        平台」发送失败）。
-
-        The main program looks sessions up in memory and creates them lazily,
-        so a failed lookup is transient: caching the empty string would pin
-        the group as "no stream" forever. Success values are deterministic
-        (session_id is stable), so they are cached as before.
+        主程序按路由口径算出的 session_id 比会话列表首匹配可信，后者同群新旧
+        session 并存时可能返回陈旧会话；查询失败属瞬时态，不缓存空串。
         """
         observed = self._observed_stream_id(group_id)
         if observed:
@@ -491,23 +455,15 @@ class RepeaterPlugin(MaiBotPlugin):
         return stream_id
 
     async def _fetch_bot_display_name(self) -> str:
-        """机器人显示名来源链：配置兜底 → 主程序 bot.nickname → 空。
-
-        Resolved once (design.md D6): whatever the outcome (configured value,
-        nickname, or lookup failure), _bot_display_name_resolved is set so the
-        injection path stops re-querying; only _rebuild_runtime resets the
-        flag (config reload may change self_display_name).
-        """
+        """机器人显示名来源链：配置兜底 → 主程序 bot.nickname → 空；结果由调用方缓存。"""
         configured = str(self.config.context.self_display_name or "").strip()
         if configured:
-            self._bot_display_name_resolved = True
             return configured
         try:
             result = await self.ctx.config.get("bot.nickname", "")
         except Exception as exc:
             self.ctx.logger.debug(f"取主程序 bot.nickname 失败: {exc}")
             result = ""
-        self._bot_display_name_resolved = True
         return str(result or "").strip()
 
     # ---- 防御式拦截（chat.receive.before_process Hook）----
@@ -523,16 +479,10 @@ class RepeaterPlugin(MaiBotPlugin):
         ),
     )
     async def guard_reaction_notify(self, **kwargs: Any) -> dict[str, Any]:
-        """表情回应通知消息在主链上 abort；其余放行。
+        """表情回应通知消息在主链上 abort，其余放行；命中打 info（适配器是否转发通知的线上答案）。
 
-        命中时打 info 日志——这条日志就是「适配器是否把表情回应当通知转发」的
-        线上答案（ADR 0001/0003）。上下文注入关闭时不拦截。
-
-        **群 → 活跃聊天流**的被动观察（纯内存、有上界）放在本 handler 最前，
-        且在注入开关判断之前：它不是任何一个域的行为，复读与表情回应的注入
-        都靠 `_get_stream_id` 优先拿到 hook 上报的活跃 `session_id`（Host 的
-        `get_stream_by_group_id` 是会话列表首匹配，可能是陈旧会话），因此不
-        跟随 `_injection_state` 或复读开关短路。
+        「群 → 活跃聊天流」观察放在本 handler 最前、不跟随注入开关短路：
+        它不属于任何一个域，两域注入都靠它优先拿到活跃 session_id。
         """
         self._observe_group_session(kwargs.get("message"))
         if self._injection_state is None:
@@ -555,16 +505,13 @@ class RepeaterPlugin(MaiBotPlugin):
         description="累积复读链，达标掷骰：复读/打断出口命中时拦截触发消息并转后台发送，沉默与非候选放行（ADR 0005/0006）。",
     )
     async def handle_repeat_message(self, **kwargs: Any) -> dict[str, Any]:
-        """复读检测入口（blocking 模式：返回值决定触发消息在主链上的去留）。
+        """复读检测入口：复读/打断出口命中 → 后台发送并 abort 触发消息，其余 continue 放行。
 
-        复读/打断出口命中 → spawn 后台发送任务后返回 abort：触发消息不写入
-        主程序消息库、不进 planner 上下文（planner 拦截，design D1）。沉默
-        出口、非候选、开关关闭 → continue 放行。未捕获异常记 warning 后返回
-        continue——blocking 挂在主链上，宁可漏一条拦截也不让插件异常干扰
-        主程序消息处理；CancelledError 照常上抛。
+        blocking 挂在主链上，未捕获异常记 warning 后放行——宁可漏一条拦截，
+        不让插件异常干扰主程序；CancelledError 照常上抛。
         """
         try:
-            intercepted = await self._process_repeat_message(kwargs.get("message"))
+            intercepted = self._process_repeat_message(kwargs.get("message"))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -573,22 +520,20 @@ class RepeaterPlugin(MaiBotPlugin):
         action = "abort" if intercepted else "continue"
         return {"action": action, "modified_kwargs": kwargs}
 
-    async def _process_repeat_message(self, message: Any) -> bool:
+    def _process_repeat_message(self, message: Any) -> bool:
         """门禁 → 链累积 → 三出口决策；返回触发消息是否被出口消费（拦截）。
 
-        返回 True 即复读/打断出口命中：本方法内已完成写冷却与 spawn，handler
-        据此对触发消息 abort。沉默出口、非候选、门禁不过一律返回 False
-        （continue 放行）。从门禁到写冷却、spawn 为止没有任何 await 点：同群
-        同文本的并发任务不可能在同一链上双触发（design D3 的同步原子段，
-        终结标记在 record 内先于掷骰写入）。
+        刻意是同步方法：从门禁到写冷却、spawn 结构上无 await 点，同群同文本的
+        并发任务不可能在同一链上双触发（终结标记在 record 内先于掷骰写入）。
         """
         repeat = self.config.repeat
         if not self.config.plugin.enabled or not repeat.enabled:
             return False
+        if not self._protocol_base_url():
+            # 发不出去就不拦截，否则触发消息白白消失。
+            return False
         if not isinstance(message, dict) or not isinstance(message.get("message_info"), dict):
-            # 形态漂移打 debug 不打 warning（design D4 / ADR 0005）：hook 每条
-            # 群消息都过，warning 会刷屏；序列化 SessionMessage 必含 dict 形态
-            # 的 message_info（主程序 message_utils._session_message_to_dict）。
+            # 形态漂移打 debug 不打 warning：hook 每条群消息都过，warning 会刷屏。
             self.ctx.logger.debug(f"复读检测收到形态异常的消息: {str(message)[:120]}")
             return False
         candidate = extract_repeat_candidate(
@@ -606,7 +551,7 @@ class RepeaterPlugin(MaiBotPlugin):
             return False
 
         now = time.time()
-        suppressed = self._repeat_state.is_cooling_down(
+        suppressed = self._repeat_cooldown.is_cooling_down(
             candidate.group_id, float(repeat.cooldown_seconds), now
         )
         result = self._repeat_state.record(
@@ -628,17 +573,16 @@ class RepeaterPlugin(MaiBotPlugin):
             roll=random.random,
         )
         if decision is None:
-            # 沉默出口：资格已在 record 内消耗（链终结同样成立），但不进群冷却。
+            # 沉默出口：资格已在 record 内消耗，不进群冷却。
             self.ctx.logger.info(
                 f"复读链达标后保持沉默 group={candidate.group_id} text={result.text!r}"
             )
             return False
         if decision.used_default_pool:
-            # 空池回落内置默认池（design D5）：回落事实由决策结果携带，此处
-            # 只读标志记 warning，不静默哑火，也不重复推断池是否为空。
+            # 空池回落内置默认池，回落事实由决策结果携带，只记日志不静默哑火。
             self.ctx.logger.warning("打断文本池为空，已回落内置默认池")
         # 复读/打断出口：先写冷却再转后台发送——发送成败不影响已进入的冷却。
-        self._repeat_state.mark_group(candidate.group_id, now)
+        self._repeat_cooldown.mark_group(candidate.group_id, now)
         self.ctx.logger.info(
             f"复读链达标 group={candidate.group_id} {decision.reason} text={result.text!r}"
         )
@@ -648,23 +592,16 @@ class RepeaterPlugin(MaiBotPlugin):
     async def _send_repeat_decision(
         self, candidate: RepeatCandidate, decision: RepeatDecision
     ) -> None:
-        """复读/打断出口的后台编舞（ADR 0006/0008，change design D4）。
+        """复读/打断出口的后台编舞：触发消息注入与延迟并发 → 协议端直发 → 行为文本注入。
 
-        触发消息注入与延迟并发（gather，ADR 0008）：注入 RTT 与延迟取较大值、
-        不串行叠加；之后 send_group_msg 协议端直发（失败止步）→ 行为文本注入
-        （仅直发成功）——「谁发了什么」始终早于「麦麦复读/打断了什么」。
-        直发只需群号，与 stream_id 彻底解耦（stream 仅注入需要），不走主程序
-        标准发送链——ctx.send.text 路过的 blocking hook 可改写/取消消息且默认
-        不进内存上下文（ADR 0006）。冷却与链终结在出口命中时已写入，与本任务
-        成败解耦；注入失败不重试、不回滚、不复用表情回应域的 InjectionState。
+        并发让可见延迟取注入 RTT 与延迟的较大值而非串行叠加；直发只需群号、
+        不走主程序发送链，冷却与链终结在出口命中时已写入，与本任务成败解耦。
         """
         group_id = candidate.group_id
         repeat = self.config.repeat
         try:
-            # 1+2. 触发消息注入与延迟并发（ADR 0008）：补偿 planner 拦截造成
-            #    的上下文缺失，同时避免决策即发。注入协程自身已吞常规异常，
-            #    return_exceptions 兜住任何未预期异常——否则异常会落到外层
-            #    except、把直发一并丢掉（design D4，return_exceptions 必需）。
+            # 注入与延迟并发；return_exceptions 必需，否则未预期异常会落到外层
+            # except、把直发一并丢掉。
             outcomes = await asyncio.gather(
                 self._append_context(
                     group_id,
@@ -677,19 +614,16 @@ class RepeaterPlugin(MaiBotPlugin):
             )
             for exc in outcomes:
                 if isinstance(exc, Exception):
-                    # 异常项显式记 warning 后继续（design D4）。CancelledError
-                    # 不是 Exception 子类，不会被这里吞掉。exc 是 gather 返回
-                    # 的异常实例而非当前抛出的异常，exc_info 需三元组形式
-                    # 才能带出 traceback（logger.exception 在此不可用）。
+                    # 异常项显式记 warning 后继续；exc_info 需三元组形式才能带出
+                    # traceback（exc 是返回的异常实例，logger.exception 在此不可用）。
                     self.ctx.logger.warning(
                         f"复读/打断后台并发协程异常: {exc}",
                         exc_info=(type(exc), exc, exc.__traceback__),
                     )
-            # 3. 协议端直发（OneBot 11 核心动作，不做 retcode=1404 永久停用）。
             response = await self._call_protocol(
                 "send_group_msg",
                 {
-                    # 群号与 message_id 同一协议端惯例：纯数字转 int。
+                    # 纯数字转 int（协议端惯例，与 message_id 一致）。
                     "group_id": coerce_message_id(group_id),
                     "message": [{"type": "text", "data": {"text": decision.text}}],
                 },
@@ -709,8 +643,7 @@ class RepeaterPlugin(MaiBotPlugin):
         self.ctx.logger.info(
             f"已直发{behavior_kind_label(decision.kind)}文本 group={group_id} text={decision.text!r}"
         )
-        # 4. 行为文本注入：让麦麦知道自己发出了什么（仅直发成功）。文案
-        #    区分行为类型（design D3），message_id 附直发响应 data.message_id。
+        # 4. 行为文本注入：让麦麦知道自己发出了什么（仅直发成功）。
         data = response.get("data")
         sent_message_id = data.get("message_id") if isinstance(data, dict) else None
         await self._append_context(
@@ -723,22 +656,23 @@ class RepeaterPlugin(MaiBotPlugin):
         text: str,
         source_kind: str,
         message_id: Any,
-    ) -> None:
-        """把一条域内上下文消息写入麦麦聊天历史（change design D3）。
+        *,
+        log_extra: str = "",
+    ) -> bool:
+        """两域注入唯一的写入入口：取 stream → `maisaka.context.append` → 判回执。
 
-        注入是 planner 拦截 / 协议端直发的即时一次性补偿，无幂等键需求，不复用
-        表情回应域的 InjectionState（去重/聚合/回滚是外部事件流聚合的需求）。
-        失败（stream 查不到 / append 异常或失败）记 warning 即返：不重试、不回滚，
-        调用方照常走后续步骤——注入与直发成败解耦。成功日志统一「kind → text
-        预览 → group/msg 定位 → index/stream 回执」字段序，与表情回应域注入
-        同一格式。
+        成功记 info「已写入」、失败记 warning「未写入」，同一字段序
+        （kind → text 预览 → 定位 → log_extra → 回执或原因）。不重试：复读注入
+        是即时一次性补偿，表情回应聚合由调用方按返回值回滚去重键再重试。
         """
+        where = (
+            f"kind={source_kind} text='{_log_preview(text)}', "
+            f"group={group_id}, msg={message_id}, {log_extra}"
+        )
         stream_id = await self._get_stream_id(group_id)
         if not stream_id:
-            self.ctx.logger.warning(
-                f"取不到群 {group_id} 的 stream，跳过注入 source_kind={source_kind}"
-            )
-            return
+            self.ctx.logger.warning(f"未写入 Maisaka 上下文: {where}原因=取不到 stream")
+            return False
         try:
             response = await self.ctx.maisaka.context.append(
                 stream_id=stream_id,
@@ -748,21 +682,20 @@ class RepeaterPlugin(MaiBotPlugin):
                 message_id=message_id,
             )
         except Exception as exc:
-            # 宽捕获是有意的：注入失败不得拖垮编舞的后续步骤（BLE001 口径）。
+            # 宽捕获是有意的：注入失败不得拖垮调用方的后续步骤（BLE001 口径）。
             self.ctx.logger.warning(
-                f"注入上下文异常 group={group_id} source_kind={source_kind}: {exc}"
+                f"未写入 Maisaka 上下文: {where}原因=调用异常 {exc}, stream={stream_id}"
             )
-            return
+            return False
         if not (isinstance(response, dict) and response.get("success")):
             self.ctx.logger.warning(
-                f"注入上下文失败 group={group_id} source_kind={source_kind}: {response}"
+                f"未写入 Maisaka 上下文: {where}原因=回执失败 {response}, stream={stream_id}"
             )
-            return
+            return False
         self.ctx.logger.info(
-            f"已写入 Maisaka 上下文: kind={source_kind} "
-            f"text='{_log_preview(text)}', group={group_id}, msg={message_id}, "
-            f"index={response.get('index')}, stream={stream_id}"
+            f"已写入 Maisaka 上下文: {where}index={response.get('index')}, stream={stream_id}"
         )
+        return True
 
     def _observe_group_session(self, message: Any) -> None:
         """从 hook 载荷里记下「群号 → 主程序路由算出的 session_id」（纯内存）。
@@ -816,12 +749,7 @@ class RepeaterPlugin(MaiBotPlugin):
         return author == self._self_qq
 
     async def _delay(self, low: float, high: float) -> None:
-        """按调用方给定的 (low, high) 区间随机延迟（change design D3）。
-
-        参数化区间而不是复制第二份延迟函数：表情回应路径传 behavior 段、
-        复读路径传 repeat 段，两域延迟从此分开调。归一逻辑留在函数内：
-        high < low 时按 low 处理、high <= 0 时不等待。
-        """
+        """按 (low, high) 区间随机延迟；high < low 按 low、high <= 0 不等待。"""
         low = max(float(low), 0.0)
         high = max(float(high), low)
         if high <= 0.0:
@@ -859,12 +787,16 @@ class RepeaterPlugin(MaiBotPlugin):
 
     # ---- 协议端直调 ----
 
+    def _protocol_base_url(self) -> str:
+        """协议端 OneBot HTTP 地址（去空白与末尾斜杠）；直调、自检与复读门禁共用。"""
+        return (self.config.protocol.base_url or "").strip().rstrip("/")
+
     async def _call_protocol(self, action_name: str, params: dict[str, Any]) -> dict[str, Any] | None:
         """直连协议端 OneBot HTTP（路径风格 + Bearer）。见 docs/adr/0001。
 
         不可达返回 None；协议端失败时可能 HTTP 200 + status=failed，故一律返回响应体交由调用方判定。
         """
-        base_url = (self.config.protocol.base_url or "").strip().rstrip("/")
+        base_url = self._protocol_base_url()
         if not base_url:
             self.ctx.logger.warning(f"protocol.base_url 未配置，动作 {action_name} 无法执行")
             return None
@@ -897,14 +829,14 @@ class RepeaterPlugin(MaiBotPlugin):
         return response if isinstance(response, dict) else {}
 
     async def _startup_checks(self) -> None:
-        """探活协议端并补齐麦麦自己的 QQ 号。失败只告警，不阻断加载。
+        """探活协议端并探测麦麦自己的 QQ 号；失败只告警不阻断加载。
 
-        不探测 set_msg_emoji_like：该动作没有无副作用的探测方式，
-        真实支持情况在首次贴表情时按 retcode 判定。
+        不探测 set_msg_emoji_like：无副作用探测方式，首次贴表情时按 retcode 判定。
         """
-        base_url = (self.config.protocol.base_url or "").strip()
-        if not base_url:
-            self.ctx.logger.warning("protocol.base_url 未配置，插件不会贴任何表情")
+        if not self._protocol_base_url():
+            self.ctx.logger.warning(
+                "protocol.base_url 未配置：复读已停用（不拦截触发消息），贴表情无法执行"
+            )
             return
 
         response = await self._call_protocol("get_login_info", {})
@@ -916,8 +848,7 @@ class RepeaterPlugin(MaiBotPlugin):
             self.ctx.logger.warning(f"协议端 get_login_info 返回失败（{detail}），请检查 access_token")
             return
 
-        if not self._self_qq:
-            self._self_qq = parse_self_qq(response)
+        self._detected_self_qq = parse_self_qq(response)
         if self._self_qq:
             self.ctx.logger.info(f"麦麦 QQ 号: {self._self_qq}")
         else:

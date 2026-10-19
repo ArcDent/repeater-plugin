@@ -10,6 +10,7 @@ from reactions import (
     BANDWAGON,
     DEFAULT_OPPOSITE_PAIRS,
     OPPOSITE,
+    GroupCooldown,
     InjectionState,
     ReactionEvent,
     ReactionState,
@@ -490,18 +491,20 @@ def test_slot_table_respects_max_entries():
 
 
 def test_cooldown_window():
-    state = ReactionState()
-    assert state.is_cooling_down("10001", 60.0, now=0.0) is False
-    state.mark_group("10001", now=0.0)
-    assert state.is_cooling_down("10001", 60.0, now=30.0) is True
-    assert state.is_cooling_down("10001", 60.0, now=61.0) is False
-    assert state.is_cooling_down("10002", 60.0, now=30.0) is False
+    """群冷却时钟（两域各持一个实例，共用这份方法体）：按群计时，到点即解除。"""
+    cooldown = GroupCooldown()
+    assert cooldown.is_cooling_down("10001", 60.0, now=0.0) is False
+    cooldown.mark_group("10001", now=0.0)
+    assert cooldown.is_cooling_down("10001", 60.0, now=30.0) is True
+    assert cooldown.is_cooling_down("10001", 60.0, now=59.9) is True
+    assert cooldown.is_cooling_down("10001", 60.0, now=60.0) is False  # 严格小于：到点即解除
+    assert cooldown.is_cooling_down("10002", 60.0, now=30.0) is False
 
 
 def test_zero_cooldown_never_blocks():
-    state = ReactionState()
-    state.mark_group("10001", now=0.0)
-    assert state.is_cooling_down("10001", 0.0, now=0.0) is False
+    cooldown = GroupCooldown()
+    cooldown.mark_group("10001", now=0.0)
+    assert cooldown.is_cooling_down("10001", 0.0, now=0.0) is False
 
 
 def test_author_cache_roundtrip_and_expiry():

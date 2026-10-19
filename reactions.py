@@ -1,9 +1,7 @@
 """复读插件 — 表情回应域纯逻辑层。
 
-只包含不依赖 maibot_sdk 的纯函数与纯内存状态：上报解析、表情 ID 归一、
-反义映射构建、跟风/反义决策、表情槽与群冷却。编排逻辑在 plugin.py。
-
-术语见 CONTEXT.md；分支互斥与内存态的取舍见 docs/adr/0002。
+不依赖 maibot_sdk 的纯函数与纯内存状态：上报解析、表情 ID 归一、反义映射、
+跟风/反义决策、表情槽与群冷却。编排逻辑在 plugin.py，术语见 CONTEXT.md。
 """
 
 from __future__ import annotations
@@ -12,19 +10,9 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-# 已知的表情回应类 notice_type。NapCat 系用 group_msg_emoji_like，
-# 部分协议端用 reaction + sub_type=add/remove。见 docs/adr/0001。
-REACTION_NOTICE_TYPES = frozenset({
-    "group_msg_emoji_like",
-    "group_msg_emoji_like_remove",
-    "reaction",
-    "group_reaction",
-})
-
-# 内置反义映射，只用 Unicode emoji（QQ 私有小黄脸编号的语义无公开权威表，
-# 不内置猜测值；需要私有编号请在 config.toml 的 extra_pairs 里按实测填）。
-# 选取原则：语义公认、无歧义、与已有对不重复（😄/😡、🔥/❄、😍/🤢、😭、👎、
-# ❌、💔 已被占用时改选相邻语义的字符，如 😠、🥵、😋、😢）。
+# 内置反义映射只用 Unicode emoji（QQ 私有编号语义无公开权威表，不内置猜测值；
+# 需要私有编号请在 config.toml 的 extra_pairs 里按实测填）。选取原则：语义公认、
+# 无歧义、与已有对不重复。
 DEFAULT_OPPOSITE_PAIRS: tuple[tuple[str, str], ...] = (
     ("👍", "👎"),
     ("❤", "💔"),
@@ -72,18 +60,9 @@ def normalize_emoji_id(token: Any) -> str:
     """把配置或上报里的表情写法归一为协议端用的表情 ID。
 
     纯数字原样保留；emoji 字符取首个码点的十进制值，因此 ❤️ 与 ❤、👍🏻 与 👍
-    归一到同一 ID。
-
-    这一步不是可选的美化，它抹平了协议端上报与发送两侧的形式不对称
-    （依据 SnowLuma 源码，见 REFERENCE/snowluma）：
-
-    - 上报侧 `event-0x2dc.ts` 直接透传 QQ 给的 code：QQ 小黄脸是数字串（'76'），
-      Unicode 表情是**字符本身**（其测试断言 `event.emojiId === '⭐'`）
-    - 发送侧 `oidb-services/reaction/set-reaction.ts` 用 `code.length > 3` 判类型：
-      1~3 位当 QQ 小黄脸（type=1），更长的当 Unicode 码点十进制（type=2）
-
-    所以把上报的 '⭐' 归一成 '11088' 后回传，长度 5 > 3 会被正确识别为 Unicode；
-    '76' 保持 2 位，仍被识别为 QQ 小黄脸。内置反义映射用码点也正因如此可用。
+    归一到同一 ID。这不是可选的美化：上报侧透传 QQ 给的 code（小黄脸是数字串、
+    Unicode 表情是字符本身），发送侧用 `code.length > 3` 判类型，归一正好抹平
+    两侧的形式不对称（依据 SnowLuma 源码，见 docs/emoji-id-reference.md）。
     """
     if token is None:
         return ""
@@ -95,16 +74,19 @@ def normalize_emoji_id(token: Any) -> str:
     return str(ord(text[0]))
 
 
+def _is_reaction_notice_type(notice_type: Any) -> bool:
+    """notice_type 是否属于表情回应；webhook 解析与通知拦截共用这一份形态判定。"""
+    text = str(notice_type or "").strip().lower()
+    return "emoji_like" in text or "reaction" in text
+
+
 def is_reaction_notice(payload: Any) -> bool:
     """是否是表情回应类 notice。用于区分「形态未知需要告警」与「无关事件可静默丢弃」。"""
     if not isinstance(payload, dict):
         return False
     if str(payload.get("post_type") or "") != "notice":
         return False
-    notice_type = str(payload.get("notice_type") or "").strip().lower()
-    if notice_type in REACTION_NOTICE_TYPES:
-        return True
-    return "emoji_like" in notice_type or "reaction" in notice_type
+    return _is_reaction_notice_type(payload.get("notice_type"))
 
 
 def _first_emoji_from_likes(payload: dict[str, Any]) -> str:
@@ -129,7 +111,7 @@ def parse_reaction_report(payload: Any) -> ReactionEvent | None:
     """解析协议端上报的表情回应事件；形态不认识或字段不全时返回 None。
 
     一次上报可能带多个 like，只取第一个：一条被回应消息只有一个表情槽，
-    多取也会被槽位拦掉（见 CONTEXT.md「表情槽」）。
+    多取也会被槽位拦掉。
     """
     if not isinstance(payload, dict) or not is_reaction_notice(payload):
         return None
@@ -184,9 +166,8 @@ def build_opposite_map(
 ) -> dict[str, str]:
     """构建双向对称的反义映射。
 
-    后加入的对覆盖先前的：新对里的任一表情 ID 若已出现在旧对中，旧对整对失效，
-    以保证「A 的反义是 B 则 B 的反义是 A」这一对称性（见 CONTEXT.md Relationships）。
-    disabled 里的表情 ID 所在的对整对移除，使该表情回落到跟风分支。
+    后加入的对整对覆盖旧对，保证「A 的反义是 B 则 B 的反义是 A」；disabled
+    里的表情 ID 所在的对整对移除，使该表情回落到跟风分支。
     """
     pairs: list[tuple[str, str]] = []
 
@@ -252,9 +233,7 @@ def clamp_probability(probability: Any) -> float:
 
 
 class GroupCooldown:
-    """群级发送冷却时钟。表情回应域与复读域各持**独立实例**（分开计时是
-    spec 要求，互不牵扯），只共用方法体：mark_group 记录起点，
-    is_cooling_down 判定窗口。冷却记录无 TTL，随实例生命周期存续。"""
+    """群级发送冷却时钟。两域各持一个独立实例（分开计时是 spec 要求），共用方法体。"""
 
     def __init__(self) -> None:
         self._last_sent: dict[str, float] = {}
@@ -383,23 +362,19 @@ def is_missing_action(response: Any) -> bool:
 
 
 def protocol_failure_detail(response: Any) -> str:
-    """从失败的动作响应里取人可读的失败原因：wording → message → retcode
-    逐级回落（对齐 SnowLuma 响应信封字段）。调用方只在
-    protocol_call_failed(response) 为真后取详情；非 dict 响应防御式
-    str() 兜底，不抛异常。"""
+    """从失败响应取人可读原因：wording → message → retcode 逐级回落；非 dict 用 str() 兜底。"""
     if not isinstance(response, dict):
         return str(response)
     return str(response.get("wording") or response.get("message") or response.get("retcode"))
 
 
 class ReactionState:
-    """表情槽与群冷却，纯内存 + 双重裁剪（条数上界 & TTL）。见 docs/adr/0002。"""
+    """表情槽与原作者缓存，纯内存 + 双重裁剪（条数上界 & TTL）。"""
 
     def __init__(self, slot_ttl_seconds: float = 3600.0, max_slots: int = 2000) -> None:
         self.slot_ttl_seconds = max(float(slot_ttl_seconds), 0.0)
         self.max_slots = max(int(max_slots), 1)
         self._slots: dict[str, float] = {}
-        self._group_cooldown = GroupCooldown()
         self._authors: dict[str, tuple[float, str]] = {}
 
     def is_slot_taken(self, message_id: str, now: float) -> bool:
@@ -418,12 +393,6 @@ class ReactionState:
             return
         self._slots[key] = now
         self.prune(now)
-
-    def is_cooling_down(self, group_id: str, cooldown_seconds: float, now: float) -> bool:
-        return self._group_cooldown.is_cooling_down(group_id, cooldown_seconds, now)
-
-    def mark_group(self, group_id: str, now: float) -> None:
-        self._group_cooldown.mark_group(group_id, now)
 
     def remember_author(self, message_id: str, author_qq: str, now: float) -> None:
         """缓存被回应消息的原作者，避免同一条消息被多人贴表情时重复查协议端。"""
@@ -468,10 +437,8 @@ class InjectionAggregate:
     group_id 记录聚合归属的群：到期 flush 时注入该群的 stream，
     不得借用触发 flush 的那个事件的群（多群并发时会串群）。
 
-    reactor_qqs keeps the dedup identities (reactor QQs) that fed this
-    aggregate; InjectionState.rollback uses them to drop every dedup key
-    the aggregate covers when the injection write fails. responders only
-    carries display names and may diverge from reactor_qqs.
+    reactor_qqs 是去重身份（回应者 QQ），rollback 失败回滚时按它逐个删去
+    覆盖的去重键；responders 只携带显示名，可与 reactor_qqs 不一致。
     """
 
     group_id: str
@@ -483,13 +450,12 @@ class InjectionAggregate:
 
 
 class InjectionState:
-    """表情回应的去重与聚合，纯内存 + TTL 裁剪。见 docs/adr/0003。
+    """表情回应的去重与聚合，纯内存 + TTL 裁剪。
 
     - 去重键 (responder, message_id, emoji_id)：窗口内同键只注入一次
     - 聚合键 (message_id, emoji_id)：窗口内多人同表情合并为一条注入消息
     - 注入上限：单条消息最多开启 max_reactions_per_message 个聚合
-    - rollback: on a failed injection write, drop every dedup key the
-      aggregate covers so the same reports can re-aggregate and retry
+    - rollback: 注入写失败时删去聚合覆盖的去重键，让同批上报可重试
     """
 
     def __init__(
@@ -515,8 +481,7 @@ class InjectionState:
         显示名：同人在 dedup TTL 内的重复回应只注入一次。
         """
         key = (event.reactor_qq, event.message_id, event.emoji_id)
-        # Dedup applies only when a positive TTL is configured; 0 disables it
-        # entirely so repeated reports always re-enter aggregation.
+        # 去重窗口 0 表示完全停用，重复上报总是重新进入聚合。
         if self.dedup_ttl_seconds > 0:
             last = self._dedup.get(key)
             if last is not None and now - last <= self.dedup_ttl_seconds:
@@ -557,12 +522,7 @@ class InjectionState:
         return due
 
     def rollback(self, aggregate: InjectionAggregate) -> None:
-        """Drop every dedup key covered by the aggregate.
-
-        Called when writing the injected message failed: removing the keys
-        lets the same (reactor, message_id, emoji_id) reports re-aggregate
-        and be retried within the dedup window instead of being skipped.
-        """
+        """注入写失败时删去聚合覆盖的全部去重键，让同批上报可重新聚合重试。"""
         for reactor_qq in aggregate.reactor_qqs:
             self._dedup.pop((reactor_qq, aggregate.message_id, aggregate.emoji_id), None)
 
@@ -630,9 +590,7 @@ def build_reaction_visible_text(message_id: str, emoji_id: str, responders: list
 def is_reaction_notice_message(message: Any) -> bool:
     """判定主程序消息链上的一条通知消息是否为表情回应形态（防御式拦截用）。
 
-    只认主程序适配器约定写入的 notice_type 字段（bot.py 注释：additional_config
-    含 napcat_notice_type / napcat_notice_sub_type / napcat_notice_payload），
-    认不出返回 False 放行——不臆测未知形态（ADR 0003）。
+    只认适配器约定写入的 notice_type 字段，认不出返回 False 放行——不臆测未知形态。
     """
     if not isinstance(message, dict):
         return False
@@ -644,7 +602,6 @@ def is_reaction_notice_message(message: Any) -> bool:
     additional = message_info.get("additional_config")
     if not isinstance(additional, dict):
         return False
-    notice_type = str(
-        additional.get("napcat_notice_type") or additional.get("notice_type") or ""
-    ).lower()
-    return "emoji_like" in notice_type or "reaction" in notice_type
+    return _is_reaction_notice_type(
+        additional.get("napcat_notice_type") or additional.get("notice_type")
+    )

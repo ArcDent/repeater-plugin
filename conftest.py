@@ -1,10 +1,7 @@
 """让 pytest 能 import plugin.py（含包内相对导入）。
 
-plugin.py 使用包相对导入（from .config / .reactions），必须以包成员的身份被加载；
-仓库根目录虽是包（有 __init__.py），但目录名含连字符无法作为模块名被测试引用。
-本 conftest 把根目录注册为合成包 repeater_plugin，再以该包成员身份加载
-plugin，并给测试用的顶层名（plugin/config/reactions）建立别名，保证全程
-单实例。仅影响 pytest 运行，MaiBot 运行时不会加载本文件。
+根目录名含连字符无法作模块名，这里把它注册为合成包 repeater_plugin 并给
+测试用的顶层名建别名，全程单实例；仅影响 pytest，运行时不加载本文件。
 """
 
 import importlib

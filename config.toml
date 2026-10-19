@@ -2,33 +2,30 @@
 # 字段含义与取值范围见 config.py，术语见 CONTEXT.md。
 
 [plugin]
-# 插件总开关，关闭后复读与表情回应两个域全部停用（不再拦截、不发送、不贴表情）
+# 插件总开关，关闭后复读与表情回应全部停用
 enabled = true
 config_version = "1.5.0"
 
-# 协议端 HTTP 上报的接收端点。协议端需要新增一个 HTTP 上报目标指向这里
-# （好友申请插件已占 18080，本插件默认 18081）。
+# 协议端 HTTP 上报的接收端点（好友申请插件已占 18080，本插件默认 18081）
 [webhook]
 host = "0.0.0.0"
 port = 18081
 path = "/maibot/emoji_reaction"
 secret = ""
 
-# 贴表情动作直调协议端 OneBot HTTP。base_url 不填则插件不做任何动作。
+# 复读 / 打断直发与贴表情都直调协议端 OneBot HTTP；不填时复读整体停用
 [protocol]
 base_url = ""
 access_token = ""
-# 留空则启动时用 get_login_info 自动获取
+# 留空则启动时自动获取
 self_qq = ""
 
-# 回应骰：两套概率分别对应「他人的消息」和「麦麦自己的消息」，决定是否回应；
-# 回应后命中反义映射的表情 ID 再掷反义骰决定贴反义回应还是同款。
+# 回应骰：两套概率分别对应「他人的消息」和「麦麦自己的消息」
 [bandwagon]
 probability = 0.25
 self_message_probability = 0.12
 
-# 反义骰。回应骰掷中后，命中反义映射的表情按本概率贴相反表情，
-# 掷不中贴同款（回落跟风）；填 0 则从不唱反调。
+# 反义骰：回应骰掷中后，命中反义映射的表情按本概率贴相反表情，掷不中贴同款
 [opposite]
 enabled = true
 probability = 0.35
@@ -38,8 +35,7 @@ extra_pairs = []
 # 这些表情所在的反义对整对移除，使它们回落到跟风分支
 disabled_emojis = []
 
-# 复读：链达标后掷骰一次，三个出口权重就是这一次掷骰的三个面，按比例恰好命中一个出口——
-# 把复读文本原样发出 / 发打断文本 / 沉默；与跟风、反义回应的概率骰互不影响
+# 复读：链达标后掷骰一次，与跟风、反义回应的概率骰互不影响
 [repeat]
 enabled = true
 # 滚动窗口秒数，窗口外的历史消息随滚动失效
@@ -48,19 +44,19 @@ window_seconds = 120
 threshold = 3
 # 仅计不同发送者人头；关闭后逐条消息计数
 distinct_senders = true
-# 三个出口权重：一次掷骰的三个面（复读 / 打断 / 沉默），按比例选中恰好一个。
-# 默认 85 / 15 / 0 = 85% 复读、15% 打断、从不沉默；只有比例意义，同比例放大等价
+# 三个出口权重：一次掷骰的三个面（复读 / 打断 / 沉默），按比例恰好选中一个。
+# 默认 85 / 15 / 0；只有比例意义，同比例放大等价
 weight_repeat = 85
 weight_interrupt = 15
 weight_silence = 0
 # 打断出口的变体池，每次随机一条；全部留空回落内置默认池
 interrupt_texts = ["打断！", "够了！", "停！", "打住！", "别念了！"]
-# 复读 / 打断出口命中后发送前的随机等待区间（秒），与 [behavior] 里表情回应的延迟互相独立
+# 发送前的随机等待区间（秒），与 [behavior] 的延迟互相独立
 delay_min_seconds = 0.3
 delay_max_seconds = 1.5
 # 掷骰后（含沉默出口）同文本在此时长内不再触发新一轮，0 = 不做链终结
 chain_ttl_seconds = 1800
-# 复读专用群冷却，与 [behavior] 里表情回应的冷却互相独立，0 = 不限
+# 复读专用群冷却，与 [behavior] 的冷却互相独立，0 = 不限
 cooldown_seconds = 120
 # 超过此长度的文本不参与复读链，0 = 不限
 max_text_length = 200
@@ -77,17 +73,16 @@ delay_max_seconds = 6.0
 slot_ttl_seconds = 3600
 max_slots = 2000
 
-# 上下文注入（实验性，默认关闭）。开启后表情回应去重、聚合后注入聊天历史，
-# 同时拦截主程序消息链上的表情回应通知消息。
+# 上下文注入（实验性，默认关闭）
 [context]
 enabled = false
 # 同一（回应者、被回应消息、表情）组合在此窗口内只注入一次，0 = 不启用去重
 dedup_ttl_seconds = 3600
-# 同一被回应消息同一表情的多条回应在此窗口内汇入同一条注入消息
+# 同一被回应消息同一表情的多条回应在此窗口内汇入一条注入消息
 merge_window_seconds = 30
 # 单条被回应消息最多产生的注入消息条数
 max_reactions_per_message = 10
-# 麦麦自己的显示名；留空自动取主程序 bot.nickname，再取不到则不写名字
+# 麦麦显示名；留空自动取主程序 bot.nickname，再取不到则不写名字
 self_display_name = ""
 
 [scope]
@@ -96,5 +91,5 @@ group_whitelist = []
 group_blacklist = []
 # 忽略这些 QQ 贴出的表情回应，通常填其他机器人
 ignore_reactors = []
-# 忽略这些 QQ 发出的消息（不进复读链），与上面的回应者名单是两个概念
+# 忽略这些 QQ 发出的消息（不进复读链），与上面的回应者名单是两个名单
 ignore_senders = []

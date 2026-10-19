@@ -14,7 +14,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![MaiBot](https://img.shields.io/badge/MaiBot-1.0.0%2B-6E4AFF?style=for-the-badge)
-![Version](https://img.shields.io/badge/Version-0.9.0-2F81F7?style=for-the-badge)
+![Version](https://img.shields.io/badge/Version-0.9.1-2F81F7?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 ![Stars](https://img.shields.io/github/stars/ArcDent/repeater-plugin?style=for-the-badge&logo=github)
 
@@ -49,7 +49,7 @@ repeater-plugin 是一个 MaiBot 群聊行为插件，把两种「群友会做�
 | **反义骰** | 命中反义映射后 35% 概率贴反义（👍↔👎 等 16 对内置，可自定义） |
 | **纯规则 + 概率** | 不依赖 LLM 判断，行为可控、频率可调、零 token 消耗 |
 | **协议端直发** | 复读/打断经协议端 HTTP 直调，与主程序发送链解耦，只依赖群号 |
-| **完全可单测** | `repeats.py` / `reactions.py` 纯逻辑层，342 条用例覆盖边界 |
+| **完全可单测** | `repeats.py` / `reactions.py` 纯逻辑层单测覆盖边界，编排层另有集成用例 |
 
 ---
 
@@ -60,9 +60,9 @@ repeater-plugin 是一个 MaiBot 群聊行为插件，把两种「群友会做�
 ```bash
 # 1. 推送插件（目录名即插件 id，config.toml 排除避免覆盖线上配置）
 rsync -av --delete \
-  --exclude .git --exclude .local --exclude .serena --exclude .superpowers \
+  --exclude .git --exclude .local --exclude .serena \
   --exclude .pytest_cache --exclude .ruff_cache --exclude __pycache__ \
-  --exclude tests --exclude docs/superpowers \
+  --exclude tests \
   --exclude .cursor --exclude openspec \
   --exclude conftest.py --exclude pyrightconfig.json --exclude config.toml \
   ./ arclinux:/home/arc/maimai/MaiBot/data/MaiMBot/plugins/arcdent.repeater-plugin/
@@ -206,7 +206,7 @@ ssh arclinux 'docker logs --since 2m maim-bot-core | grep -E "复读插件已加
 |:-----|:-----|:-----|
 | `webhook.host` / `port` / `path` | `0.0.0.0` / `18081` / `/maibot/emoji_reaction` | 接收协议端表情回应上报的端点 |
 | `webhook.secret` | `""` | SnowLuma 留空 |
-| `protocol.base_url` / `access_token` / `self_qq` | `""` | 协议端 OneBot HTTP 地址、令牌、麦麦 QQ（留空自动获取） |
+| `protocol.base_url` / `access_token` / `self_qq` | `""` | 协议端 OneBot HTTP 地址（不填则复读停用、贴表情无法执行）、令牌、麦麦 QQ（留空自动获取） |
 
 ### `[scope]`
 
@@ -222,7 +222,7 @@ ssh arclinux 'docker logs --since 2m maim-bot-core | grep -E "复读插件已加
 <summary>📁 项目结构</summary>
 
 ```
-repeat-plugin/
+repeater-plugin/
 ├── plugin.py               # 插件主类：两域 Hook 编排、协议端直发、上下文注入、启动自检
 ├── repeats.py              # 复读域纯逻辑层：归一、链状态机、三出口决策、注入文案
 ├── reactions.py            # 表情回应域纯逻辑层：上报解析、反义映射、两级决策、表情槽
@@ -231,7 +231,7 @@ repeat-plugin/
 ├── _manifest.json          # 插件清单 v2
 ├── tests/                  # pytest：纯逻辑单测 + 插件级集成
 ├── docs/
-│   ├── adr/                # 决策记录 0001~0014
+│   ├── adr/                # 决策记录 0001~0015
 │   └── emoji-id-reference.md  # 表情 ID 编号体系查表
 └── openspec/               # 行为契约（specs/ 主 spec + changes/archive 变更归档）
 ```
